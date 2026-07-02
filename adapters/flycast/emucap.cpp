@@ -281,7 +281,9 @@ bool json_num_from(const std::string& s, const char* key, long& out, size_t from
 	if (c == std::string::npos) return false;
 	size_t i = c + 1;
 	while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '"')) i++;
-	out = strtol(s.c_str() + i, nullptr, 0);
+	// strtol saturates at LONG_MAX on 32-bit long (Windows), corrupting DC addresses >= 0x80000000.
+	// Parse as u64 and keep the low 32 bits round-trippable through (uint32_t) casts at call sites.
+	out = (long)strtoull(s.c_str() + i, nullptr, 0);
 	return true;
 }
 bool json_num(const std::string& s, const char* key, long& out) {
