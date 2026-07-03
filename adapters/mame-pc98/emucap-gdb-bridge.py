@@ -865,9 +865,14 @@ class Bridge:
         큰 N(예: 3000+)이 끝나기 전에 타임아웃 난다. recv는 데이터 도착 즉시 반환하므로 타임아웃을
         넉넉히 늘려도 무해하다(상한 600s — hung plugin은 결국 에러). hit이 나면 plugin이 즉시 T05를
         보내 일찍 반환한다.
+
+        트레이싱 중이면 프레임마다 수십만 명령을 디스어셈+기록하므로 무트레이스 50ms/frame 예산으론
+        타임아웃→지연 stop이 recv 창 밖에 도착해 다음 요청에 오배달(desync)된다. 트레이스일 때 프레임당
+        예산을 크게 잡아 지연 응답이 이 recv 창 안에서 매칭되게 한다(Rust 브리지 _frames_op와 동일).
         """
         prev = self.gdb.get_timeout()
-        self.gdb.set_timeout(min(600.0, 5.0 + frames * 0.05))
+        per_frame = 5.0 if self.tracing else 0.05
+        self.gdb.set_timeout(min(600.0, 5.0 + frames * per_frame))
         try:
             return self._lua_cmd_allow_stop(name, str(frames))
         finally:
@@ -1004,6 +1009,13 @@ class Bridge:
 
     def call_stack(self, _params: dict[str, Any]) -> dict[str, Any]:
         self._require_lua_backend("call_stack")
+        # 트레이싱 중이면 call/ret 트레이스 스캔이 정확하니 그대로 쓴다. 아니면 정지 상태의
+        # BP(EBP) 체인을 걸어 트레이스 없이 복원한다 — method 필드로 신뢰도를 알린다.
+        if self.tracing:
+            return self._call_stack_from_trace()
+        return self._call_stack_from_frame_pointer()
+
+    def _call_stack_from_trace(self) -> dict[str, Any]:
         rows = self._read_trace_rows()
         stack: list[int] = []
         frames: list[dict[str, Any]] = []
@@ -1020,9 +1032,60 @@ class Bridge:
             "call_stack": stack,
             "frames": frames,
             "depth": len(stack),
+            "method": "trace",
             "tracing": self.tracing,
             "total": len(rows),
         }
+
+    def _call_stack_from_frame_pointer(self) -> dict[str, Any]:
+        # 표준 BP 프롤로그(push bp; mov bp,sp)를 가정한다 — 모든 루틴이 지키진 않으므로
+        # method="frame_pointer"로 알려 호출자가 신뢰도를 판단하게 한다.
+        state = self._state_from_regs_hex(self._read_regs_hex())
+        ebp = state.get("cpu.ebp", 0)
+        esp = state.get("cpu.esp", 0)
+        eip = state.get("cpu.eip", 0)
+        ss = state.get("cpu.ss", 0)
+        # CR0.PE는 RSP 레지스터 셋에 없다. 값 크기로 real16 vs protected32를 추정한다(caveat:
+        # 라이브 검증 필요).
+        real_mode = ebp <= 0xFFFF and esp <= 0xFFFF and eip <= 0xFFFF
+        if real_mode:
+            ptr_size, seg_base, bp_mask = 2, ss << 4, 0xFFFF
+        else:
+            ptr_size, seg_base, bp_mask = 4, 0, 0xFFFFFFFF
+        bp = ebp & bp_mask
+        stack: list[int] = []
+        frames: list[dict[str, Any]] = []
+        for _ in range(64):
+            if bp == 0:
+                break
+            base = seg_base + bp
+            if base + 2 * ptr_size > 0x0011_0000:
+                break
+            saved_bp = self._read_ptr_le(base, ptr_size)
+            ret_addr = self._read_ptr_le(base + ptr_size, ptr_size)
+            if saved_bp is None or ret_addr is None:
+                break
+            stack.append(ret_addr)
+            frames.append({"pc": ret_addr, "frame_pointer": bp})
+            if saved_bp <= bp:
+                break
+            bp = saved_bp & bp_mask
+        return {
+            "call_stack": stack,
+            "frames": frames,
+            "depth": len(stack),
+            "method": "frame_pointer",
+            "mode": "real16" if real_mode else "protected32",
+            "pointer_size": ptr_size,
+            "frame_pointer": ebp & bp_mask,
+            "tracing": self.tracing,
+        }
+
+    def _read_ptr_le(self, addr: int, size: int) -> int | None:
+        try:
+            return int.from_bytes(bytes.fromhex(self._read_abs_hex(addr, size)), "little")
+        except (BridgeError, ValueError):
+            return None
 
     def disassemble(self, params: dict[str, Any]) -> dict[str, Any]:
         self._require_lua_backend("disassemble")

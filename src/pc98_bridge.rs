@@ -228,6 +228,11 @@ pub trait GdbTransport {
     fn send(&mut self, payload: &str) -> BridgeResult<String>;
     fn send_no_reply(&mut self, payload: &str) -> BridgeResult<()>;
     fn interrupt(&mut self) -> BridgeResult<String>;
+    /// 직전 write 없이 다음 RSP 패킷을 blocking으로 읽는다. `send_cmd`가 stale async stop을
+    /// 실제 응답 앞에서 걷어낸 뒤 진짜 응답을 이어 읽을 때 쓴다.
+    fn recv_reply(&mut self) -> BridgeResult<String> {
+        Err(BridgeError::Emulator("recv_reply unsupported".into()))
+    }
     fn get_timeout(&self) -> BridgeResult<Duration> {
         Ok(Duration::from_secs(5))
     }
@@ -375,6 +380,10 @@ impl GdbTransport for GdbRspClient {
         Ok(())
     }
 
+    fn recv_reply(&mut self) -> BridgeResult<String> {
+        Ok(self.read_packet()?)
+    }
+
     fn interrupt(&mut self) -> BridgeResult<String> {
         self.stream.write_all(&[0x03])?;
         std::thread::sleep(Duration::from_millis(10));
@@ -450,6 +459,7 @@ pub struct Bridge<G> {
     events: Vec<Value>,
     bps: BTreeMap<u64, Breakpoint>,
     next_bp: u64,
+    input_fields: Option<Vec<String>>,
 }
 
 impl<G: GdbTransport> Bridge<G> {
@@ -464,6 +474,7 @@ impl<G: GdbTransport> Bridge<G> {
             events: Vec::new(),
             bps: BTreeMap::new(),
             next_bp: 1,
+            input_fields: None,
         }
     }
 
@@ -566,6 +577,11 @@ impl<G: GdbTransport> Bridge<G> {
 
     fn status(&mut self) -> BridgeResult<Value> {
         self.drain_stop()?;
+        let mut input_buttons = input_buttons_json();
+        let available = self.refresh_input_fields();
+        if let Some(obj) = input_buttons.as_object_mut() {
+            obj.insert("available".into(), json!(available));
+        }
         Ok(json!({
             "connected": true,
             "system": "pc98",
@@ -588,7 +604,7 @@ impl<G: GdbTransport> Bridge<G> {
                 "trace": true,
                 "state_restore": state_restore_info(),
             },
-            "input_buttons": input_buttons_json(),
+            "input_buttons": input_buttons,
         }))
     }
 
@@ -607,7 +623,7 @@ impl<G: GdbTransport> Bridge<G> {
         }
         hex::decode(hexstr).map_err(|_| BridgeError::BadParams("hex decode failed".into()))?;
         let size = hexstr.len() / 2;
-        let resp = self.gdb.send(&format!("M{address:x},{size:x}:{hexstr}"))?;
+        let resp = self.send_cmd(&format!("M{address:x},{size:x}:{hexstr}"))?;
         if resp != "OK" {
             return Err(BridgeError::Emulator(format!(
                 "GDB memory write failed: {resp}"
@@ -1137,15 +1153,79 @@ impl<G: GdbTransport> Bridge<G> {
 
     fn set_input(&mut self, params: &Value) -> BridgeResult<Value> {
         let buttons = normalize_buttons(params.get("buttons"))?;
-        self.lua_cmd("setinput", Some(&buttons.join(",")))?;
+        if let Err(err) = self.lua_cmd("setinput", Some(&buttons.join(","))) {
+            return Err(self.explain_input_failure(err, &buttons));
+        }
         Ok(json!({ "buttons": buttons }))
     }
 
     fn press_buttons(&mut self, params: &Value) -> BridgeResult<Value> {
         let buttons = normalize_buttons(params.get("buttons"))?;
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
-        self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(","))))?;
+        if let Err(err) = self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(",")))) {
+            return Err(self.explain_input_failure(err, &buttons));
+        }
         Ok(json!({ "buttons": buttons, "frames": frames }))
+    }
+
+    fn refresh_input_fields(&mut self) -> Vec<String> {
+        // 머신 ioport에 실제 등록된 키 필드를 조회한다. 버튼 이름은 균일 매핑을 유지하고,
+        // 가용성만 머신별로 다르므로 status/에러가 이 목록을 정본으로 노출한다. 구 plugin은
+        // 이 쿼리를 몰라 빈 응답→Err이니 빈 목록으로 폴백한다(비-non-empty만 캐시).
+        if let Some(cached) = &self.input_fields {
+            return cached.clone();
+        }
+        let fields = self
+            .lua_cmd_reply("inputfields", None)
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !fields.is_empty() {
+            self.input_fields = Some(fields.clone());
+        }
+        fields
+    }
+
+    fn explain_input_failure(&mut self, err: BridgeError, buttons: &[String]) -> BridgeError {
+        // E08 = 이 머신 ioport에 등록되지 않은 키. 어느 버튼이 없고 무엇이 가능한지 이름을 붙여
+        // 돌려준다(맨몸 E08 패스스루 금지). plugin이 E08:<key>로 미해결 키를 보고하면 그걸 쓰고,
+        // 아니면 가용 목록과 대조해 유추한다.
+        let msg = err.to_string();
+        let Some(idx) = msg.find("E08") else {
+            return err;
+        };
+        let reported = msg[idx + 3..]
+            .trim_start_matches(':')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let available = self.refresh_input_fields();
+        let unavailable: Vec<String> = if !reported.is_empty() {
+            vec![reported]
+        } else {
+            buttons
+                .iter()
+                .filter(|b| !available.iter().any(|a| a == *b))
+                .cloned()
+                .collect()
+        };
+        let avail_str = if available.is_empty() {
+            "(unknown; plugin does not report input fields)".to_string()
+        } else {
+            available.join(", ")
+        };
+        BridgeError::Emulator(format!(
+            "PC-98 key(s) not registered on this machine: {}; available: {}",
+            unavailable.join(", "),
+            avail_str
+        ))
     }
 
     fn reset(&mut self) -> BridgeResult<Value> {
@@ -1322,6 +1402,16 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn call_stack(&mut self) -> BridgeResult<Value> {
+        // 트레이싱 중이면 call/ret 트레이스 스캔이 정확하니 그대로 쓴다. 아니면 정지 상태의
+        // BP(EBP) 체인을 걸어 트레이스 없이 복원한다 — method 필드로 호출자가 신뢰도를 판단한다.
+        if self.tracing {
+            self.call_stack_from_trace()
+        } else {
+            self.call_stack_from_frame_pointer()
+        }
+    }
+
+    fn call_stack_from_trace(&mut self) -> BridgeResult<Value> {
         let rows = self.read_trace_rows()?;
         let mut stack = Vec::new();
         let mut frames = Vec::new();
@@ -1347,14 +1437,83 @@ impl<G: GdbTransport> Bridge<G> {
             "call_stack": stack,
             "frames": frames,
             "depth": stack.len(),
+            "method": "trace",
             "tracing": self.tracing,
             "total": rows.len(),
         }))
     }
 
+    fn call_stack_from_frame_pointer(&mut self) -> BridgeResult<Value> {
+        // 표준 BP 프롤로그(push bp; mov bp,sp)를 가정한다 — 모든 루틴이 이를 지키진 않으므로
+        // method="frame_pointer"로 알려 호출자가 신뢰도를 판단하게 한다.
+        let state = state_from_regs_hex(&self.read_regs_hex()?);
+        let get = |name: &str| state.get(name).and_then(Value::as_u64).unwrap_or(0);
+        let (ebp, esp, eip, ss) = (
+            get("cpu.ebp"),
+            get("cpu.esp"),
+            get("cpu.eip"),
+            get("cpu.ss"),
+        );
+        // CR0.PE는 RSP 레지스터 셋에 없다. 값 크기로 real16 vs protected32를 추정한다(caveat:
+        // 라이브 검증 필요). 모두 16비트 안이면 real16, 아니면 32비트 평면으로 본다.
+        let real_mode = ebp <= 0xFFFF && esp <= 0xFFFF && eip <= 0xFFFF;
+        let (ptr_size, seg_base, bp_mask) = if real_mode {
+            (2usize, ss << 4, 0xFFFFu64)
+        } else {
+            (4usize, 0u64, 0xFFFF_FFFFu64)
+        };
+        let mut bp = ebp & bp_mask;
+        let mut stack = Vec::new();
+        let mut frames = Vec::new();
+        for _ in 0..64 {
+            if bp == 0 {
+                break;
+            }
+            let base = seg_base.wrapping_add(bp);
+            // 1MB+A20 상한을 넘는 주소는 무효로 보고 멈춘다.
+            if base.saturating_add(2 * ptr_size as u64) > 0x0011_0000 {
+                break;
+            }
+            let Some(saved_bp) = self.read_ptr_le(base, ptr_size) else {
+                break;
+            };
+            let Some(ret_addr) = self.read_ptr_le(base + ptr_size as u64, ptr_size) else {
+                break;
+            };
+            stack.push(ret_addr);
+            frames.push(json!({ "pc": ret_addr, "frame_pointer": bp }));
+            if saved_bp <= bp {
+                // 비-증가/무효 bp → 프레임 체인 종료.
+                break;
+            }
+            bp = saved_bp & bp_mask;
+        }
+        Ok(json!({
+            "call_stack": stack,
+            "frames": frames,
+            "depth": stack.len(),
+            "method": "frame_pointer",
+            "mode": if real_mode { "real16" } else { "protected32" },
+            "pointer_size": ptr_size,
+            "frame_pointer": ebp & bp_mask,
+            "tracing": self.tracing,
+        }))
+    }
+
+    fn read_ptr_le(&mut self, address: u64, size: usize) -> Option<u64> {
+        let hex = self.read_abs_hex(address, size).ok()?;
+        little_hex_to_u64(&hex)
+    }
+
     fn step_instruction_count(&mut self, count: u64) -> BridgeResult<Value> {
         for _ in 0..count {
-            let resp = self.gdb.send("s")?;
+            // s는 정상 응답 자체가 stop이라 send_cmd의 demux(command_expects_stop 아닌 명령만)가
+            // 스킵된다. 그래서 s 앞에 낀 stale async stop(직전 framestep/BP 히트)은 send_cmd로도
+            // 안 걷혀 s의 응답 자리에 오배달되고, 스텝이 실제로 안 돌고도 완료로 오인돼 off-by-one
+            // 디싱크가 남는다. 스텝 전에 버퍼의 stale stop을 이벤트 큐로 걷어낸 뒤(=note_stop) s를
+            // send_cmd로 보내 진짜 스텝 완료 stop을 응답으로 받는다(=re-read).
+            self.drain_buffered_stops()?;
+            let resp = self.send_cmd("s")?;
             if resp.starts_with('E') {
                 return Err(BridgeError::Emulator(format!(
                     "GDB instruction step failed: {resp}"
@@ -1430,7 +1589,7 @@ impl<G: GdbTransport> Bridge<G> {
             let chunk = MAX_READ_CHUNK.min(data.len() - offset);
             let hex = hex::encode(&data[offset..offset + chunk]);
             let address = region.base as u64 + start as u64 + offset as u64;
-            let resp = self.gdb.send(&format!("M{address:x},{chunk:x}:{hex}"))?;
+            let resp = self.send_cmd(&format!("M{address:x},{chunk:x}:{hex}"))?;
             if resp != "OK" {
                 return Err(BridgeError::Emulator(format!(
                     "GDB memory write failed: {resp}"
@@ -1509,9 +1668,11 @@ impl<G: GdbTransport> Bridge<G> {
         let mut offset = 0usize;
         while offset < length {
             let chunk = std::cmp::min(MAX_READ_CHUNK, length - offset);
-            let resp = self
-                .gdb
-                .send(&format!("m{:x},{:x}", address + offset as u64, chunk))?;
+            // send_cmd 경유로 demux한다(raw send 금지). m 응답 앞에 낀 stale async stop이 이
+            // 읽기의 응답 자리에 오배달되면 stop 문자열이 hex로 디코드돼 실패하고 이후 요청이
+            // 통째로 off-by-one 디싱크된다. m은 command_expects_stop이 아니라 send_cmd가 앞선
+            // stop을 이벤트 큐로 걷어내고 진짜 hex 응답을 이어 읽는다.
+            let resp = self.send_cmd_data(&format!("m{:x},{:x}", address + offset as u64, chunk))?;
             if resp.starts_with('E') {
                 return Err(BridgeError::Emulator(format!(
                     "GDB memory read failed: {resp}"
@@ -1524,7 +1685,7 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn read_regs_hex(&mut self) -> BridgeResult<String> {
-        let resp = self.gdb.send("g")?;
+        let resp = self.send_cmd_data("g")?;
         if resp.starts_with('E') {
             return Err(BridgeError::Emulator(format!(
                 "GDB register read failed: {resp}"
@@ -1546,13 +1707,51 @@ impl<G: GdbTransport> Bridge<G> {
         hex::decode(hex).map_err(|_| BridgeError::Emulator("GDB returned invalid hex".into()))
     }
 
+    fn send_cmd(&mut self, payload: &str) -> BridgeResult<String> {
+        // framestep/BP/WP 히트의 async stop이 drain 창 밖에서 도착하면 버퍼에 남아, 이 데이터
+        // 명령의 응답 자리에 오배달돼 이후 요청/응답이 통째로 off-by-one 디싱크된다. stop을
+        // 정상 응답으로 받는 명령이 아니면, 앞선 stale stop을 이벤트 큐로 걷어내고 진짜 응답을
+        // 이어 읽는다.
+        let mut resp = self.gdb.send(payload)?;
+        if !command_expects_stop(payload) {
+            while is_stop_packet(&resp) {
+                self.note_stop(resp, false);
+                resp = self.gdb.recv_reply()?;
+            }
+        }
+        Ok(resp)
+    }
+
+    /// 데이터(hex/숫자) 응답을 기대하는 명령용 — send_cmd의 stale-stop demux에 더해 스트림에 낀 stale "OK"도
+    /// 걷어낸다. 트레이싱 중 runframes의 frame-target이 pause_on_hit BP 히트와 겹치면 하나의 runframes에
+    /// 완료 "OK"와 BP stop이 이중 응답되고, 브리지가 그중 하나를 소비하면 나머지(늦게 도착한 stale "OK")가
+    /// 다음 데이터 명령(g 레지스터·m 메모리·qEmucap,frame·기타 lua_cmd_reply 읽기)의 응답 자리에 오배달돼
+    /// off-by-one desync된다(get_state가 raw_register_bytes로 깨지고 이후 traceflush가 register 패킷을 받음).
+    /// 데이터를 기대하는 호출자만 이 경로를 쓰고(호출자가 의도 선언), "OK"가 유효 응답인 명령(쓰기 M/G,
+    /// lua_cmd)은 send_cmd를 그대로 써 정상 OK를 소비한다. 드레인 창 크기에 의존하지 않는 결정론적 재정렬.
+    fn send_cmd_data(&mut self, payload: &str) -> BridgeResult<String> {
+        debug_assert!(!command_expects_stop(payload));
+        let mut resp = self.gdb.send(payload)?;
+        // 데이터 응답 앞에 낀 stale stop(이벤트 큐로)과 stale "OK"(폐기)를 모두 걷어내고 진짜 응답을 읽는다.
+        loop {
+            if is_stop_packet(&resp) {
+                self.note_stop(resp, false);
+            } else if resp == "OK" {
+                // stale 완료 OK — 이 데이터 명령의 유효 응답이 아니므로 폐기(이중 응답의 잔재).
+            } else {
+                return Ok(resp);
+            }
+            resp = self.gdb.recv_reply()?;
+        }
+    }
+
     fn lua_cmd(&mut self, name: &str, arg: Option<&str>) -> BridgeResult<String> {
         let mut payload = format!("qEmucap,{name}");
         if let Some(arg) = arg {
             payload.push(',');
             payload.push_str(&hex::encode(arg.as_bytes()));
         }
-        let resp = self.gdb.send(&payload)?;
+        let resp = self.send_cmd(&payload)?;
         if resp.is_empty() || resp.starts_with('E') {
             return Err(BridgeError::Emulator(format!(
                 "MAME Lua command {name} failed: {resp}"
@@ -1583,20 +1782,31 @@ impl<G: GdbTransport> Bridge<G> {
             payload.push(',');
             payload.push_str(&hex::encode(arg.as_bytes()));
         }
-        self.gdb.send(&payload)
+        // 주의: lua_cmd_reply 명령 중 clearpoint 등은 bare "OK"를 정상 반환하므로 여기서 send_cmd_data로
+        // 드레인하면 안 된다(진짜 OK를 stale로 오인해 hang). stale-OK 드레인은 응답이 절대 bare "OK"가 아닌
+        // 데이터 명령(g/m/qEmucap,frame)에서만 명시적으로 send_cmd_data로 한다.
+        self.send_cmd(&payload)
     }
 
     fn current_frame(&mut self) -> Option<u64> {
-        self.lua_cmd_reply("frame", None)
+        // frames_op(runframes/framestep) 직후 run_frames/step 핸들러가 필수로 호출한다 — 그 직전 이벤트
+        // (BP 히트가 frame-target과 겹침)의 spurious bare "OK"가 이 frame 응답 자리에 오배달되면, 이후 g가
+        // 프레임 10진수를 레지스터 hex로 오소비해 desync된다. frame 응답은 10진수(bare OK가 아님)라
+        // send_cmd_data로 앞에 낀 stale bare "OK"를 걷어낸다.
+        self.send_cmd_data("qEmucap,frame")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
     }
 
     fn frames_op(&mut self, name: &str, frames: u64) -> BridgeResult<Option<String>> {
         let previous = self.gdb.get_timeout()?;
+        // 트레이싱 중이면 프레임마다 수십만 명령을 디스어셈+기록하므로 무트레이스 50ms/frame
+        // 예산으론 타임아웃→지연 stop이 늦게 도착한다. 트레이스일 때 프레임당 예산을 크게 잡아
+        // 지연 응답이 이 recv 창 안에서 매칭되게 한다.
+        let per_frame_ms = if self.tracing { 5_000 } else { 50 };
         let timeout = Duration::from_millis(
             5_000u64
-                .saturating_add(frames.saturating_mul(50))
+                .saturating_add(frames.saturating_mul(per_frame_ms))
                 .min(600_000),
         );
         self.gdb.set_timeout(timeout)?;
@@ -1620,7 +1830,7 @@ impl<G: GdbTransport> Bridge<G> {
             payload.push(',');
             payload.push_str(&hex::encode(arg.as_bytes()));
         }
-        let resp = self.gdb.send(&payload)?;
+        let resp = self.send_cmd(&payload)?;
         if resp == "OK" {
             return self.drain_immediate_stops();
         }
@@ -1641,6 +1851,21 @@ impl<G: GdbTransport> Bridge<G> {
         if let Some(stop) = self.gdb.recv_nonblocking()? {
             if is_stop_packet(&stop) {
                 self.note_stop(stop, false);
+            }
+        }
+        Ok(())
+    }
+
+    /// 버퍼에 남은 stale async stop을 블로킹 없이 이벤트 큐로 걷어낸다. s처럼 응답 자체가
+    /// stop인 명령(command_expects_stop)을 보내기 전에, 앞선 미소비 stop이 그 명령의 응답
+    /// 자리에 오배달되는 걸 막는다. drain_stop은 frozen이면 조기 반환하지만 스텝 직전엔 frozen
+    /// 중에도 직전 프레임 진행의 지연 stop이 남을 수 있어 별도로 항상 버퍼를 비운다.
+    fn drain_buffered_stops(&mut self) -> BridgeResult<()> {
+        while let Some(pkt) = self.gdb.recv_nonblocking()? {
+            if is_stop_packet(&pkt) {
+                self.note_stop(pkt, false);
+            } else {
+                break;
             }
         }
         Ok(())
@@ -2046,6 +2271,20 @@ fn input_alias(key: &str) -> Option<&'static str> {
 
 fn is_stop_packet(resp: &str) -> bool {
     resp.starts_with('S') || resp.starts_with('T')
+}
+
+/// 이 명령의 정상 RSP 응답 자체가 stop 패킷인 명령인지. continue/step/`?`/vCont 외에,
+/// framestep·runframes는 프레임 노티파이어가 목표에 도달할 때 stop을 지연 응답으로 보내므로
+/// 여기에 포함한다 — 이들 응답의 stop은 stale이 아니라 정상 응답이라 demux하면 안 된다.
+fn command_expects_stop(payload: &str) -> bool {
+    payload == "c"
+        || payload == "s"
+        || payload == "?"
+        || payload.starts_with('C')
+        || payload.starts_with('S')
+        || payload.starts_with("vCont")
+        || payload.starts_with("qEmucap,framestep")
+        || payload.starts_with("qEmucap,runframes")
 }
 
 fn parse_breakpoint_reply(resp: &str) -> BridgeResult<(String, u64)> {
@@ -3516,12 +3755,21 @@ mod tests {
 
     #[test]
     fn status_drains_nonblocking_stop_when_running() {
-        let fake = FakeGdb::with(&[("?", ""), ("qEmucap,frame", "12")]).with_nonblocking(&["S05"]);
+        let fake = FakeGdb::with(&[
+            ("?", ""),
+            ("qEmucap,inputfields", "enter,esc,space,a,b"),
+            ("qEmucap,frame", "12"),
+        ])
+        .with_nonblocking(&["S05"]);
         let mut bridge = Bridge::new(fake, BridgeEnv::default());
         bridge.frozen = false;
         let response = bridge.handle_request(Request::new(18, "status", json!({})));
         let result = response.result.unwrap();
         assert_eq!(result["state"], "frozen");
+        assert_eq!(
+            result["input_buttons"]["available"],
+            json!(["enter", "esc", "space", "a", "b"])
+        );
     }
 
     #[test]
@@ -3759,5 +4007,297 @@ mod tests {
         .unwrap();
         assert_eq!(client.send("g").unwrap(), "OK");
         handle.join().unwrap();
+    }
+
+    // P1: stale async stop이 데이터 명령의 응답 자리에 오배달돼도 send_cmd가 이벤트 큐로
+    // 걷어내고 진짜 응답을 이어 읽어 off-by-one 디싱크를 막는지 검증한다.
+    #[derive(Default)]
+    struct StaleStopGdb {
+        stale: Option<String>,
+        reply: String,
+    }
+
+    impl GdbTransport for StaleStopGdb {
+        fn send(&mut self, payload: &str) -> BridgeResult<String> {
+            if payload == "?" {
+                return Ok("S05".into());
+            }
+            Ok(self.stale.take().unwrap_or_else(|| self.reply.clone()))
+        }
+
+        fn recv_reply(&mut self) -> BridgeResult<String> {
+            Ok(self.reply.clone())
+        }
+
+        fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+
+        fn interrupt(&mut self) -> BridgeResult<String> {
+            Ok("S05".into())
+        }
+    }
+
+    #[test]
+    fn send_cmd_demuxes_stale_async_stop_ahead_of_data_reply() {
+        let gdb = StaleStopGdb {
+            stale: Some("T05".into()),
+            reply: "OK".into(),
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let resp = bridge
+            .send_cmd("qEmucap,setinput,656e746572")
+            .expect("send_cmd returns the real reply");
+        assert_eq!(resp, "OK");
+        assert_eq!(bridge.events.len(), 1);
+        assert_eq!(bridge.events[0]["type"], "stop");
+    }
+
+    // F1: m 읽기(read_abs_hex → read_memory/dump_memory/save_state/find_pattern/probe/call_stack)가
+    // send_cmd demux를 경유해, 응답 앞에 낀 stale async stop을 이벤트 큐로 걷어내고 진짜 hex
+    // 응답을 반환하는지 검증한다. raw send면 stop이 hex 자리에 오배달돼 디코드 실패 + off-by-one.
+    struct StaleStopReadGdb {
+        stale: Option<String>,
+        hex: String,
+        reads: Vec<String>,
+    }
+
+    impl GdbTransport for StaleStopReadGdb {
+        fn send(&mut self, payload: &str) -> BridgeResult<String> {
+            if payload == "?" {
+                return Ok("S05".into());
+            }
+            self.reads.push(payload.into());
+            Ok(self.stale.take().unwrap_or_else(|| self.hex.clone()))
+        }
+
+        fn recv_reply(&mut self) -> BridgeResult<String> {
+            Ok(self.hex.clone())
+        }
+
+        fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+
+        fn interrupt(&mut self) -> BridgeResult<String> {
+            Ok("S05".into())
+        }
+    }
+
+    #[test]
+    fn read_abs_hex_demuxes_stale_stop_ahead_of_memory_reply() {
+        let gdb = StaleStopReadGdb {
+            stale: Some("T05hwbreak:00100000;idx:1".into()),
+            hex: "deadbeef".into(),
+            reads: Vec::new(),
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let hex = bridge
+            .read_abs_hex(0x1234, 4)
+            .expect("read_abs_hex returns the real hex reply");
+        assert_eq!(hex, "deadbeef");
+        // stale stop이 hex 응답 자리에 오배달되지 않고 이벤트 큐로 걷혔다.
+        assert_eq!(bridge.events.len(), 1);
+        assert_eq!(bridge.events[0]["raw"], "T05hwbreak:00100000;idx:1");
+        // 데이터 명령이 실제 m 읽기였는지(demux는 m 자체는 건드리지 않는다).
+        assert!(
+            bridge.gdb.reads.iter().any(|c| c.starts_with('m')),
+            "issued an m read: {:?}",
+            bridge.gdb.reads
+        );
+    }
+
+    #[test]
+    fn send_cmd_drains_stale_ok_ahead_of_register_read() {
+        // 트레이싱 중 runframes가 frame-target에 도달한 순간 BP도 히트하면, frame notifier의 완료 "OK"와
+        // note_breakpoint의 BP stop이 하나의 runframes에 이중 응답한다. 브리지가 그중 하나를 소비하면 나머지
+        // stale "OK"가 다음 데이터 명령(g=레지스터)의 응답 자리에 오배달돼 off-by-one desync된다
+        // (get_state가 raw_register_bytes로 깨지고 이후 traceflush가 register 패킷을 받음). send_cmd는 데이터
+        // 읽기 앞의 stale "OK"를 걷어내고 진짜 hex를 재읽기해야 한다.
+        let gdb = StaleStopReadGdb {
+            stale: Some("OK".into()),
+            hex: "00ff0000160000008080".into(), // i386 레지스터 hex(축약)
+            reads: Vec::new(),
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let resp = bridge.send_cmd_data("g").expect("g returns register hex");
+        assert_eq!(
+            resp, "00ff0000160000008080",
+            "g는 stale OK가 아니라 레지스터 hex를 받아야(desync 없음)"
+        );
+    }
+
+    #[test]
+    fn send_cmd_data_drains_stale_ok_ahead_of_frame_read() {
+        // run_frames/step은 frames_op 직후 qEmucap,frame(current_frame)을 필수로 부른다. 이 경로도
+        // send_cmd_data를 타야 stale bare "OK"가 frame 응답 자리에 오배달(→ 이후 g가 프레임 숫자를 레지스터로
+        // 오소비)되는 것을 막는다. g/m 하드코딩이 아닌 명령-의도 기반이라 frame도 커버된다.
+        let gdb = StaleStopReadGdb {
+            stale: Some("OK".into()),
+            hex: "2028".into(), // qEmucap,frame의 10진 프레임 번호
+            reads: Vec::new(),
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let resp = bridge
+            .send_cmd_data("qEmucap,frame")
+            .expect("frame returns the decimal frame number");
+        assert_eq!(resp, "2028", "frame은 stale OK가 아니라 프레임 번호를 받아야");
+    }
+
+    #[test]
+    fn send_cmd_data_keeps_ok_pipe_data_reply() {
+        // 회귀 가드: saveitems/loaditems/regload은 성공 시 "OK|<data>"를 반환한다 — bare "OK"가 아니므로
+        // send_cmd_data가 이를 stale로 오인해 드레인하면 안 된다(그러면 hang). "OK|..."는 그대로 반환.
+        let gdb = StaleStopReadGdb {
+            stale: None,
+            hex: "OK|3|0".into(),
+            reads: Vec::new(),
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let resp = bridge
+            .send_cmd_data("qEmucap,saveitems,2f74")
+            .expect("saveitems returns OK|data");
+        assert_eq!(resp, "OK|3|0", "\"OK|...\"는 유효 데이터라 드레인 금지");
+    }
+
+    // F3: s(instruction step)는 응답 자체가 stop이라 send_cmd demux가 스킵된다. 스텝 직전에
+    // 버퍼의 stale async stop을 걷어내(note_stop) s의 응답 자리 오배달을 막고, 진짜 스텝 완료
+    // stop을 응답으로 받아(re-read) instruction step이 유지되는지 검증한다.
+    struct StepStaleGdb {
+        buffered: VecDeque<String>,
+        step_reply: String,
+        steps: usize,
+    }
+
+    impl GdbTransport for StepStaleGdb {
+        fn send(&mut self, payload: &str) -> BridgeResult<String> {
+            if payload == "?" {
+                return Ok("S05".into());
+            }
+            if payload == "s" {
+                self.steps += 1;
+                return Ok(self.step_reply.clone());
+            }
+            Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        }
+
+        fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+
+        fn interrupt(&mut self) -> BridgeResult<String> {
+            Ok("S05".into())
+        }
+
+        fn recv_nonblocking(&mut self) -> BridgeResult<Option<String>> {
+            Ok(self.buffered.pop_front())
+        }
+    }
+
+    #[test]
+    fn step_instruction_drains_pre_command_stale_stop() {
+        let gdb = StepStaleGdb {
+            buffered: VecDeque::from(vec!["T05hwbreak:00100000;idx:2".to_string()]),
+            step_reply: "S05".into(),
+            steps: 0,
+        };
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let response =
+            bridge.handle_request(Request::new(40, "step_instructions", json!({"count": 1})));
+        assert!(response.ok, "instruction step still completes");
+        let result = response.result.unwrap();
+        assert_eq!(result["unit"], "instructions");
+        assert_eq!(result["count"], 1);
+        // stale stop이 s의 응답 자리에 오배달되지 않고 이벤트 큐로 걷혔다.
+        assert_eq!(bridge.events.len(), 1);
+        assert_eq!(bridge.events[0]["raw"], "T05hwbreak:00100000;idx:2");
+        // 스텝은 실제로 한 번 실행됐다(stale를 스텝 완료로 오인하지 않음).
+        assert_eq!(bridge.gdb.steps, 1);
+    }
+
+    // P2: 머신 ioport에 없는 버튼을 눌렀을 때, 어느 버튼이 없고 무엇이 가능한지 이름을 붙여
+    // 반환하는지 검증한다(맨몸 E08 패스스루 금지).
+    #[test]
+    fn set_input_names_unavailable_button_and_lists_machine_fields() {
+        let fake = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                format!("qEmucap,setinput,{}", hex::encode("help")),
+                "E08:help".into(),
+            ),
+            ("qEmucap,inputfields".into(), "a,b,enter,esc,space".into()),
+        ]);
+        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+        let response =
+            bridge.handle_request(Request::new(30, "set_input", json!({"buttons": ["help"]})));
+        assert!(!response.ok);
+        let msg = response.error.unwrap().message;
+        assert!(msg.contains("help"), "names the unavailable button: {msg}");
+        assert!(
+            msg.contains("enter") && msg.contains("space"),
+            "lists the machine-registered fields: {msg}"
+        );
+    }
+
+    // P3: 트레이스 없이 정지 상태의 BP(EBP) 체인을 걸어 호출 스택을 복원하고, 어느 방법을
+    // 썼는지 method 필드로 알리는지 검증한다.
+    struct CallStackFpGdb {
+        regs_hex: String,
+        mem: BTreeMap<u64, u64>,
+    }
+
+    impl GdbTransport for CallStackFpGdb {
+        fn send(&mut self, payload: &str) -> BridgeResult<String> {
+            if payload == "?" {
+                return Ok("S05".into());
+            }
+            if payload == "g" {
+                return Ok(self.regs_hex.clone());
+            }
+            if let Some(rest) = payload.strip_prefix('m') {
+                let (addr_hex, len_hex) = rest
+                    .split_once(',')
+                    .ok_or_else(|| BridgeError::Emulator(format!("bad read: {payload}")))?;
+                let addr = u64::from_str_radix(addr_hex, 16)
+                    .map_err(|_| BridgeError::Emulator(format!("bad addr: {payload}")))?;
+                let len = usize::from_str_radix(len_hex, 16)
+                    .map_err(|_| BridgeError::Emulator(format!("bad len: {payload}")))?;
+                let value = self.mem.get(&addr).copied().unwrap_or(0);
+                return Ok(hex::encode(&value.to_le_bytes()[..len]));
+            }
+            Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        }
+
+        fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+            Ok(())
+        }
+
+        fn interrupt(&mut self) -> BridgeResult<String> {
+            Ok("S05".into())
+        }
+    }
+
+    #[test]
+    fn call_stack_walks_frame_pointer_chain_without_trace() {
+        // eip를 16비트를 넘겨 protected32(포인터 4바이트, 평면 SS)로 판정되게 한다.
+        let regs = i386_regs_hex(&[("eip", 0x0010_0000), ("ebp", 0x1000), ("esp", 0x0FF0)]);
+        let mem = BTreeMap::from([
+            (0x1000u64, 0x1100u64), // saved_bp
+            (0x1004u64, 0xAAAAu64), // ret addr, frame 1
+            (0x1100u64, 0x0000u64), // saved_bp = 0 → 체인 종료
+            (0x1104u64, 0xBBBBu64), // ret addr, frame 2
+        ]);
+        let mut bridge = Bridge::new(
+            CallStackFpGdb {
+                regs_hex: regs,
+                mem,
+            },
+            BridgeEnv::default(),
+        );
+        let response = bridge.handle_request(Request::new(31, "call_stack", json!({})));
+        let result = response.result.unwrap();
+        assert_eq!(result["method"], "frame_pointer");
+        assert_eq!(result["call_stack"], json!([0xAAAA, 0xBBBB]));
+        assert_eq!(result["depth"], 2);
     }
 }

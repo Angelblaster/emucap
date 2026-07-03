@@ -87,7 +87,14 @@ pub fn mesen_spec(binary: &Path, log_path: &Path, lua: &Path, opts: &SpecOpts) -
             "--donotSaveSettings",
         ])
         .env("EMUCAP_PORT", opts.port.to_string())
-        .env("EMUCAP_CONTENT", opts.content);
+        .env("EMUCAP_CONTENT", opts.content)
+        // The entry Lua (emucap-snes.lua / emucap-sms.lua) dofile's emucap-core.lua from this dir.
+        .env(
+            "EMUCAP_ADAPTER_DIR",
+            lua.parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
     if let Some(name) = opts.name {
         spec = spec.env("EMUCAP_NAME", name);
     }
@@ -307,12 +314,12 @@ mod tests {
         let spec = mesen_spec(
             Path::new("/run/Mesen"),
             Path::new("/tmp/m.log"),
-            Path::new("/a/emucap-live.lua"),
+            Path::new("/a/emucap-snes.lua"),
             &opts("game.sfc"),
         );
         // ROM and adapter Lua are positional, first.
         assert_eq!(&spec.args[0], "game.sfc");
-        assert_eq!(&spec.args[1], "/a/emucap-live.lua");
+        assert_eq!(&spec.args[1], "/a/emucap-snes.lua");
         // Required settings are applied via CLI config override, not by editing the user's
         // settings.json (so the user's key mappings/controller are inherited untouched), and
         // --donotSaveSettings keeps the overrides out of the user's saved config.
@@ -367,5 +374,21 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-hard".to_string(), "disk.hdi".to_string()]));
         assert!(!spec.args.iter().any(|a| a == "-flop1"));
+    }
+
+    #[test]
+    fn mame_spec_mounts_second_floppy() {
+        let mut o = mame_opts("system.d88");
+        o.flop2 = Some("sampling.d88");
+        let spec = mame_spec(Path::new("/mame"), Path::new("/l"), &o);
+        // 2-드라이브 게임(System+Sampling): -flop1·-flop2 둘 다 마운트돼야 인게임까지 부팅된다.
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w == ["-flop1".to_string(), "system.d88".to_string()]));
+        assert!(spec
+            .args
+            .windows(2)
+            .any(|w| w == ["-flop2".to_string(), "sampling.d88".to_string()]));
     }
 }

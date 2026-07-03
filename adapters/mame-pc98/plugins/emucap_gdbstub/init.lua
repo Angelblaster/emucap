@@ -473,7 +473,23 @@ function emucap_gdbstub.startplugin()
   end
 
   local function idle_briefly()
-    pcall(function() os.execute("sleep 0.01") end)
+    -- freeze 스핀이 소켓 데이터를 기다리는 짧은 대기. os.execute("sleep")은 (a) Unix에서 idle마다
+    -- fork+exec 폭풍을 내고 (b) Windows엔 sleep 바이너리가 없어 즉시 실패→대기 없는 100% 스핀이
+    -- 된다(pcall이 에러를 삼킴). 프로세스를 스폰하지 않는 osd_ticks 바운드 대기로 대체해 양
+    -- 플랫폼 공통으로 폴 간격을 둔다(register_periodic 콜백 안이라 코루틴 yield/sleep API는 없음).
+    local ticks = emu.osd_ticks
+    local hz = emu.osd_ticks_per_second
+    if ticks and hz then
+      local rate = hz()
+      if rate and rate > 0 then
+        local deadline = ticks() + rate // 200  -- ~5ms
+        while ticks() < deadline do end
+        return
+      end
+    end
+    -- osd_ticks 미노출 시 표준 Lua os.clock 폴백(여전히 프로세스 스폰 없음).
+    local deadline = os.clock() + 0.005
+    while os.clock() < deadline do end
   end
 
   service_frozen_socket = function()
@@ -643,9 +659,9 @@ function emucap_gdbstub.startplugin()
     for _, key in ipairs(keys) do
       local field = input_fields[norm_key(key)]
       if not field then
-        print("emucap_gdbstub: unknown PC-98 key " .. tostring(key))
+        -- 미해결 키를 호출자에 돌려줘 브리지가 어느 버튼이 없는지 이름을 붙일 수 있게 한다.
         clear_inputs()
-        return false
+        return false, norm_key(key)
       end
       field:set_value(1)
       active_input_fields[field] = true
@@ -1071,10 +1087,11 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      if set_inputs(split_csv(buttons)) then
+      local ok, unresolved = set_inputs(split_csv(buttons))
+      if ok then
         ack_packet(socket, "OK")
       else
-        ack_packet(socket, "E08")
+        ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end
       return true
     elseif name == "press" then
@@ -1089,11 +1106,12 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      if set_inputs(split_csv(buttons)) then
+      local ok, unresolved = set_inputs(split_csv(buttons))
+      if ok then
         release_input_frame = current_frame() + frames
         ack_packet(socket, "OK")
       else
-        ack_packet(socket, "E08")
+        ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end
       return true
     elseif name == "framestep" or name == "runframes" then
@@ -1250,6 +1268,16 @@ function emucap_gdbstub.startplugin()
       else
         ack_packet(socket, "NONE")
       end
+      return true
+    elseif name == "inputfields" then
+      -- 이 머신이 런타임에 실제 등록한 키보드 ioport 필드 이름을 정렬해 돌려준다. 브리지는
+      -- 이를 status.input_buttons.available로 노출하고 미가용 버튼 에러에 가용 목록을 붙인다.
+      local keys = {}
+      for k, _ in pairs(input_fields) do
+        keys[#keys + 1] = k
+      end
+      table.sort(keys)
+      ack_packet(socket, table.concat(keys, ","))
       return true
     end
 

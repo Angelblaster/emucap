@@ -93,12 +93,20 @@ pub struct Launch<'a> {
     pub binary: &'a Path,
     pub repo_root: &'a Path,
     pub content: &'a str,
+    /// 2번째 플로피(선택). None이면 MAME_FLOP2 환경변수를 폴백으로 읽는다(legacy launch.sh와 동형).
+    pub flop2: Option<&'a str>,
     pub machine: &'a str,
     pub log_path: &'a Path,
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
     pub headless: bool,
+}
+
+/// 2번째 플로피 경로 결정: 명시 param(launch 툴 `content_path2` → `Launch.flop2`)이 우선, 없으면
+/// `MAME_FLOP2` 환경변수를 폴백으로(legacy launch.sh 동형). 둘 다 없으면 None(단일 매체).
+fn resolve_flop2<'a>(explicit: Option<&'a str>, env: Option<&'a str>) -> Option<&'a str> {
+    explicit.or(env)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +274,10 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
     // are usually absent from a user's romset and MAME refuses to start the machine without them.
     // `MAME_CBUS0` overrides (e.g. to load a specific board).
     let cbus0 = std::env::var("MAME_CBUS0").unwrap_or_default();
+    // 2번째 플로피: 명시 param 우선, 없으면 MAME_FLOP2 폴백(legacy launch.sh 동형). System+Sampling
+    // 2장짜리 게임은 두 장을 동시에 물려야 인게임까지 부팅된다 — 1장이면 검정 hang.
+    let flop2_env = std::env::var("MAME_FLOP2").ok();
+    let flop2 = resolve_flop2(l.flop2, flop2_env.as_deref());
 
     let opts = MameOpts {
         machine: l.machine,
@@ -275,7 +287,7 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         media: l.content,
         headless: l.headless,
         cbus0: Some(&cbus0),
-        flop2: None,
+        flop2,
         name: l.name,
         session_token: l.session_token,
     };
@@ -301,7 +313,7 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
 mod tests {
     use super::{
         default_rompath, gdb_port_for_emucap_port, repo_local_binary, resolve_bridge_launch,
-        resolve_bridge_script, Launch,
+        resolve_bridge_script, resolve_flop2, Launch,
     };
     use std::ffi::OsString;
     use std::path::Path;
@@ -469,6 +481,7 @@ mod tests {
             binary: &mame_bin,
             repo_root: dir.path(),
             content: "/game.hdi",
+            flop2: None,
             machine: "pc9801rs",
             log_path: &log,
             port: 47800,
@@ -509,6 +522,7 @@ mod tests {
             binary: &mame_bin,
             repo_root: dir.path(),
             content: "/game.hdi",
+            flop2: None,
             machine: "pc9801rs",
             log_path: &log,
             port: 47800,
@@ -551,6 +565,7 @@ mod tests {
             binary: &mame_bin,
             repo_root: dir.path(),
             content: "/game.hdi",
+            flop2: None,
             machine: "pc9801rs",
             log_path: &log,
             port: 47800,
@@ -571,6 +586,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_flop2_prefers_explicit_over_env() {
+        // 명시 param(launch 툴 content_path2)이 MAME_FLOP2 폴백보다 우선.
+        assert_eq!(resolve_flop2(Some("/a.d88"), Some("/b.d88")), Some("/a.d88"));
+        // param 없으면 env 폴백(legacy launch.sh 동형).
+        assert_eq!(resolve_flop2(None, Some("/b.d88")), Some("/b.d88"));
+        // 둘 다 없으면 단일 매체.
+        assert_eq!(resolve_flop2(None, None), None);
+    }
+
+    #[test]
     fn rust_bridge_selection_fails_before_mame_when_binary_missing() {
         let _lock = lock_env();
         let _env = EnvGuard::new(&["EMUCAP_PC98_BRIDGE", "EMUCAP_PC98_BRIDGE_BIN"]);
@@ -583,6 +608,7 @@ mod tests {
             binary: &mame_bin,
             repo_root: dir.path(),
             content: "/game.hdi",
+            flop2: None,
             machine: "pc9801rs",
             log_path: &log,
             port: 47800,
