@@ -80,7 +80,9 @@ pub(crate) struct ReadMemoryArgs {
 pub(crate) struct ProbeArgs {
     /// 베이스 세이브스테이트 경로. 어댑터가 load_state한 뒤 frame만큼 진행하고 타깃을 읽는다.
     pub(crate) state: String,
-    /// 베이스 상태에서 진행할 프레임 수.
+    /// 베이스 상태에서 진행할 프레임 수(deferred — 상한 적용). 과대값이 프로브를 딴 세계로 진행시켜
+    /// 링크를 데드라인까지 붙잡는 것을 막는다.
+    #[serde(deserialize_with = "deser_frame_count")]
     pub(crate) frame: u64,
     /// 읽을 메모리 타입(read_memory와 동일 식별자).
     pub(crate) memory_type: String,
@@ -149,6 +151,9 @@ pub(crate) struct PressArgs {
     #[serde(default)]
     pub(crate) port: u64,
     pub(crate) buttons: Vec<String>,
+    /// 누른 채 진행할 프레임 수(입력 hold — 작은 상한). 과대값은 링크 deadline을 넘겨 MCP 포기 후에도
+    /// 버튼이 눌린 채 남아 상태를 오염시키므로 deadline 안에 드는 상한을 건다.
+    #[serde(deserialize_with = "deser_input_frames")]
     pub(crate) frames: u64,
 }
 fn two() -> u64 {
@@ -159,11 +164,11 @@ pub(crate) struct TapArgs {
     #[serde(default)]
     pub(crate) port: u64,
     pub(crate) buttons: Vec<String>,
-    /// 누를 프레임 수(기본 2 — auto-repeat 미만의 짧은 탭으로 정확히 1칸/1회 이동)
-    #[serde(default = "two")]
+    /// 누를 프레임 수(기본 2 — auto-repeat 미만의 짧은 탭으로 정확히 1칸/1회 이동). 입력 hold라 작은 상한.
+    #[serde(default = "two", deserialize_with = "deser_input_frames")]
     pub(crate) press_frames: u64,
-    /// 떼고 더 진행할 프레임 수(기본 0). >0이면 입력+관찰을 한 콜에(frozen 유지)
-    #[serde(default)]
+    /// 떼고 더 진행할 프레임 수(기본 0). >0이면 입력+관찰을 한 콜에(frozen 유지). 해제 후라 입력 hold 아님.
+    #[serde(default, deserialize_with = "deser_frame_count")]
     pub(crate) after_frames: u64,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -171,8 +176,9 @@ pub(crate) struct TapSequenceArgs {
     #[serde(default)]
     pub(crate) port: u64,
     /// 각 원소가 한 탭의 버튼셋. 예: [["down"],["down"],["a"]] = 세 탭을 순차로
+    #[serde(deserialize_with = "deser_tap_steps")]
     pub(crate) steps: Vec<Vec<String>>,
-    #[serde(default = "two")]
+    #[serde(default = "two", deserialize_with = "deser_input_frames")]
     pub(crate) press_frames: u64,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -185,8 +191,8 @@ pub(crate) struct HoldUntilArgs {
     /// 주소(10진 또는 '0x'/'$' 16진)
     pub(crate) address: Num,
     pub(crate) length: Num,
-    /// 안 바뀌면 멈출 상한 프레임(기본 300)
-    #[serde(default = "three_hundred")]
+    /// 안 바뀌면 멈출 상한 프레임(기본 300). 입력을 누른 채 진행하므로 입력 hold 상한(작게).
+    #[serde(default = "three_hundred", deserialize_with = "deser_input_frames")]
     pub(crate) max_frames: u64,
 }
 fn three_hundred() -> u64 {
@@ -196,8 +202,60 @@ fn three_hundred() -> u64 {
 pub(crate) struct PathArgs {
     pub(crate) path: String,
 }
+
+/// 프레임/명령 진행 인자의 상한(~60fps로 약 4.6시간분). 상한 없는 n·frames·count·max_frames는
+/// deferred 명령을 사실상 무한 루프시켜 어댑터를 붙잡고, raw_call(및 그것이 쥔 SharedLink mutex)을
+/// wedge한다. regression.rs의 MAX_REPLAY_FRAMES와 같은 취지의 상한 — 초과는 조용히 자르지
+/// 않고(silent-wrong 금지) 에러로 드러낸다.
+pub(crate) const MAX_FRAME_ARG: u64 = 1_000_000;
+
+/// 프레임/명령 수 필드용 디시리얼라이저 — MAX_FRAME_ARG 초과를 거부한다. 값이 존재할 때만 호출되고
+/// (serde default는 필드 부재 시 우회하므로 기본값은 상한 검사 없이 통과 — 모두 상한 이내).
+fn deser_frame_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let n = u64::deserialize(d)?;
+    if n > MAX_FRAME_ARG {
+        return Err(serde::de::Error::custom(format!(
+            "프레임/명령 수 {n}이 상한 {MAX_FRAME_ARG} 초과 — 더 작게 나눠 호출하라"
+        )));
+    }
+    Ok(n)
+}
+
+/// tap 시퀀스 최대 스텝 수 — 한 MCP 콜이 무한 탭 시리즈로 팽창해 deferred 실행을 붙잡는 것을 막는다.
+pub(crate) const MAX_TAP_STEPS: usize = 4096;
+
+/// 입력을 누른 채 진행하는 deferred 명령(press/tap/hold)의 프레임 상한. run_frames/step(입력 없음)과 달리
+/// 큰 값은 링크 deadline(300s)을 넘겨 — MCP가 포기해 timeout/drop한 뒤에도 어댑터가 버튼을 계속 눌러
+/// 게임 상태를 오염시킨다(취소 경로도 없다). deadline 안에 드는 작은 상한으로 둔다(어떤 정상 입력 hold도
+/// 이보다 훨씬 짧다 — 60fps에서 ~166초).
+pub(crate) const MAX_INPUT_HOLD_FRAMES: u64 = 10_000;
+
+fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let n = u64::deserialize(d)?;
+    if n > MAX_INPUT_HOLD_FRAMES {
+        return Err(serde::de::Error::custom(format!(
+            "입력 hold 프레임 {n}이 상한 {MAX_INPUT_HOLD_FRAMES} 초과 — 링크 deadline을 넘겨 MCP 포기 후에도 입력이 눌린 채 남는다"
+        )));
+    }
+    Ok(n)
+}
+
+/// tap_sequence의 steps 길이 상한. deferred 데드라인이 총 벽시계를 이미 유한하게 하지만, 여기서도 초과를
+/// 조용히 자르지 않고 에러로 드러낸다.
+fn deser_tap_steps<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<String>>, D::Error> {
+    let v = Vec::<Vec<String>>::deserialize(d)?;
+    if v.len() > MAX_TAP_STEPS {
+        return Err(serde::de::Error::custom(format!(
+            "tap 시퀀스 스텝 수 {}가 상한 {MAX_TAP_STEPS} 초과 — 나눠 호출하라",
+            v.len()
+        )));
+    }
+    Ok(v)
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct RunFramesArgs {
+    #[serde(deserialize_with = "deser_frame_count")]
     pub(crate) n: u64,
 }
 fn one() -> u64 {
@@ -205,13 +263,13 @@ fn one() -> u64 {
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct StepArgs {
-    #[serde(default = "one")]
+    #[serde(default = "one", deserialize_with = "deser_frame_count")]
     pub(crate) frames: u64,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct StepInstructionsArgs {
     /// 진행할 CPU 명령 수
-    #[serde(default = "one")]
+    #[serde(default = "one", deserialize_with = "deser_frame_count")]
     pub(crate) count: u64,
 }
 #[derive(Deserialize, JsonSchema)]
@@ -265,6 +323,11 @@ pub(crate) struct WatchRegisterArgs {
     /// 벗어난 명령에서 freeze
     #[serde(default = "default_true")]
     pub(crate) pause_on_hit: bool,
+    /// 자동해제 예산(명령 수). watch_register는 매 명령 getState라 무기한이면 emu 스레드를 굶긴다 —
+    /// 이 명령 수만큼 실행 후 자동해제하고 watch_disarmed 이벤트를 남긴다. 미지정 시 어댑터 기본(1M).
+    /// 드문 후발 derail을 더 오래 감시하려면 키운다(상한 있음).
+    #[serde(default)]
+    pub(crate) max_instructions: Option<u64>,
 }
 fn sp_reg() -> String {
     "sp".into()
@@ -347,9 +410,11 @@ pub(crate) struct SetLayerEnableArgs {
 pub(crate) struct BisectArgs {
     /// 베이스 세이브스테이트 경로(매 프로브마다 여기로 복귀)
     pub(crate) state: String,
-    /// good(낮은) 프레임 경계
+    /// good(낮은) 프레임 경계(deferred — 상한 적용)
+    #[serde(deserialize_with = "deser_frame_count")]
     pub(crate) lo: u64,
-    /// bad(높은) 프레임 경계
+    /// bad(높은) 프레임 경계(deferred — 상한 적용)
+    #[serde(deserialize_with = "deser_frame_count")]
     pub(crate) hi: u64,
     pub(crate) memory_type: String,
     /// 주소(10진 또는 '0x'/'$' 16진)
@@ -382,6 +447,10 @@ pub(crate) struct LaunchPlanArgs {
 pub(crate) struct LaunchArgs {
     /// 실행할 ROM/disc/disk 경로(필수 — launch는 계획이 아니라 실제 실행이다).
     pub(crate) content_path: String,
+    /// 2번째 디스크/디스켓(선택 — 여러 매체를 동시에 물려야 부팅되는 타이틀용). 현재 PC-98 2-드라이브
+    /// 게임(System+Sampling 2장 동시 마운트)에서 쓰인다 — 1장만이면 검정 hang. 다른 어댑터는 무시한다.
+    #[serde(default)]
+    pub(crate) content_path2: Option<String>,
     /// 명시 시스템(snes 등). 미디어가 애매하면 지정한다.
     #[serde(default)]
     pub(crate) system: Option<String>,

@@ -357,6 +357,8 @@ fn missing_mame_bridge_response(
 fn normalize_system(system: &str) -> Option<&'static str> {
     match system.trim().to_ascii_lowercase().as_str() {
         "snes" | "super-famicom" | "super-nintendo" | "mesen" | "mesen2" => Some("snes"),
+        "gamegear" | "gg" | "game-gear" | "sms" | "mastersystem" | "master-system"
+        | "sega-mastersystem" => Some("gamegear"),
         "saturn" | "ss" | "sega-saturn" => Some("saturn"),
         "psx" | "ps1" | "playstation" | "playstation1" => Some("psx"),
         "pce" | "pcengine" | "pc-engine" | "pce-cd" | "pc-engine-cd" => Some("pce"),
@@ -481,7 +483,7 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "confidence": "none",
             "reason": format!("unsupported system={system:?}"),
             "needs_user_input": true,
-            "required_user_input": "지원 시스템 중 하나를 지정하라: snes, saturn, psx, pce, md, pc98, dc"
+            "required_user_input": "지원 시스템 중 하나를 지정하라: snes, gamegear, saturn, psx, pce, md, pc98, dc"
         });
     }
 
@@ -548,6 +550,13 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("gg" | "sms") => serde_json::json!({
+            "system": "gamegear",
+            "confidence": "extension",
+            "reason": "Game Gear / Master System ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("hdi" | "hdm" | "d88") => serde_json::json!({
             "system": "pc98",
             "confidence": "extension",
@@ -599,6 +608,7 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
 fn adapter_for_system(system: &str) -> (&'static str, Option<&'static str>) {
     match system {
         "snes" => ("mesen2", None),
+        "gamegear" => ("mesen2", None),
         "saturn" => ("mednafen", Some("ss")),
         "psx" => ("mednafen", Some("psx")),
         "pce" => ("mednafen", Some("pce")),
@@ -875,7 +885,7 @@ pub(crate) fn make_launch(
         }
     }
     match adapter {
-        "mesen2" => launch_mesen(port, token.as_deref(), a),
+        "mesen2" => launch_mesen(port, token.as_deref(), system, a),
         "mednafen" => launch_mednafen(port, token.as_deref(), module, a),
         "flycast" => launch_flycast(port, token.as_deref(), a),
         "mame_pc98" => launch_mame(port, token.as_deref(), a),
@@ -899,6 +909,7 @@ fn launch_mame(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Va
         binary: &binary,
         repo_root: &root,
         content: &a.content_path,
+        flop2: a.content_path2.as_deref(),
         machine: "pc9801rs",
         log_path: &log,
         port,
@@ -957,14 +968,20 @@ fn launch_flycast(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json:
 }
 
 /// SNES/Mesen leg of `make_launch`: resolve the binary + adapter Lua and hand off to the orchestrator.
-fn launch_mesen(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+fn launch_mesen(port: u16, token: Option<&str>, system: &str, a: &LaunchArgs) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
     let Some(binary) = emucap::launch::mesen::resolve_binary() else {
         return serde_json::json!({ "launched": false, "reason": "Mesen 바이너리 미발견 — MESEN_BIN을 Mesen 실행파일 또는 macOS Mesen.app 경로로 설정하라" });
     };
-    let lua = root.join("adapters/mesen2/emucap-live.lua");
+    // 시스템별 얇은 엔트리 스크립트(SYS config 설정 후 emucap-core.lua를 require). Mesen은 SNES/GG 둘 다 처리.
+    let entry = if system == "gamegear" {
+        "adapters/mesen2/emucap-sms.lua"
+    } else {
+        "adapters/mesen2/emucap-snes.lua"
+    };
+    let lua = root.join(entry);
     let log = adapter_log_path("mesen2", port, "mesen.log");
     let spec = emucap::launch::mesen::Launch {
         binary: &binary,

@@ -518,6 +518,7 @@ impl Emucap {
             a.min.get(),
             a.max.get(),
             a.pause_on_hit,
+            a.max_instructions,
         ) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),

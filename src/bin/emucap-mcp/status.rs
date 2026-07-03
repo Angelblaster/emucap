@@ -60,6 +60,12 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r", "lb": "l", "rb": "r"},
             "notes": "Mesen SNES uses lowercase SNES button names."
         }),
+        "gamegear" | "gg" | "sms" => serde_json::json!({
+            "system": "gamegear",
+            "buttons": ["up", "down", "left", "right", "one", "two", "pause"],
+            "aliases": {"start": "pause", "enter": "pause", "return": "pause", "a": "two", "b": "one", "1": "one", "2": "two", "button1": "one", "button2": "two"},
+            "notes": "Mesen Game Gear (SMS controller): one=Button1(B), two=Button2(A), pause=Start. Aliases let you use start/a/b/1/2."
+        }),
         // 알 수 없는 system은 어느 패드로도 위장하지 않는다 — 거짓 버튼 힌트 대신 input_buttons를 생략한다.
         _ => return None,
     })
@@ -327,7 +333,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "launch": abs_path_json(&root, &["adapters", "mesen2", "launch.sh"]),
                 "windows_script": abs_path_json(&root, &["adapters", "mesen2", "launch.ps1"]),
                 "platform_launch": mesen_launcher.display().to_string(),
-                "lua": abs_path_json(&root, &["adapters", "mesen2", "emucap-live.lua"]),
+                "lua": abs_path_json(&root, &["adapters", "mesen2", "emucap-core.lua"]),
             },
             "mednafen": {
                 "preferred_launcher": "MCP tool: launch",
@@ -372,6 +378,14 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "system": "snes",
             "adapter": "mesen2",
             "content": ["sfc", "smc"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
+        },
+        {
+            "system": "gamegear",
+            "aliases": ["gg", "game-gear", "sms", "master-system"],
+            "adapter": "mesen2",
+            "content": ["gg", "sms"],
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
         },

@@ -594,6 +594,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
         &mut link,
         &LaunchArgs {
             content_path: missing.display().to_string(),
+            content_path2: None,
             system: Some("snes".into()),
             name: None,
         },
@@ -637,6 +638,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
         &mut link,
         &LaunchArgs {
             content_path: disc.display().to_string(),
+            content_path2: None,
             system: Some("dc".into()),
             name: None,
         },
@@ -703,6 +705,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
         &mut link,
         &LaunchArgs {
             content_path: disk.display().to_string(),
+            content_path2: None,
             system: Some("pc98".into()),
             name: None,
         },
@@ -747,6 +750,7 @@ fn launch_refuses_occupied_port_before_spawn() {
         &mut link,
         &LaunchArgs {
             content_path: "/tmp/game.md".into(),
+            content_path2: None,
             system: Some("md".into()),
             name: None,
         },
@@ -815,6 +819,7 @@ fn launch_refuses_when_this_session_already_connected() {
         &mut link,
         &LaunchArgs {
             content_path: "/tmp/second.hdm".into(),
+            content_path2: None,
             system: Some("pc98".into()),
             name: Some("dup-B".into()),
         },
