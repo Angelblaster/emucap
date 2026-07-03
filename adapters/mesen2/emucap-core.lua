@@ -1211,6 +1211,13 @@ emu.addEventCallback(function()
   local cb_start_ms = os.clock() * 1000  -- 이번 콜백 진입(워치독 회피용 — 매 진입 리셋)
   local last_key_ms = 0                   -- freeze 핫키 폴 throttle(스핀이 빨라 매 반복 폴은 과함)
   while true do
+    -- 워치독 회피(명령 버스트): poll_line이 명령을 연속으로 반환하면 아래 `if line` 분기만 반복돼 예산
+    -- 재무장 검사(elseif)에 도달하지 못한 채 누적 실행이 1초 워치독을 넘겨 스크립트가 죽는다(poll_line에서
+    -- "Maximum execution time exceeded"). 최상단에서 명령 유무와 무관하게 예산 초과면 codeBreak를 재무장하고
+    -- 반환한다 — 큐에 남은 명령은 다음 codeBreak 진입에서 이어 서비스한다(스텝 1 드리프트는 기존 재무장과 동일).
+    if (os.clock() * 1000 - cb_start_ms) >= FREEZE_BUDGET_MS then
+      emu.step(1, emu.stepType.step); return
+    end
     -- 로컬 resume 핫키(frozen→running 토글). 스핀이 매우 빠르니 ~16ms마다만 폴(라이징 에지 1회).
     if FREEZE_KEY and freeze_key_ok then
       local now = os.clock() * 1000
