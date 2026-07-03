@@ -88,6 +88,13 @@ pub fn observe_hash(
                     }),
                 )
                 .map_err(|e| ObserveError::Link(e.to_string()))?;
+            // 부분 읽기(truncated)를 성공으로 받으면 prefix만 해시해 거짓 pass/fail이 난다 — 거부한다
+            // (어댑터가 잘라 응답하는 경우 방어. Mesen은 이제 over-cap을 아예 에러로 낸다).
+            if r.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Err(ObserveError::Decode(
+                    "read_memory 응답이 truncated=true — 부분 읽기는 검증에 못 쓴다(나눠 읽어라)".into(),
+                ));
+            }
             let hex = r
                 .get("hex")
                 .and_then(|h| h.as_str())

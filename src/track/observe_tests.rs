@@ -64,6 +64,22 @@ fn memory_observe_is_deterministic_and_typed() {
 }
 
 #[test]
+fn truncated_memory_read_is_rejected() {
+    // 부분 읽기(truncated=true)를 성공으로 받으면 prefix만 해시해 거짓 pass/fail이 난다 — 거부해야.
+    let mut link = ObsLink::new(&["read_memory"])
+        .resp("read_memory", json!({"hex": "0a0b", "truncated": true}));
+    let r = observe_hash(
+        &mut link,
+        &ObserveSpec::Memory {
+            memory_type: "wram".into(),
+            address: 0,
+            length: 200_000,
+        },
+    );
+    assert!(r.is_err(), "truncated 읽기는 검증 관측에서 거부해야: {r:?}");
+}
+
+#[test]
 fn different_bytes_differ() {
     let mut x = ObsLink::new(&["read_memory"]).resp("read_memory", json!({"hex": "0a0b"}));
     let mut y = ObsLink::new(&["read_memory"]).resp("read_memory", json!({"hex": "0a0c"}));
