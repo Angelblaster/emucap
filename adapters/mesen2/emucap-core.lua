@@ -1,3 +1,11 @@
+-- 이 파일은 제네릭 코어다. 시스템별 엔트리 스크립트(emucap-snes.lua/emucap-sms.lua)가 전역 SYS를
+-- 설정한 뒤 dofile(이 파일)한다. SYS는 buttons/aliases/system/system_label/cpu_type/default_memtype/
+-- reset_vector/bank_mirror/dump_regions/region_sizes를 담는다.
+assert(SYS and SYS.buttons and SYS.cpu_type and SYS.default_memtype,
+  "emucap-core: 전역 SYS config가 없다 — 엔트리 스크립트에서 SYS를 설정하고 dofile 하라")
+assert(SYS.disassemble and SYS.op_is_call and SYS.op_is_return and SYS.snapshot_regs,
+  "emucap-core: SYS에 ISA 구현이 없다 — 엔트리가 disassemble/op_is_call/op_is_return/snapshot_regs를 설정해야 한다")
+
 -- emucap Mesen2 라이브 클라이언트 (능동 제어)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
 -- 먼저 emucap-mcp 서버가 떠 있어야 한다(기본 포트 47800).
@@ -56,6 +64,8 @@ local next_bp_id = 1
 local breakpoints = {}         -- id -> { ref, kind, start, end, pause_on_hit, auto_savestate }
 local reset_bp = nil           -- break_on_reset: 리셋 핸들러 exec BP { ref, handler }
 local EVENT_CAP = 256
+local READ_CAP = 0x20000       -- read_memory 상한(워치독 안전: 대량 읽기가 emu 스레드를 초단위 블록하지 않게 — find_pattern SCAN_CAP과 동형)
+local WATCH_REG_BUDGET = 1000000  -- watch_register 자동해제 기본 예산(명령 수): full-range exec+매명령 getState라 무기한이면 emu 스레드를 굶긴다. p.max_instructions로 조정.
 local events = {}              -- poll_events로 드레인
 local dropped = 0              -- 큐 상한 초과로 버린 이벤트 수
 local CPU = nil                -- emu.cpuType.snes (로드 시 설정)
@@ -293,14 +303,8 @@ end
 local input_hold = nil   -- { port=, tbl={a=true,...} }
 
 -- Mesen emu.setInput은 소문자 키만 인식한다(대문자/오타는 에러 없이 무시됨).
-local VALID_BUTTONS = {
-  a = true, b = true, x = true, y = true, l = true, r = true,
-  start = true, select = true, up = true, down = true, left = true, right = true,
-}
-local BUTTON_ALIASES = {
-  enter = "start", ["return"] = "start",
-  l1 = "l", r1 = "r", lb = "l", rb = "r",
-}
+local VALID_BUTTONS = SYS.buttons
+local BUTTON_ALIASES = SYS.aliases
 local function buttons_to_table(buttons)
   local t = {}
   local unknown = {}
@@ -315,7 +319,7 @@ local function buttons_to_table(buttons)
     end
   end
   if #unknown > 0 then
-    return nil, "unknown SNES button(s): " .. table.concat(unknown, ", ")
+    return nil, "unknown " .. SYS.system_label .. " button(s): " .. table.concat(unknown, ", ")
   end
   return t
 end
@@ -338,7 +342,7 @@ local handlers = {}
 function handlers.hello()
   local result = {
     protocol_version = PROTOCOL_VERSION,
-    system = "snes",
+    system = SYS.system,
     adapter = "mesen2-live",
     build = os.getenv("EMUCAP_BUILD_HASH") or "unknown",  -- launch가 넘긴 emucap git hash(status.emulator_build)
     methods = { "read_memory", "screenshot", "get_state", "get_rom_info", "status",
@@ -368,8 +372,18 @@ end
 
 function handlers.read_memory(p)
   local mt = emu.memType[p.memory_type] or p.memory_type
+  local length = p.length or 0
+  if length < 0 then length = 0 end
+  -- 워치독 안전 상한: 멀티MB 읽기는 emu 스레드를 초단위 블록해 소켓을 굶긴다(find_pattern SCAN_CAP과 동형).
+  -- 넘치면 조용히 자르지 않고 에러로 거부한다 — truncated+ok로 부분 데이터를 성공처럼 돌려주면 검증
+  -- consumer(observe/regression)가 hex만 읽어 prefix만 해시/비교해 거짓 pass/fail을 낼 수 있다.
+  -- 큰 영역은 dump_memory를 쓰거나 READ_CAP 이하로 나눠 읽는다.
+  if length > READ_CAP then
+    return false, "bad_params",
+      string.format("read_memory length %d가 상한 %d 초과 — dump_memory를 쓰거나 나눠 읽어라", length, READ_CAP)
+  end
   local out = {}
-  for i = 0, (p.length - 1) do
+  for i = 0, length - 1 do
     out[#out + 1] = string.format("%02x", emu.read(p.address + i, mt, false))
   end
   return true, { hex = table.concat(out) }
@@ -552,6 +566,14 @@ local function snum(s)
 end
 
 local function record_hit(bp, addr, value)
+  -- 핫 BP 플러드 가드: pause_on_hit=false BP가 이벤트 버퍼(EVENT_CAP)를 채운 뒤엔 매 히트마다 비싼
+  -- emu.getState()를 부르지 않고 즉시 드롭한다. 프레임당 수천 번 실행되는 핫 주소에 exec/write BP를
+  -- 걸면 getState 플러드가 emu 스레드를 stall시켜 소켓을 굶기고 연결이 끊기던 문제를 막는다. freeze BP는
+  -- 첫 히트에서 STATE=frozen이 되어 스스로 멈추므로(더는 실행 안 함) 이 가드에서 제외한다.
+  if #events >= EVENT_CAP and not bp.pause_on_hit then
+    dropped = dropped + 1
+    return
+  end
   local st = emu.getState()
   if bp.pc_min then                       -- pc 조건: 지정 pc 범위에서 일어난 접근만(노이즈 제거)
     local pc = full_pc(st)
@@ -564,21 +586,20 @@ local function record_hit(bp, addr, value)
       type = "breakpoint_hit", breakpoint_id = bp.id, kind = bp.kind,
       address = addr, value = value or 0, pc = full_pc(st), frame = frame,
     }
-    -- write BP가 PPU 데이터 포트($2118/9 VRAM·$2122 CGRAM·$2104 OAM)에 걸렸으면 목적지 주소를 함께
-    -- 싣는다. dma BP가 DMA 적재를 잡듯, 이건 CPU의 소량 직접 포트 쓰기(STA $2118 등 타일맵 1엔트리)가
-    -- "VRAM 어느 워드주소로 갔나"를 PC·값과 함께 답하게 한다(런타임 라벨 타일맵 추적). addr은 뱅크미러로
-    -- $80xxxx일 수 있어 하위 16비트로 판별. (VRAM/OAM write를 소스+값과 함께 기록.)
-    if bp.kind == "write" then
-      local low = addr % 0x10000
-      if low == 0x2118 or low == 0x2119 then ev.vram_addr = st["ppu.vramAddress"]
-      elseif low == 0x2122 then ev.cgram_addr = st["ppu.cgramAddress"]
-      elseif low == 0x2104 then ev.oam_addr = st["ppu.oamRamAddress"] end
+    -- write BP가 시스템 데이터 포트에 걸렸으면 목적지 주소를 이벤트에 라벨링(런타임 타일맵 추적: CPU의
+    -- 소량 직접 포트 쓰기가 "어느 워드주소로 갔나"를 PC·값과 함께 답하게). 포트 의미는 ISA별이라
+    -- SYS.port_semantics로 위임 — SNES만 $2118/$2122/$2104를 라벨하고, 없는 시스템(GG 등)은 평범한 메모리
+    -- 접근이라 아무 것도 안 붙인다(SNES 하드코딩 누수 제거).
+    if bp.kind == "write" and SYS.port_semantics then
+      SYS.port_semantics(ev, addr, st)
     end
     -- 히트 순간 atomic 스냅샷: freeze 후 read 사이 워치독-회피 step(1) 드리프트(+데드맨)로 ZP 등
     -- 명령단위 상태가 호출마다 변해 "히트 순간"을 못 잡는다. 그래서 히트 시점에 레지스터(항상)와
     -- set_breakpoint의 snapshot 스펙(mt:addr:len) 메모리를 여기서 잡아 이벤트에 실어 보존 → 이후 드리프트 무관.
-    ev.regs = { pc = full_pc(st), a = st["cpu.a"], x = st["cpu.x"], y = st["cpu.y"],
-                sp = st["cpu.sp"], d = st["cpu.d"], dbr = st["cpu.dbr"], k = st["cpu.k"], ps = st["cpu.ps"] }
+    -- 레지스터 세트는 ISA별이라 SYS.snapshot_regs로 위임(SNES=65816, GG=Z80). pc는 두 ISA 공통(full_pc가
+    -- 뱅크 없는 Z80에선 cpu.pc로 축약).
+    ev.regs = SYS.snapshot_regs(st)
+    ev.regs.pc = full_pc(st)
     if bp.snapshot_specs then
       local snaps = {}
       for _, sp in ipairs(bp.snapshot_specs) do
@@ -619,17 +640,35 @@ end
 function handlers.watch_register(p)
   local id = next_bp_id; next_bp_id = next_bp_id + 1
   local reg = "cpu." .. (p.register or "sp")
+  local budget = math.max(1, p.max_instructions or WATCH_REG_BUDGET)
   local bp = {
     id = id, kind = "reg", register = p.register or "sp",
     min = p.min or 0, max = p.max or 0xffff, pause_on_hit = p.pause_on_hit,
     cbtype = emu.callbackType.exec, start = 0, end_ = 0xffffff,
+    seen = 0, budget = budget,
   }
   bp.ref = emu.addMemoryCallback(function(addr, value)
+    -- 플러드 가드(exemplar): 버퍼가 차고 비-pausing이면 매-명령 getState 전에 즉시 드롭.
+    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
+    -- 자동 해제: full-range exec가 매 명령 getState라, 레지스터가 범위 안이면 이벤트도 안 쌓여 위 가드가
+    -- 안 걸린 채 무기한 emu 스레드를 굶긴다. 명령 예산을 넘으면 스스로 콜백을 떼고(hunting 전용)
+    -- watch_disarmed 이벤트를 남긴다 → 조용한 stall이 아니게. 더 오래 감시하려면 max_instructions를 키우거나
+    -- 다시 무장. (자기 콜백 내 removeMemoryCallback은 Mesen에서 안전 — on_io_exec와 동일 패턴.)
+    bp.seen = bp.seen + 1
+    if bp.seen > bp.budget then
+      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)
+      breakpoints[id] = nil
+      if #events < EVENT_CAP then
+        events[#events + 1] = { type = "watch_disarmed", breakpoint_id = id, register = bp.register,
+          reason = "instruction_budget", instructions = bp.budget, frame = frame }
+      else dropped = dropped + 1 end
+      return
+    end
     local v = emu.getState()[reg]
     if v and (v < bp.min or v > bp.max) then record_reg_hit(bp, addr, v) end
   end, bp.cbtype, bp.start, bp.end_, CPU)
   breakpoints[id] = bp
-  return true, { id = id }
+  return true, { id = id, max_instructions = budget }
 end
 
 -- 비트 AND(순수 산술 — Lua 버전 무관). value_mask는 최대 32비트.
@@ -646,7 +685,10 @@ end
 -- 그대로 쓴다. value_len>1이면 저바이트=접근 바이트, 상위는 addr+i에서 little-endian으로 읽는다(SNES).
 local function access_value(bp, addr, value)
   if (bp.value_len or 1) <= 1 then return value end
-  local mt = emu.memType[bp.memory_type] or emu.memType.snesMemory
+  -- 상위바이트 읽기용 memory_type. §0에서 버스주소로 변환한 BP는 addr이 버스주소이므로 RAM-상대
+  -- memory_type(예 smsWorkRam)으로 addr+i를 읽으면 범위 밖을 읽는다 — 버스 memtype으로 읽어야 한다.
+  local mt = (bp.bus_translated and emu.memType[SYS.default_memtype])
+    or emu.memType[bp.memory_type] or emu.memType[SYS.default_memtype]
   local v = value
   for i = 1, bp.value_len - 1 do
     v = v + emu.read(addr + i, mt, false) * (256 ^ i)
@@ -657,8 +699,7 @@ end
 -- DMA 채널 스냅샷: MDMAEN($420B) 비트로 활성 채널의 src/dest/size/mode를 get_state에서 읽는다.
 -- DMA/HDMA는 CPU를 우회해 read/write BP가 못 잡으므로(NMI/VBlank 그래픽 전송), 이걸로 "무엇이
 -- 어디로 전송됐나"를 포착한다. MDMAEN write는 CPU 명령(STA $420B)이라 write 콜백으로 잡힌다.
-local function dma_snapshot(mdmaen)
-  local st = emu.getState()
+local function dma_snapshot(st, mdmaen)
   local chans = {}
   for ch = 0, 7 do
     if band(mdmaen, 2 ^ ch) ~= 0 then
@@ -690,6 +731,9 @@ function handlers.set_breakpoint(p)
     local evtype = (p.kind == "nmi") and emu.eventType.nmi or emu.eventType.irq
     local bp = { id = id, kind = p.kind, is_event = true, evtype = evtype, pause_on_hit = p.pause_on_hit }
     bp.ref = emu.addEventCallback(function()
+      -- 플러드 가드(exemplar): 스캔라인 IRQ는 프레임당 ~224회다. 버퍼가 차고 비-pausing이면 비싼 getState
+      -- 전에 즉시 드롭. pausing BP는 첫 히트에서 freeze해 스스로 멈추므로 예외.
+      if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
       local st = emu.getState()
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "breakpoint_hit", breakpoint_id = id, kind = p.kind,
@@ -705,6 +749,9 @@ function handlers.set_breakpoint(p)
   -- DMA: MDMAEN($420B, 또는 start로 지정) write 시 채널 스냅샷을 dma 이벤트로. 매 프레임 발생이라
   -- 기본은 freeze 안 함(pause_on_hit=true면 freeze). poll_events로 "이번 프레임 DMA"를 드레인.
   if p.kind == "dma" then
+    -- 능력 게이트: dma BP는 SNES MDMAEN($420B) 컨트롤러 전용이다. 그런 DMA가 없는 시스템(GG/Z80 등)은
+    -- honest unsupported를 낸다(break_on_reset의 `if not SYS.reset_vector` 패턴 — garbage 대신 명시적 에러).
+    if not SYS.dma_supported then return false, "unsupported", "dma breakpoints not supported for " .. SYS.system end
     -- $420B(MDMAEN)는 banks $00-$3F·$80-$BF에 미러된다. 게임이 어느 뱅크에서 STA $420B 하든 잡으려면
     -- 미러를 등록해야 한다(Mesen 메모리 콜백은 뱅크별 절대주소 — bank $00 등록은 bank $80 접근을 못 잡음).
     -- 기본은 슬로우($00:420B)·패스트($80:420B) 뱅크 둘. p.start로 특정 뱅크 미러만 지정 가능.
@@ -719,7 +766,11 @@ function handlers.set_breakpoint(p)
     local dest_filter, vmin, vmax = p.value, p.pc_min, p.pc_max
     local has_filter = (dest_filter ~= nil) or (vmin ~= nil) or (vmax ~= nil)
     local function on_dma(addr, value)
-      local chans = dma_snapshot(value)
+      -- 플러드 가드(exemplar): DMA write는 프레임마다 발생한다. 버퍼가 차고 비-pausing이면 dma_snapshot의
+      -- getState 전에 즉시 드롭.
+      if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
+      local st = emu.getState()          -- 히트당 1회: dma_snapshot과 pc 라벨이 같은 스냅샷을 공유(중복 getState 제거).
+      local chans = dma_snapshot(st, value)
       if has_filter then
         local kept = {}
         for _, c in ipairs(chans) do
@@ -738,7 +789,7 @@ function handlers.set_breakpoint(p)
       end
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "dma", breakpoint_id = id, address = addr, mdmaen = value,
-          channels = as_array(chans), pc = full_pc(emu.getState()), frame = frame }
+          channels = as_array(chans), pc = full_pc(st), frame = frame }
       else dropped = dropped + 1 end
       if bp.pause_on_hit and STATE ~= "frozen" then
         flush_deferred("interrupted", "dma", id); STATE = "frozen"; freeze_reason = "dma"; emu.breakExecution()
@@ -763,6 +814,17 @@ function handlers.set_breakpoint(p)
     has_value = has_value, value = p.value or 0,
     value_mask = p.value_mask or 0xFFFFFFFF, value_len = math.max(1, math.min(4, p.value_len or 1)),
   }
+  -- 주소 footgun 수정(§0): read/write BP는 CPU-버스 주소로 콜백을 단다 — addMemoryCallback은 memory_type을
+  -- 콜백 등록에 쓰지 않는다. 그래서 RAM memory_type의 상대 offset을 주면(예 GG smsWorkRam:0x0B) 버스 0x000B(ROM)에
+  -- 등록돼 영원히 미발동한다(read_memory는 같은 인자로 WRAM offset을 읽어 조용한 불일치). SYS.bp_bus_base에
+  -- 등록된 memory_type만 버스 base를 더해 실제 버스주소로 변환(smsWorkRam:0x0B → 0xC00B)해 발화하게 한다.
+  -- 이미 버스인 memory_type(smsMemory:0xC00B)·SNES(맵이 비어 identity)는 그대로.
+  if (p.kind == "read" or p.kind == "write") and SYS.bp_bus_base then
+    local base = SYS.bp_bus_base[bp.memory_type]
+    -- 변환하면 콜백 addr이 버스주소가 된다. value_len>1의 상위바이트를 읽을 때 RAM-상대 memory_type이
+    -- 아니라 버스 memtype으로 읽어야 하므로 표시해 둔다(access_value 참조).
+    if base then bp.start = bp.start + base; bp.end_ = bp.end_ + base; bp.bus_translated = true end
+  end
   -- snapshot: 히트 순간 atomic 캡처할 메모리 스펙 리스트("mt:addr:len", addr는 0x/$/10진). record_hit이
   -- 레지스터(항상)와 함께 이벤트에 싣는다 → 워치독 드리프트/데드맨 무관하게 히트 순간 보존.
   if p.snapshot then
@@ -787,7 +849,7 @@ function handlers.set_breakpoint(p)
   -- 둘 다 등록한다(Mesen 콜백은 뱅크별 절대주소 — bank $00만 걸면 bank $80 실행 게임의 $2117 등을 놓침
   -- ). 범위 BP·뱅크 명시 주소($XX0000+)·LowRAM($0000-$1FFF, snesWorkRam 권장)은 그대로.
   local mirrors = { { bp.start, bp.end_ } }
-  if (p.kind == "read" or p.kind == "write") and p.memory_type == "snesMemory"
+  if SYS.bank_mirror and (p.kind == "read" or p.kind == "write") and p.memory_type == SYS.default_memtype
      and bp.start == bp.end_ and bp.start >= 0x2000 and bp.start < 0x8000 then
     mirrors = { { bp.start, bp.start }, { bp.start + 0x800000, bp.start + 0x800000 } }
   end
@@ -851,9 +913,10 @@ end
 -- break_on_reset: 게임이 리셋 핸들러를 실행하면(워치독 리셋·하드 크래시→리셋) freeze. 리셋벡터
 -- $00:FFFC에서 핸들러 주소를 읽어 그 지점에 exec BP. (SNES엔 invalid opcode가 없고 SP wrap은 watch_register.)
 function handlers.break_on_reset(p)
+  if not SYS.reset_vector then return false, "unsupported", "break_on_reset not supported for " .. SYS.system end
   local on = p.enabled and true or false
   if on and not reset_bp then
-    local handler = emu.read16(0xFFFC, emu.memType.snesMemory, false)  -- 리셋벡터(뱅크0)
+    local handler = emu.read16(SYS.reset_vector, emu.memType[SYS.default_memtype], false)  -- 리셋벡터
     reset_bp = { handler = handler }
     reset_bp.ref = emu.addMemoryCallback(function(addr, value)
       if #events < EVENT_CAP then
@@ -885,14 +948,14 @@ end
 
 local function trace_cb(addr, value)
   local op = value
-  if type(op) ~= "number" then op = emu.read(addr, emu.memType.snesMemory, false) end
+  if type(op) ~= "number" then op = emu.read(addr, emu.memType[SYS.default_memtype], false) end
   trace_ring[(trace_idx % TRACE_CAP) + 1] = { pc = addr, op = op }
   trace_idx = trace_idx + 1
-  if op == 0x20 or op == 0x22 then                    -- JSR / JSL: 호출지 push(SP 정합 후)
+  if SYS.op_is_call(op) then                           -- 호출 명령: 호출지 push(SP 정합 후)
     local sp = emu.getState()["cpu.sp"]
     reconcile_callstack(sp)                            -- 이미 리턴한 프레임(JMP-리턴 포함) 정리
     callstack[#callstack + 1] = { pc = addr, sp = sp }
-  elseif op == 0x60 or op == 0x6b or op == 0x40 then  -- RTS / RTL / RTI: pop
+  elseif SYS.op_is_return(op) then                     -- 리턴 명령: pop
     if #callstack > 0 then table.remove(callstack) end
   end
 end
@@ -934,12 +997,7 @@ end
 
 -- ── 메모리 덤프 (emucap diff 입력) ───────────────────────────
 -- 표준 리전을 .bin과 regions.json으로 디렉토리에 쓴다. 콘솔 변경 시 목록을 바꾼다.
-local DUMP_REGIONS = {
-  { name = "wram", mt = "snesWorkRam",   base = 8257536, size = 0x20000 },  -- 128KB @ $7E0000
-  { name = "vram", mt = "snesVideoRam",  base = 0,       size = 0x10000 },  -- 64KB
-  { name = "cram", mt = "snesCgRam",     base = 0,       size = 0x200 },    -- 512B(팔레트)
-  { name = "oam",  mt = "snesSpriteRam", base = 0,       size = 0x220 },    -- 544B(스프라이트)
-}
+local DUMP_REGIONS = SYS.dump_regions
 
 function handlers.dump_memory(p)
   if not p.path then return false, "bad_params", "path 필요" end
@@ -966,10 +1024,7 @@ end
 
 -- ── 바이트패턴 검색 (find_pattern) ───────────────────────────
 -- 알려진 선형 메모리 타입의 영역 크기(start만 주고 length 생략 시 끝까지 스캔용). 콘솔 추가 시 보강.
-local REGION_SIZE = {
-  snesWorkRam = 0x20000, snesVideoRam = 0x10000, snesCgRam = 0x200,
-  snesSpriteRam = 0x220, snesSaveRam = 0x8000,
-}
+local REGION_SIZE = SYS.region_sizes
 local SCAN_CAP = 0x20000   -- 1초 워치독 안전: 한 호출 최대 128KB 스캔(emu.read ~2M/s → ≈65ms)
 
 -- 영역을 어댑터 내부에서 한 번 읽어 string.find(plain)로 매칭 오프셋들을 돌려준다 → 128KB를 와이어로
@@ -1024,173 +1079,19 @@ function handlers.find_pattern(p)
   }
 end
 
--- ── 디스어셈블러 (65816) ─────────────────────────────────────
--- Mesen2 Lua엔 디스어셈블 API가 없어 65816 디코더를 직접 구현한다(스탠드얼론 디스어셈블러에서 포팅).
--- M/X 플래그는 현재 CPU 상태(cpu.ps bit5=M, bit4=X)에서 시작해 REP/SEP로 전진 추적한다 —
--- 즉시값 폭(immM/immX)이 플래그 의존이라, 명령 경계가 정확하려면 추적이 필수.
+-- ── 디스어셈블러 (ISA별 — SYS 위임) ─────────────────────────
+-- Mesen2 Lua엔 디스어셈블 API가 없어 디코더를 직접 구현한다. ISA 로직은 코어에 두지 않고
+-- 엔트리(emucap-snes=65816, emucap-sms=Z80)가 SYS.disassemble로 제공한다. 코어는 memory_type을
+-- 해석해 read_byte 클로저를 넘기고, ISA는 명령 경계·니모닉을 결정한다.
 
--- 어드레싱 모드 → 기본 오퍼랜드 바이트 수(immM/immX는 M/X로 1↔2 가변).
-local MODE_SIZE = {
-  imp = 0, acc = 0, imm8 = 1, immM = 1, immX = 1,
-  dp = 1, dpx = 1, dpy = 1, dpind = 1, dpindx = 1, dpindy = 1, dpindl = 1, dpindly = 1,
-  sr = 1, sry = 1, rel = 1,
-  abs = 2, abx = 2, aby = 2, absind = 2, absindx = 2, rell = 2, bm = 2,
-  long = 3, lngx = 3,
-}
-
--- 65816 전체 opcode → {니모닉, 모드}.
-local OPCODES = {
-  [0x00]={"BRK","imm8"},   [0x01]={"ORA","dpindx"}, [0x02]={"COP","imm8"},  [0x03]={"ORA","sr"},
-  [0x04]={"TSB","dp"},     [0x05]={"ORA","dp"},     [0x06]={"ASL","dp"},    [0x07]={"ORA","dpindl"},
-  [0x08]={"PHP","imp"},    [0x09]={"ORA","immM"},   [0x0A]={"ASL","acc"},   [0x0B]={"PHD","imp"},
-  [0x0C]={"TSB","abs"},    [0x0D]={"ORA","abs"},    [0x0E]={"ASL","abs"},   [0x0F]={"ORA","long"},
-  [0x10]={"BPL","rel"},    [0x11]={"ORA","dpindy"}, [0x12]={"ORA","dpind"}, [0x13]={"ORA","sry"},
-  [0x14]={"TRB","dp"},     [0x15]={"ORA","dpx"},    [0x16]={"ASL","dpx"},   [0x17]={"ORA","dpindly"},
-  [0x18]={"CLC","imp"},    [0x19]={"ORA","aby"},    [0x1A]={"INC","acc"},   [0x1B]={"TCS","imp"},
-  [0x1C]={"TRB","abs"},    [0x1D]={"ORA","abx"},    [0x1E]={"ASL","abx"},   [0x1F]={"ORA","lngx"},
-  [0x20]={"JSR","abs"},    [0x21]={"AND","dpindx"}, [0x22]={"JSL","long"},  [0x23]={"AND","sr"},
-  [0x24]={"BIT","dp"},     [0x25]={"AND","dp"},     [0x26]={"ROL","dp"},    [0x27]={"AND","dpindl"},
-  [0x28]={"PLP","imp"},    [0x29]={"AND","immM"},   [0x2A]={"ROL","acc"},   [0x2B]={"PLD","imp"},
-  [0x2C]={"BIT","abs"},    [0x2D]={"AND","abs"},    [0x2E]={"ROL","abs"},   [0x2F]={"AND","long"},
-  [0x30]={"BMI","rel"},    [0x31]={"AND","dpindy"}, [0x32]={"AND","dpind"}, [0x33]={"AND","sry"},
-  [0x34]={"BIT","dpx"},    [0x35]={"AND","dpx"},    [0x36]={"ROL","dpx"},   [0x37]={"AND","dpindly"},
-  [0x38]={"SEC","imp"},    [0x39]={"AND","aby"},    [0x3A]={"DEC","acc"},   [0x3B]={"TSC","imp"},
-  [0x3C]={"BIT","abx"},    [0x3D]={"AND","abx"},    [0x3E]={"ROL","abx"},   [0x3F]={"AND","lngx"},
-  [0x40]={"RTI","imp"},    [0x41]={"EOR","dpindx"}, [0x42]={"WDM","imm8"},  [0x43]={"EOR","sr"},
-  [0x44]={"MVP","bm"},     [0x45]={"EOR","dp"},     [0x46]={"LSR","dp"},    [0x47]={"EOR","dpindl"},
-  [0x48]={"PHA","imp"},    [0x49]={"EOR","immM"},   [0x4A]={"LSR","acc"},   [0x4B]={"PHK","imp"},
-  [0x4C]={"JMP","abs"},    [0x4D]={"EOR","abs"},    [0x4E]={"LSR","abs"},   [0x4F]={"EOR","long"},
-  [0x50]={"BVC","rel"},    [0x51]={"EOR","dpindy"}, [0x52]={"EOR","dpind"}, [0x53]={"EOR","sry"},
-  [0x54]={"MVN","bm"},     [0x55]={"EOR","dpx"},    [0x56]={"LSR","dpx"},   [0x57]={"EOR","dpindly"},
-  [0x58]={"CLI","imp"},    [0x59]={"EOR","aby"},    [0x5A]={"PHY","imp"},   [0x5B]={"TCD","imp"},
-  [0x5C]={"JML","long"},   [0x5D]={"EOR","abx"},    [0x5E]={"LSR","abx"},   [0x5F]={"EOR","lngx"},
-  [0x60]={"RTS","imp"},    [0x61]={"ADC","dpindx"}, [0x62]={"PER","rell"},  [0x63]={"ADC","sr"},
-  [0x64]={"STZ","dp"},     [0x65]={"ADC","dp"},     [0x66]={"ROR","dp"},    [0x67]={"ADC","dpindl"},
-  [0x68]={"PLA","imp"},    [0x69]={"ADC","immM"},   [0x6A]={"ROR","acc"},   [0x6B]={"RTL","imp"},
-  [0x6C]={"JMP","absind"}, [0x6D]={"ADC","abs"},    [0x6E]={"ROR","abs"},   [0x6F]={"ADC","long"},
-  [0x70]={"BVS","rel"},    [0x71]={"ADC","dpindy"}, [0x72]={"ADC","dpind"}, [0x73]={"ADC","sry"},
-  [0x74]={"STZ","dpx"},    [0x75]={"ADC","dpx"},    [0x76]={"ROR","dpx"},   [0x77]={"ADC","dpindly"},
-  [0x78]={"SEI","imp"},    [0x79]={"ADC","aby"},    [0x7A]={"PLY","imp"},   [0x7B]={"TDC","imp"},
-  [0x7C]={"JMP","absindx"},[0x7D]={"ADC","abx"},    [0x7E]={"ROR","abx"},   [0x7F]={"ADC","lngx"},
-  [0x80]={"BRA","rel"},    [0x81]={"STA","dpindx"}, [0x82]={"BRL","rell"},  [0x83]={"STA","sr"},
-  [0x84]={"STY","dp"},     [0x85]={"STA","dp"},     [0x86]={"STX","dp"},    [0x87]={"STA","dpindl"},
-  [0x88]={"DEY","imp"},    [0x89]={"BIT","immM"},   [0x8A]={"TXA","imp"},   [0x8B]={"PHB","imp"},
-  [0x8C]={"STY","abs"},    [0x8D]={"STA","abs"},    [0x8E]={"STX","abs"},   [0x8F]={"STA","long"},
-  [0x90]={"BCC","rel"},    [0x91]={"STA","dpindy"}, [0x92]={"STA","dpind"}, [0x93]={"STA","sry"},
-  [0x94]={"STY","dpx"},    [0x95]={"STA","dpx"},    [0x96]={"STX","dpy"},   [0x97]={"STA","dpindly"},
-  [0x98]={"TYA","imp"},    [0x99]={"STA","aby"},    [0x9A]={"TXS","imp"},   [0x9B]={"TXY","imp"},
-  [0x9C]={"STZ","abs"},    [0x9D]={"STA","abx"},    [0x9E]={"STZ","abx"},   [0x9F]={"STA","lngx"},
-  [0xA0]={"LDY","immX"},   [0xA1]={"LDA","dpindx"}, [0xA2]={"LDX","immX"},  [0xA3]={"LDA","sr"},
-  [0xA4]={"LDY","dp"},     [0xA5]={"LDA","dp"},     [0xA6]={"LDX","dp"},    [0xA7]={"LDA","dpindl"},
-  [0xA8]={"TAY","imp"},    [0xA9]={"LDA","immM"},   [0xAA]={"TAX","imp"},   [0xAB]={"PLB","imp"},
-  [0xAC]={"LDY","abs"},    [0xAD]={"LDA","abs"},    [0xAE]={"LDX","abs"},   [0xAF]={"LDA","long"},
-  [0xB0]={"BCS","rel"},    [0xB1]={"LDA","dpindy"}, [0xB2]={"LDA","dpind"}, [0xB3]={"LDA","sry"},
-  [0xB4]={"LDY","dpx"},    [0xB5]={"LDA","dpx"},    [0xB6]={"LDX","dpy"},   [0xB7]={"LDA","dpindly"},
-  [0xB8]={"CLV","imp"},    [0xB9]={"LDA","aby"},    [0xBA]={"TSX","imp"},   [0xBB]={"TYX","imp"},
-  [0xBC]={"LDY","abx"},    [0xBD]={"LDA","abx"},    [0xBE]={"LDX","aby"},   [0xBF]={"LDA","lngx"},
-  [0xC0]={"CPY","immX"},   [0xC1]={"CMP","dpindx"}, [0xC2]={"REP","imm8"},  [0xC3]={"CMP","sr"},
-  [0xC4]={"CPY","dp"},     [0xC5]={"CMP","dp"},     [0xC6]={"DEC","dp"},    [0xC7]={"CMP","dpindl"},
-  [0xC8]={"INY","imp"},    [0xC9]={"CMP","immM"},   [0xCA]={"DEX","imp"},   [0xCB]={"WAI","imp"},
-  [0xCC]={"CPY","abs"},    [0xCD]={"CMP","abs"},    [0xCE]={"DEC","abs"},   [0xCF]={"CMP","long"},
-  [0xD0]={"BNE","rel"},    [0xD1]={"CMP","dpindy"}, [0xD2]={"CMP","dpind"}, [0xD3]={"CMP","sry"},
-  [0xD4]={"PEI","dp"},     [0xD5]={"CMP","dpx"},    [0xD6]={"DEC","dpx"},   [0xD7]={"CMP","dpindly"},
-  [0xD8]={"CLD","imp"},    [0xD9]={"CMP","aby"},    [0xDA]={"PHX","imp"},   [0xDB]={"STP","imp"},
-  [0xDC]={"JML","absind"}, [0xDD]={"CMP","abx"},    [0xDE]={"DEC","abx"},   [0xDF]={"CMP","lngx"},
-  [0xE0]={"CPX","immX"},   [0xE1]={"SBC","dpindx"}, [0xE2]={"SEP","imm8"},  [0xE3]={"SBC","sr"},
-  [0xE4]={"CPX","dp"},     [0xE5]={"SBC","dp"},     [0xE6]={"INC","dp"},    [0xE7]={"SBC","dpindl"},
-  [0xE8]={"INX","imp"},    [0xE9]={"SBC","immM"},   [0xEA]={"NOP","imp"},   [0xEB]={"XBA","imp"},
-  [0xEC]={"CPX","abs"},    [0xED]={"SBC","abs"},    [0xEE]={"INC","abs"},   [0xEF]={"SBC","long"},
-  [0xF0]={"BEQ","rel"},    [0xF1]={"SBC","dpindy"}, [0xF2]={"SBC","dpind"}, [0xF3]={"SBC","sry"},
-  [0xF4]={"PEA","abs"},    [0xF5]={"SBC","dpx"},    [0xF6]={"INC","dpx"},   [0xF7]={"SBC","dpindly"},
-  [0xF8]={"SED","imp"},    [0xF9]={"SBC","aby"},    [0xFA]={"PLX","imp"},   [0xFB]={"XCE","imp"},
-  [0xFC]={"JSR","absindx"},[0xFD]={"SBC","abx"},    [0xFE]={"INC","abx"},   [0xFF]={"SBC","lngx"},
-}
-
-local function s8(v) return (v >= 0x80) and (v - 0x100) or v end
-local function s16(v) return (v >= 0x8000) and (v - 0x10000) or v end
-
--- 오퍼랜드 문자열. addr16=명령 시작의 뱅크 내 16비트 주소, b1/b2/b3=오퍼랜드 바이트.
-local function fmt_operand(mode, addr16, size, b1, b2, b3)
-  if mode == "imp" then return "" end
-  if mode == "acc" then return "A" end
-  if mode == "bm" then return string.format("$%02X,$%02X", b1, b2) end          -- dest, src
-  if mode == "rel" then return string.format("$%04X", (addr16 + 2 + s8(b1)) % 0x10000) end
-  if mode == "rell" then return string.format("$%04X", (addr16 + 3 + s16(b1 + b2 * 256)) % 0x10000) end
-  local val
-  if size == 1 then val = b1
-  elseif size == 2 then val = b1 + b2 * 256
-  else val = b1 + b2 * 256 + b3 * 65536 end
-  if mode == "immM" or mode == "immX" then
-    return (size == 2) and string.format("#$%04X", val) or string.format("#$%02X", val)
-  elseif mode == "imm8" then return string.format("#$%02X", val)
-  elseif mode == "dp" then return string.format("$%02X", val)
-  elseif mode == "dpx" then return string.format("$%02X,X", val)
-  elseif mode == "dpy" then return string.format("$%02X,Y", val)
-  elseif mode == "dpind" then return string.format("($%02X)", val)
-  elseif mode == "dpindx" then return string.format("($%02X,X)", val)
-  elseif mode == "dpindy" then return string.format("($%02X),Y", val)
-  elseif mode == "dpindl" then return string.format("[$%02X]", val)
-  elseif mode == "dpindly" then return string.format("[$%02X],Y", val)
-  elseif mode == "sr" then return string.format("$%02X,S", val)
-  elseif mode == "sry" then return string.format("($%02X,S),Y", val)
-  elseif mode == "abs" then return string.format("$%04X", val)
-  elseif mode == "abx" then return string.format("$%04X,X", val)
-  elseif mode == "aby" then return string.format("$%04X,Y", val)
-  elseif mode == "absind" then return string.format("($%04X)", val)
-  elseif mode == "absindx" then return string.format("($%04X,X)", val)
-  elseif mode == "long" then return string.format("$%06X", val)
-  elseif mode == "lngx" then return string.format("$%06X,X", val)
-  end
-  return ""
-end
-
--- disassemble(address, count): 24비트 실행주소(뱅크 포함)에서 count개 명령. snesMemory 버스에서 읽는다.
--- M/X 시작값은 현재 cpu.ps(없으면 8bit 가정). 반환 [{addr,text,bytes}] — Mednafen과 같은 형태.
+-- disassemble(address, count): 실행주소에서 count개 명령. 반환 [{addr,text,bytes}] — Mednafen과 같은 형태.
+-- read_byte(addr)=emu.read(addr, mt, false)(mt는 p.memory_type 또는 SYS.default_memtype).
 function handlers.disassemble(p)
   local addr = p.address or 0
   local count = math.max(1, math.min(p.count or 8, 256))
-  local mt = emu.memType[p.memory_type] or emu.memType.snesMemory
-  local st = emu.getState()
-  local ps = st["cpu.ps"] or st["cpu.p"] or st["cpu.status"] or 0x30
-  local m8 = (math.floor(ps / 0x20) % 2) == 1   -- bit5=M: set→8bit A
-  local x8 = (math.floor(ps / 0x10) % 2) == 1   -- bit4=X: set→8bit X/Y
-  local out = {}
-  local a = addr
-  for _ = 1, count do
-    local addr16 = a % 0x10000
-    local opcode = emu.read(a, mt, false)
-    local entry = OPCODES[opcode]
-    if not entry then
-      out[#out + 1] = { addr = string.format("0x%06X", a),
-                        text = string.format(".DB $%02X", opcode),
-                        bytes = string.format("%02X", opcode) }
-      a = a + 1
-    else
-      local mnem, mode = entry[1], entry[2]
-      local size = MODE_SIZE[mode]
-      if mode == "immM" and not m8 then size = 2 end
-      if mode == "immX" and not x8 then size = 2 end
-      local b1 = (size >= 1) and emu.read(a + 1, mt, false) or 0
-      local b2 = (size >= 2) and emu.read(a + 2, mt, false) or 0
-      local b3 = (size >= 3) and emu.read(a + 3, mt, false) or 0
-      local operand = fmt_operand(mode, addr16, size, b1, b2, b3)
-      local text = (operand == "") and mnem or (mnem .. " " .. operand)
-      local raw = string.format("%02X", opcode)
-      if size >= 1 then raw = raw .. string.format(" %02X", b1) end
-      if size >= 2 then raw = raw .. string.format(" %02X", b2) end
-      if size >= 3 then raw = raw .. string.format(" %02X", b3) end
-      out[#out + 1] = { addr = string.format("0x%06X", a), text = text, bytes = raw }
-      if opcode == 0xC2 then          -- REP: 비트 클리어 → 16bit
-        if math.floor(b1 / 0x20) % 2 == 1 then m8 = false end
-        if math.floor(b1 / 0x10) % 2 == 1 then x8 = false end
-      elseif opcode == 0xE2 then      -- SEP: 비트 셋 → 8bit
-        if math.floor(b1 / 0x20) % 2 == 1 then m8 = true end
-        if math.floor(b1 / 0x10) % 2 == 1 then x8 = true end
-      end
-      a = a + 1 + size
-    end
-  end
-  return true, as_array(out)
+  local mt = emu.memType[p.memory_type] or emu.memType[SYS.default_memtype]
+  local read_byte = function(x) return emu.read(x, mt, false) end
+  return true, as_array(SYS.disassemble(read_byte, addr, count))
 end
 
 -- ── 디스패치 ─────────────────────────────────────────────────
@@ -1399,12 +1300,12 @@ emu.addEventCallback(function()
   if line then dispatch(line) end
 end, emu.eventType.startFrame)
 
-CPU = emu.cpuType.snes   -- 브레이크포인트/세이브스테이트 exec 콜백용(콘솔 변경 시 함께)
+CPU = emu.cpuType[SYS.cpu_type]   -- 브레이크포인트/세이브스테이트 exec 콜백용
 
 if emu.getScriptDataFolder() == "" then
   emu.displayMessage("emucap", "I/O 접근 꺼짐 — Script Settings에서 켜야 함")
 end
-emu.log("emucap-live(능동) 로드됨: " .. HOST .. ":" .. PORT)
+emu.log("emucap-core(능동) 로드됨: " .. HOST .. ":" .. PORT)
 
 -- 콜드부팅 1회성 DMA 포착(EMUCAP_PREARM): soft reset로는 재현 안 되는 전원ON 1회 DMA(예: OBJ 폰트
 -- 로드)는 BP를 부팅 '전'에 무장해야 잡힌다. 이 환경변수가 있으면 스크립트 로드(=ROM 부팅 직전)에 dma

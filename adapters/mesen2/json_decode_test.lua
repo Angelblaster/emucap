@@ -1,5 +1,5 @@
--- emucap-live.lua의 json_decode/parse_request 단위 테스트(스탠드얼론). `lua json_decode_test.lua`.
--- 아래 디코더는 emucap-live.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
+-- emucap-core.lua의 json_decode/parse_request 단위 테스트(스탠드얼론). `lua json_decode_test.lua`.
+-- 아래 디코더는 emucap-core.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
 -- 범용 JSON 디코더(요청 줄 파싱용). 객체·배열·문자열·숫자·true/false/null.
 local function json_decode(s)
   local i = 1

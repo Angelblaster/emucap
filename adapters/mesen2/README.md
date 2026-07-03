@@ -35,10 +35,12 @@ two checkboxes must be turned on once (Mesen remembers them — only needed the 
 
 ## 3. Load and run the adapter
 
-In the Script Window → **File → Open** (Ctrl+O) → choose `adapters/mesen2/emucap-live.lua` (live agent
-control) or `emucap.lua` (retrospective-bundle capture). It runs automatically; the log pane at the
-bottom should print `emucap: ROM 경로 = …` with no I/O warning. (To re-run manually: **Script → Run
-Script**, F5.)
+In the Script Window → **File → Open** (Ctrl+O) → choose `adapters/mesen2/emucap-snes.lua` (live agent
+control for SNES; `emucap-sms.lua` for Game Gear / Master System) or `emucap.lua` (retrospective-bundle
+capture). Both live entries share `adapters/mesen2/emucap-core.lua`; `emucap-snes.lua` adds the 65816
+decoder, `emucap-sms.lua` the Z80 one, and the entry you load selects the system. It runs automatically;
+the log pane at the bottom should print `emucap: ROM 경로 = …` with no I/O warning. (To re-run manually:
+**Script → Run Script**, F5.)
 
 The ROM path is auto-inferred via `getRomInfo`; if inference is off, fix the `ROM_PATH` fallback at the
 top of `emucap.lua`, or override it when finalizing with `emucap finalize --rom`.
@@ -79,7 +81,7 @@ combo) at the top of the script.
 
 ## Live MCP mode — agent operation
 
-A separate script `emucap-live.lua` lets the agent read and control the running game.
+A separate entry script `emucap-snes.lua` (SNES; `emucap-sms.lua` for Game Gear) lets the agent read and control the running game.
 The MCP server `emucap-mcp` comes up over stdio, and the Lua connects to that server's
 TCP port (default 47800).
 
@@ -112,6 +114,12 @@ Get the port from `status`'s `listening_port` — never hardcode 47800. Prefer t
 
 ```json
 {"content_path": "/path/to/game.sfc", "system": "snes", "name": "snes_session"}
+```
+
+For Game Gear (or Master System), launch a `.gg` / `.sms` file with `system: "gamegear"`:
+
+```json
+{"content_path": "/path/to/game.gg", "system": "gamegear", "name": "gg_session"}
 ```
 
 The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
@@ -169,6 +177,23 @@ powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:
   vanishes in an instant during boot (e.g. initialization before the attract), arm it ahead
   at launch time so it freezes on the first hit.
 
+### Game Gear (and Master System) — Z80
+
+Game Gear runs on the same adapter through the `emucap-sms.lua` entry (a Z80 core; the SMS core also
+handles `.sms`). Launch with `system: "gamegear"` and a `.gg` / `.sms` content path. The tool set is
+identical to SNES — only the ISA, memory types, and button names differ:
+
+- **ISA**: Z80. `disassemble`, `call_stack`, and `get_state` are Z80 (SNES uses 65816).
+- **Buttons** (`status.input_buttons`): `up` / `down` / `left` / `right` / `one` / `two` / `pause`.
+  `one` = Button 1 (B), `two` = Button 2 (A), `pause` = Start. Aliases: `start→pause`, `a→two`,
+  `b→one`, `1→one`, `2→two`.
+- **memory_types**: `smsWorkRam` (8KB WRAM, CPU bus 0xC000+), `smsMemory` (full Z80 bus), `smsCartRam`,
+  `smsPrgRom`, `smsVideoRam`, `smsPaletteRam`, `smsPort`, `smsBootRom`, `smsDebug`.
+  `status.memory_types` is authoritative.
+- **BP address conversion**: a read/write BP given `smsWorkRam` (an offset) fires on the CPU bus
+  address (0xC000 + offset) after adapter translation; an exec BP takes `smsMemory` (a Z80 bus
+  address). The Mesen-only `nmi` / `irq` / `dma` BP kinds apply here too.
+
 ### Verify the connection
 Call the `status` tool → `{"connected":true,"frame":…,"state":"running"}` means it is
 ready. The first call right after boot may return `emulator not connected`, so retry a few
@@ -176,7 +201,7 @@ seconds later. The MCP server binds lazily, so even before Mesen exists, tool ca
 gracefully with "not connected".
 
 ### (Alternative) Load via the GUI
-If Mesen is already up, you can also load `emucap-live.lua` from Debug → Script Window.
+If Mesen is already up, you can also load `emucap-snes.lua` (or `emucap-sms.lua` for Game Gear) from Debug → Script Window.
 
 Server and client match ports via `EMUCAP_PORT`.
 

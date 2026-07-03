@@ -1,5 +1,5 @@
--- emucap-live.lua write_memory의 hex→bytes 파싱(emu.write 제외 순수 로직) 단위 테스트.
--- `lua write_hex_test.lua`. 한쪽을 바꾸면 emucap-live.lua write_memory도 함께 갱신한다.
+-- emucap-core.lua write_memory의 hex→bytes 파싱(emu.write 제외 순수 로직) 단위 테스트.
+-- `lua write_hex_test.lua`. 한쪽을 바꾸면 emucap-core.lua write_memory도 함께 갱신한다.
 local function parse_write_hex(hex)
   if type(hex) ~= "string" or #hex % 2 ~= 0 then return nil, "bad_params" end
   local bytes = {}

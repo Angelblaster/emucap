@@ -35,8 +35,8 @@
 
 ## 3. 어댑터 로드·실행
 
-Script Window에서 → **File → Open** (Ctrl+O) → `adapters/mesen2/emucap-live.lua`(라이브 에이전트
-제어) 또는 `emucap.lua`(회고 번들 캡처)를 고른다. 자동으로 실행되며, 하단 로그 창에 I/O 경고 없이
+Script Window에서 → **File → Open** (Ctrl+O) → `adapters/mesen2/emucap-snes.lua`(SNES 라이브 에이전트
+제어; Game Gear는 `emucap-sms.lua`) 또는 `emucap.lua`(회고 번들 캡처)를 고른다. 자동으로 실행되며, 하단 로그 창에 I/O 경고 없이
 `emucap: ROM 경로 = …` 가 찍혀야 한다. (수동 재실행: **Script → Run Script**, F5.)
 
 ROM 경로는 `getRomInfo`로 자동 추론된다. 추론이 빗나가면 `emucap.lua` 상단의 `ROM_PATH` 폴백을
@@ -75,7 +75,7 @@ emucap inspect  bundles/<시각>-retrospective
 
 ## 라이브 MCP 모드 — 에이전트 운용
 
-별도 스크립트 `emucap-live.lua`로 실행 중 게임을 에이전트가 읽고 제어한다. MCP 서버
+별도 엔트리 스크립트 `emucap-snes.lua`(SNES; Game Gear는 `emucap-sms.lua`)로 실행 중 게임을 에이전트가 읽고 제어한다. MCP 서버
 `emucap-mcp`가 stdio로 뜨고, Lua가 그 서버의 TCP 포트(기본 47800)에 접속한다.
 
 - 읽기: `read_memory`/`find_pattern`(바이트패턴 검색 — 영역 직접 스캔, 매칭 오프셋만)/`screenshot`/`get_state`/`get_rom_info`/`status`.
@@ -156,7 +156,7 @@ powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:
 지연 바인드라, Mesen이 아직 없어도 도구 호출이 "not connected"로 graceful하게 응답한다.
 
 ### (대안) GUI로 로드
-이미 Mesen이 떠 있으면 Debug → Script Window에서 `emucap-live.lua`를 로드해도 된다.
+이미 Mesen이 떠 있으면 Debug → Script Window에서 `emucap-snes.lua`(Game Gear는 `emucap-sms.lua`)를 로드해도 된다.
 
 서버·클라이언트 모두 `EMUCAP_PORT`로 포트를 맞춘다.
 

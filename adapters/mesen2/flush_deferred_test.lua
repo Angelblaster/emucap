@@ -1,7 +1,7 @@
--- emucap-live.lua의 flush_deferred 회귀 테스트(스탠드얼론). `lua flush_deferred_test.lua`.
+-- emucap-core.lua의 flush_deferred 회귀 테스트(스탠드얼론). `lua flush_deferred_test.lua`.
 -- 브레이크포인트가 press/run_frames 도중 발화해 freeze되면 frozen 동안 tick_deferred가 안 돌아
 -- deferred가 응답을 못 보내니, freeze 진입 시 flush한다.
--- 아래 flush_deferred는 emucap-live.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
+-- 아래 flush_deferred는 emucap-core.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
 
 local deferred, input_hold, frame
 local last_reply

@@ -5,7 +5,7 @@
 MCP infrastructure for debugging retro-game patches. An AI agent reads and
 controls a running emulator's memory, state, and screen so it can analyze a
 problem a human described in plain language. A common Core plus per-emulator
-adapters supports several emulators — Mesen2 (SNES), a Mednafen fork
+adapters supports several emulators — Mesen2 (SNES · Game Gear), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast),
 and MAME (PC-98).
 
@@ -150,9 +150,10 @@ install paths and fallbacks**, the agent never has to hunt around the filesystem
 
 Pick one to start. **Mesen2 is the lightest — no source build.**
 
-- **Mesen2 (SNES)** — install the Mesen2 app and, once, allow network access for
-  the Script window in the GUI. The adapter Lua ships with the repo, so there is
-  no build. → `adapters/mesen2/README.md`
+- **Mesen2 (SNES · Game Gear)** — install the Mesen2 app and, once, allow network
+  access for the Script window in the GUI. The adapter Lua ships with the repo, so
+  there is no build. One adapter covers both systems (65816 for SNES, Z80 for Game
+  Gear / Master System). → `adapters/mesen2/README.md`
 - **Mednafen (Saturn · PSX · PCE · MD)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux
   `libsdl2-dev`). One binary handles all four systems. PSX and PCE-CD need BIOS

@@ -1,4 +1,4 @@
--- emucap-live.lua input button normalization unit test. `lua input_mapping_test.lua`.
+-- emucap-core.lua input button normalization unit test. `lua input_mapping_test.lua`.
 
 local VALID_BUTTONS = {
   a = true, b = true, x = true, y = true, l = true, r = true,

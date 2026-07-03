@@ -38,11 +38,11 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/runtime-env.sh"
-LUA="$HERE/emucap-live.lua"
+LUA="$HERE/emucap-snes.lua"
 # 빌드 hash: 스크립트 어댑터(Lua)는 로드시가 곧 버전이라 launch 시점 emucap git hash를 넘긴다 — hello/
-# status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. emucap-live.lua가 HEAD와 다르면 -dirty.
+# status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. emucap-core.lua(+엔트리)가 HEAD와 다르면 -dirty.
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap-live.lua 2>/dev/null || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+git -C "$HERE" diff --quiet HEAD -- emucap-core.lua emucap-snes.lua 2>/dev/null || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
 export EMUCAP_BUILD_HASH
 
 default_emu_home_base() {
@@ -392,7 +392,7 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   # Codex처럼 transient PTY/agent에서 GUI .app을 직접 exec하면 macOS reopen/open 경로와 충돌해
   # 신규 창이 안 뜨거나 연결 직후 사라지는 사례가 있다. LaunchServices로 새 인스턴스를 요청하되,
   # EMUCAP_* 환경변수는 open --env로 명시 전달한다. 실제 PID는 포트 연결 후 lsof로 역추적한다.
-  OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH")
+  OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH" --env "EMUCAP_ADAPTER_DIR=$HERE")
   [ -n "$NAME" ] && OPEN_ENV+=(--env "EMUCAP_NAME=$NAME")
   [ -n "$SESSION_TOKEN" ] && OPEN_ENV+=(--env "EMUCAP_SESSION_TOKEN=$SESSION_TOKEN")
   OPEN_ENV+=(--env "EMUCAP_CONTENT=$ROM")

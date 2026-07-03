@@ -1,5 +1,5 @@
--- emucap-live.lua의 esc()(JSON 문자열 이스케이프) 단위 테스트. `lua esc_test.lua`.
--- 아래 esc는 emucap-live.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
+-- emucap-core.lua의 esc()(JSON 문자열 이스케이프) 단위 테스트. `lua esc_test.lua`.
+-- 아래 esc는 emucap-core.lua의 사본 — 한쪽을 바꾸면 함께 갱신한다.
 local ESC_MAP = {
   ['"'] = '\\"', ['\\'] = '\\\\',
   ['\b'] = '\\b', ['\f'] = '\\f', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',

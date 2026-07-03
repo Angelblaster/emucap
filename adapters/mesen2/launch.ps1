@@ -11,7 +11,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$lua  = Join-Path $here "emucap-live.lua"
+$lua  = Join-Path $here "emucap-snes.lua"
 
 function Get-LocalTcpConnections([int]$LocalPort) {
   if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
@@ -172,7 +172,8 @@ $settings = Join-Path $portableDir "settings.json"
 '@ | Set-Content $settings -Encoding UTF8
 
 # Launch Mesen with the ROM + Lua; the Lua reads EMUCAP_PORT (and the rest) from the environment.
-$env:EMUCAP_PORT    = "$Port"
+$env:EMUCAP_ADAPTER_DIR = $here
+  $env:EMUCAP_PORT    = "$Port"
 $env:EMUCAP_CONTENT = $Rom
 if ($Name) { $env:EMUCAP_NAME = $Name }
 $buildHash = "unknown"
@@ -181,7 +182,7 @@ try {
   if ($LASTEXITCODE -eq 0 -and $rev) {
     $buildHash = ($rev | Select-Object -First 1).Trim()
   }
-  & git -C $here diff --quiet HEAD -- emucap-live.lua 2>$null
+  & git -C $here diff --quiet HEAD -- emucap-core.lua emucap-snes.lua 2>$null
   if ($LASTEXITCODE -ne 0) {
     $buildHash = "$buildHash-dirty"
   }
