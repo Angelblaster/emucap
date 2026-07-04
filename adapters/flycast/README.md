@@ -1,7 +1,5 @@
 # emucap — Flycast (Dreamcast) adapter
 
-> 한국어: [README.ko.md](README.ko.md)
-
 Live-debug the Dreamcast (SH-4) with emucap. The third platform, after SNES (Mesen) and Saturn/PSX (Mednafen).
 
 ## What the user provides (agent: relay these by name)

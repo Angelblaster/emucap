@@ -166,6 +166,7 @@ pub struct Launch<'a> {
 /// the emucap environment. Returns the child pid.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let portable = prepare_portable_binary(l.binary, l.port)?;
+    provision_gba_bios(l, &portable)?;
     let opts = crate::launch::spec::SpecOpts {
         content: l.content,
         port: l.port,
@@ -185,6 +186,49 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
             .spawn();
     }
     Ok(pid)
+}
+
+/// GBA needs a real BIOS (gba_bios.bin), which Mesen looks for in its data folder's `Firmware`
+/// directory; without it Mesen pops a firmware prompt that breaks the headless/agent flow, and the
+/// portable copy starts with an empty Firmware. When launching the GBA entry script, stage the BIOS
+/// into the portable Firmware directory first — source `EMUCAP_GBA_BIOS`, else `firmware/gba_bios.bin`
+/// under the mesen2 home. A missing BIOS fails fast with a clear precondition instead of hanging on
+/// the prompt.
+fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
+    if l.lua.file_name().and_then(|n| n.to_str()) != Some("emucap-gba.lua") {
+        return Ok(());
+    }
+    let src = match std::env::var_os("EMUCAP_GBA_BIOS") {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            let base = super::emu_home_dir("mesen2", l.port);
+            base.parent()
+                .unwrap_or(base.as_path())
+                .join("firmware/gba_bios.bin")
+        }
+    };
+    if !src.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "GBA needs a real BIOS (gba_bios.bin): set EMUCAP_GBA_BIOS to it, or place it at {}. \
+                 Without it Mesen would pop a firmware prompt and break the headless launch.",
+                src.display()
+            ),
+        ));
+    }
+    let firmware = portable
+        .binary
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "cannot locate the portable Mesen Firmware directory",
+            )
+        })?
+        .join("Firmware");
+    std::fs::create_dir_all(&firmware)?;
+    super::copy_file_replace(&src, &firmware.join("gba_bios.bin"))
 }
 
 #[cfg(test)]

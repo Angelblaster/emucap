@@ -126,19 +126,17 @@ fn resolve_gdb_port(env_key: &str) -> io::Result<GdbPort> {
     })
 }
 
-/// Confirm desmume-cli survived startup (didn't crash on a bad ROM/BIOS/port) without opening a
-/// client connection to its GDB stubs. Probing readiness by connecting would occupy the stub's
-/// single client slot before the bridge does, racing the bridge's own connection. The bridge's
-/// GdbRspClient already retries the stub connection for 30s, so this only needs a liveness settle;
-/// the bridge handles waiting for the stubs to open.
-fn wait_desmume_settle(pid: u32, settle: Duration) -> io::Result<()> {
+/// Confirm a just-spawned process survives a brief startup window — an early exit (desmume-cli
+/// crashing on a bad ROM/BIOS/port, or the bridge failing on bad args / an immediate connect
+/// failure) means the launch failed even though `spawn_detached` returned a pid. This checks
+/// liveness only, not readiness: probing the GDB stubs by connecting would occupy their single
+/// client slot before the bridge does, so the bridge's GdbRspClient owns GDB readiness (it retries
+/// the stubs for 30s). A process still alive at the end is either connected or still retrying.
+fn wait_survives(pid: u32, settle: Duration, on_exit: &str) -> io::Result<()> {
     let deadline = Instant::now() + settle;
     while Instant::now() < deadline {
         if !process_alive(pid) {
-            return io::Result::Err(io::Error::new(
-                io::ErrorKind::Other,
-                "desmume-cli exited during startup (crashed — check the launch log)",
-            ));
+            return Err(io::Error::new(io::ErrorKind::Other, on_exit.to_string()));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -220,7 +218,11 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
     // (실패 경로의 terminate_detached는 SIGTERM→SIGKILL 에스컬레이션이라 desmume-cli처럼 SIGTERM을 무시해도
     // 실제로 죽는다). 성공 시 bridge.pid는 아래에서 추가 기록한다.
     write_pidfile(l.log_path, "desmume.pid", desmume_pid);
-    if let Err(e) = wait_desmume_settle(desmume_pid, Duration::from_secs(2)) {
+    if let Err(e) = wait_survives(
+        desmume_pid,
+        Duration::from_secs(2),
+        "desmume-cli exited during startup (crashed — check the launch log)",
+    ) {
         let _ = terminate_detached(desmume_pid);
         return Err(e);
     }
@@ -234,6 +236,17 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
             return Err(e);
         }
     };
+    // 브리지가 곧바로 죽지 않았는지 확인한다(잘못된 인자·GDB/MCP 즉시 연결실패 등). 죽었으면 launch가 성공을
+    // 오보하고 desmume를 orphan으로 남기지 않도록 둘 다 정리하고 에러를 낸다(살아남으면 스텁 재시도 중이거나 연결됨).
+    if let Err(e) = wait_survives(
+        bridge_pid,
+        Duration::from_secs(2),
+        "emucap-desmume-nds-bridge exited during startup (couldn't reach the GDB stubs or the MCP listener — check the launch log)",
+    ) {
+        let _ = terminate_detached(bridge_pid);
+        let _ = terminate_detached(desmume_pid);
+        return Err(e);
+    }
     write_pidfile(l.log_path, "bridge.pid", bridge_pid);
     Ok(Launched {
         desmume_pid,
@@ -255,6 +268,23 @@ fn write_pidfile(log_path: &Path, name: &str, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::{bridge_spec, emu_spec, resolve_bridge, resolve_binary, resolve_gdb_port, Launch};
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_survives_passes_a_living_process_and_flags_an_exited_one() {
+        use std::time::Duration;
+        // A bridge (or desmume) still alive after the settle passes; one that already exited fails,
+        // so a process that dies during startup surfaces as a launch error, not a false success.
+        let mut alive = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        assert!(super::wait_survives(alive.id(), Duration::from_millis(400), "died").is_ok());
+        let _ = alive.kill();
+        let _ = alive.wait();
+
+        let mut dead = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let dead_pid = dead.id();
+        let _ = dead.wait(); // reap so the pid is gone
+        assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
+    }
     use std::ffi::OsString;
     use std::path::Path;
     use std::sync::{Mutex, MutexGuard};

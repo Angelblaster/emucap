@@ -28,6 +28,10 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 use crate::pc98_bridge::{BridgeEnv, BridgeError as GdbError, GdbTransport};
 
 const MAX_READ_CHUNK: usize = 0x4000;
+/// Cap on a single `read_memory` length (matches the Mesen adapter's READ_CAP). A larger region is
+/// read in chunks — an unbounded length would preallocate `length*2` and tie up the bridge on one
+/// request. The region-size check in `route` also bounds it, but this caps the 4 GB `arm9`/`arm7` bus.
+const MAX_READ_LEN: usize = 0x2_0000;
 
 const METHODS: &[&str] = &[
     "hello",
@@ -273,8 +277,15 @@ impl<G: GdbTransport> CpuConn<G> {
 
     fn pause(&mut self) -> NdsResult<()> {
         if !self.frozen {
-            let _ = self.gdb.interrupt()?;
-            self.frozen = true;
+            // 인터럽트 전에 대기 중인 스톱(BP 히트 S05 등)을 드레인해 큐에 넣는다 — 안 그러면 interrupt()의
+            // 읽기가 그 S05를 삼켜 poll_events가 BP 히트를 잃는다. 드레인으로 이미 멈춘 게 드러나면(frozen)
+            // 인터럽트를 생략한다(멈춘 스텁에 0x03은 무응답→hang 위험). 살아있으면 인터럽트하고 그 응답도
+            // note_stop한다 — 우리 SIGINT(S02)는 note_stop이 거르고, 인터럽트 순간 실제 스톱이면 큐에 남는다.
+            self.drain_stops()?;
+            if !self.frozen {
+                let stop = self.gdb.interrupt()?;
+                self.note_stop(stop);
+            }
         }
         Ok(())
     }
@@ -587,20 +598,25 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     fn read_memory(&mut self, params: &Value) -> NdsResult<Value> {
-        let (cpu, addr) = route(params)?;
         let length = required_num(params, "length")? as usize;
+        if length > MAX_READ_LEN {
+            return Err(NdsBridgeError::BadParams(format!(
+                "read length {length:#x} exceeds the {MAX_READ_LEN:#x} cap — read a large region in chunks (advance the start address)"
+            )));
+        }
+        let (cpu, addr) = route(params, length as u64)?;
         let hex = self.cpu_mut(cpu)?.read_abs_hex(addr, length)?;
         Ok(json!({ "hex": hex, "cpu": cpu.as_str() }))
     }
 
     fn write_memory(&mut self, params: &Value) -> NdsResult<Value> {
-        let (cpu, addr) = route(params)?;
         let hexstr = required_str(params, "hex")?;
         if hexstr.len() % 2 != 0 {
             return Err(NdsBridgeError::BadParams("hex must have even length".into()));
         }
         hex::decode(hexstr).map_err(|_| NdsBridgeError::BadParams("hex decode failed".into()))?;
         let size = hexstr.len() / 2;
+        let (cpu, addr) = route(params, size as u64)?;
         let resp = self
             .cpu_mut(cpu)?
             .send_cmd(&format!("M{addr:x},{size:x}:{hexstr}"))?;
@@ -724,7 +740,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let ztype = if hardware { "1" } else { "0" };
-        let (cpu, addr) = route(params)?;
+        let (cpu, addr) = route(params, 4)?;
         let resp = self
             .cpu_mut(cpu)?
             .send_cmd(&format!("Z{ztype},{addr:x},4"))?;
@@ -1221,7 +1237,7 @@ fn memory_region(name: &str) -> Option<&'static NdsRegion> {
 
 /// Resolve a request's `(cpu, absolute_address)` from `memory_type` + `address`/`start`.
 /// The routing CPU is the memory_type's default unless an explicit `cpu` param overrides it.
-fn route(params: &Value) -> NdsResult<(CpuId, u64)> {
+fn route(params: &Value, len: u64) -> NdsResult<(CpuId, u64)> {
     let memory_type = params
         .get("memory_type")
         .and_then(Value::as_str)
@@ -1239,7 +1255,20 @@ fn route(params: &Value) -> NdsResult<(CpuId, u64)> {
             )))
         }
     };
-    Ok((cpu, region.base.wrapping_add(region_offset(params)?)))
+    let offset = region_offset(params)?;
+    // [offset, offset+len)이 선택된 region 안이어야 한다. main(4 MB) 같은 유한 region 밖 offset을 절대주소로
+    // 감싸 보내면(wrapping) 무관한 DS 버스를 읽고/쓰게 되므로 거부한다 — arm9/arm7은 size=4 GB(전체 버스)라
+    // 유효한 32비트 주소만 통과한다. read/write/BP가 모두 이 경로를 탄다.
+    if !matches!(offset.checked_add(len.max(1)), Some(end) if end <= region.size) {
+        return Err(NdsBridgeError::BadParams(format!(
+            "{memory_type} access out of range: offset {offset:#x}+{len:#x} exceeds region size {size:#x}",
+            size = region.size
+        )));
+    }
+    let addr = region.base.checked_add(offset).ok_or_else(|| {
+        NdsBridgeError::BadParams(format!("{memory_type} address overflow at offset {offset:#x}"))
+    })?;
+    Ok((cpu, addr))
 }
 
 fn region_offset(params: &Value) -> NdsResult<u64> {
@@ -1627,7 +1656,9 @@ mod tests {
         }
 
         fn interrupt(&mut self) -> Result<String, BridgeError> {
-            Ok("S05".into())
+            // A real interrupt reads the next packet off the socket: a pending stop is consumed here
+            // (the loss the pause fix drains first). Otherwise the stub answers our SIGINT (S02).
+            Ok(self.nonblocking.pop_front().unwrap_or_else(|| "S02".into()))
         }
 
         fn recv_nonblocking(&mut self) -> Result<Option<String>, BridgeError> {
@@ -1934,6 +1965,70 @@ mod tests {
         assert_eq!(response.result.unwrap()["state"], "frozen");
         assert!(bridge.arm9.frozen);
         assert!(!bridge.arm9.gdb.calls.iter().any(|c| c == "c"));
+    }
+
+    #[test]
+    fn read_memory_rejects_out_of_range_main_offset() {
+        // main is 4 MB; without the bound, route() wraps a past-the-end offset into unrelated DS bus
+        // space via absolute addressing. Reject instead.
+        let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+        let r = bridge.handle_request(Request::new(
+            1,
+            "read_memory",
+            json!({"memory_type": "main", "address": 0x0040_0000, "length": 4}),
+        ));
+        assert!(!r.ok);
+        assert_eq!(r.error.unwrap().kind, "bad_params");
+    }
+
+    #[test]
+    fn read_memory_rejects_length_over_cap() {
+        let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+        let r = bridge.handle_request(Request::new(
+            1,
+            "read_memory",
+            json!({"memory_type": "arm9", "address": 0, "length": 0x30_0000}),
+        ));
+        assert!(!r.ok);
+        assert_eq!(r.error.unwrap().kind, "bad_params");
+    }
+
+    #[test]
+    fn read_memory_accepts_in_range_main() {
+        // main+0 for 4 bytes maps to the ARM9 bus at 0x0200_0000 and reaches the stub.
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("m2000000,4", "aabbccdd")]);
+        let r = bridge.handle_request(Request::new(
+            1,
+            "read_memory",
+            json!({"memory_type": "main", "address": 0, "length": 4}),
+        ));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.result.unwrap()["hex"], "aabbccdd");
+    }
+
+    #[test]
+    fn pending_breakpoint_stop_survives_a_data_command() {
+        // Scope: a breakpoint hits while the bridge still believes the core is running; the data
+        // command's with_frozen pause must not swallow the pending S05, so poll_events still reports
+        // it. Register/state correctness at the stop is out of scope here — the fake stub's `g` reply
+        // is static and can't model the core advancing past the breakpoint; that is verified live.
+        let regs = arm_regs_hex(&[(15, 0x0200_0000)], 0);
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("g", &regs)]);
+        bridge.arm9.frozen = false; // bridge believes the core is running
+        bridge.arm9.gdb.nonblocking.push_back("S05".into()); // a breakpoint hit is pending
+        let _ = bridge.handle_request(Request::new(1, "get_state", json!({})));
+        let events = bridge
+            .handle_request(Request::new(2, "poll_events", json!({})))
+            .result
+            .unwrap();
+        assert!(
+            events["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["signal"] == "05"),
+            "pending breakpoint hit was lost: {events:?}"
+        );
     }
 
     #[test]

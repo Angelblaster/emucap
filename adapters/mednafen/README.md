@@ -1,7 +1,5 @@
 # emucap — Mednafen (Sega Saturn · Sony PlayStation · PC Engine · Mega Drive) adapter
 
-> 한국어: [README.ko.md](README.ko.md)
-
 Mednafen has no Lua like Mesen, so **we patch Mednafen and inject a socket
 client (`emucap.cpp`)** — a C++ port of Mesen's `emucap-core.lua`. It connects to
 emucap-mcp and serves the same NDJSON protocol, so the Rust side (TcpLink · tools

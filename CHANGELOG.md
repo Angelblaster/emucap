@@ -2,6 +2,18 @@
 
 Beta software — interfaces may still change.
 
+## 0.3.1
+
+### Fixed
+- NDS: memory reads, writes, and breakpoints out of the selected region are rejected instead of reaching unrelated bus space.
+- NDS: a breakpoint hit is no longer lost when a memory read or screenshot runs before `poll_events`.
+- NDS: an emulator or bridge that crashes at startup fails the launch instead of reporting success and leaving a stray process.
+- Mesen: GBA launches stage the BIOS (from `EMUCAP_GBA_BIOS`, else the mesen2 firmware directory) instead of hanging on a firmware prompt, and fail with a clear message when it is missing.
+
+### Changed
+- NDS `read_memory` is capped at 128 KB per call — read a larger region in chunks.
+- Adapter READMEs are English only; `README.ko.md` at the repo root remains the Korean entry point.
+
 ## 0.3.0
 
 ### Added

@@ -1,7 +1,5 @@
 # emucap — Mesen2 adapter
 
-> 한국어: [README.ko.md](README.ko.md)
-
 ## For the agent — you are the user's interface
 
 The user is likely not a developer and will not read this file — you read it and walk them through each
