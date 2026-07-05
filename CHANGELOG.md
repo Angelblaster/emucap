@@ -2,6 +2,25 @@
 
 Beta software — interfaces may still change.
 
+## 0.4.0
+
+### Added
+- **PSP (PlayStation Portable)** adapter, via a headless PPSSPP fork with a WebSocket debugger bridge: memory, registers, screenshot, buttons, save/load state, disassemble, instruction stepping, execution and read/write breakpoints, and reset. Build with `adapters/ppsspp/build.sh`.
+- PSP `display: true` HITL mode — the adapter opens a real PPSSPP window a human watches and plays (keyboard/gamepad) while the agent reads and injects over the debugger WebSocket, mirroring the NDS display mode; the GUI runs under an isolated per-session profile, so it never touches the operator's real PPSSPP config or saves.
+- PSP `dump_memory` — bulk-export a memory region to `<dir>/<region>.bin` + `regions.json` for large regions, instead of inline hex.
+- NDS `dump_memory` and `find_pattern` — bulk-export Main RAM to region files, and scan a region for a byte pattern, mirroring the other adapters.
+
+### Fixed
+- PSP: the debugger WebSocket listens on loopback only, so it is not reachable from other hosts.
+- PSP: `reset` performs a real reboot and reports failure when the reboot fails, instead of acknowledging a no-op.
+- PSP: `main` reads and writes outside PSP user RAM are rejected instead of aliasing onto other memory.
+- PSP: duplicate memory and execution breakpoints on one address are ref-counted, so clearing one no longer disarms another.
+- Mesen: the GBA BIOS is resolved from the documented firmware directory, and an already-staged BIOS is used when its source is gone.
+- NDS: a memory read or register read before `poll_events` no longer resumes past a pending breakpoint stop.
+
+### Changed
+- `EMUCAP_PPSSPP_SRC` is read-only input: the build clones it into the owned work tree and never patches or builds in place.
+
 ## 0.3.1
 
 ### Fixed

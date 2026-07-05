@@ -8,9 +8,9 @@ problem a human described in plain language. A common Core plus per-emulator
 adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
 GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast), a
-DeSmuME fork (Nintendo DS), and MAME (PC-98).
+DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.3.1 — beta.** This repository is under active, continuous development;
+**v0.4.0 — beta.** This repository is under active, continuous development;
 interfaces and behavior may still change between updates.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -168,6 +168,10 @@ Pick one to start. **Mesen2 is the lightest — no source build.**
   `adapters/desmume-nds/build.sh` (needs meson/ninja/SDL2/glib). No NDS BIOS is
   needed (HLE direct-boot). The dual CPUs (ARM9/ARM7) each get a GDB stub, like the
   PC-98 adapter. → `adapters/desmume-nds/README.md`
+- **PPSSPP (PSP)** — build the headless fork with `adapters/ppsspp/build.sh` (needs
+  CMake and a C++ toolchain). No PSP firmware is needed. The adapter is a pure
+  WebSocket client against PPSSPP's own debugger protocol, so it's a single
+  headless process plus the bridge — no GDB stub. → `adapters/ppsspp/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
 
