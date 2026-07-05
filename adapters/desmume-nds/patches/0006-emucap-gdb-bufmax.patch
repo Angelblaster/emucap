@@ -1,0 +1,53 @@
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+index 7def9c6..31c0fac 100644
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -403,8 +403,11 @@ step_instruction_watch( void *data, uint32_t addr, UNUSED_PARM(int thunmb)) {
+ 
+ /************************************************************************/
+ /* BUFMAX defines the maximum number of characters in inbound/outbound buffers*/
+-/* at least NUMREGBYTES*2 are needed for register packets */
+-#define BUFMAX 2048
++/* at least NUMREGBYTES*2 are needed for register packets. */
++/* emucap: raised from 2048 so a useful bulk `m` read chunk (2 hex chars/byte) fits — a 16 KiB read */
++/* would overflow the old 2 KiB reply buffer and segfault. Kept in step with BUFMAX_GDB (the input */
++/* reader buffer) since readPacket_gdb bounds pos_index by BUFMAX while writing into buffer[BUFMAX_GDB]. */
++#define BUFMAX 0x8000
+ 
+ 
+ 
+@@ -1177,7 +1180,16 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       if ( *rx_ptr++ == ',') {
+         if ( hexToInt( &rx_ptr, &length)) {
+           //DEBUG_LOG("mem read from %08x (%d)\n", addr, length);
+-          if ( !mem2hex( stub->direct_memio, addr, out_ptr, length)) {
++          // emucap: mem2hex writes 2 hex chars per byte into out_ptr (= &hidden_buffer[1]); putpacket
++          // then adds the leading '$', a trailing '#'+2-char checksum and a NUL. A read whose reply
++          // exceeds the buffer overflows that write and crashes the emulator, so any over-large request
++          // is rejected here (E03) instead of written past the buffer — a hard cap independent of the
++          // client. The emucap bridge already chunks reads well within this bound (MAX_READ_CHUNK).
++          if ( length > (uint32_t)((BUFMAX - 5) / 2)) {
++            strcpy ( (char *)out_ptr, "E03");
++            send_size = 3;
++          }
++          else if ( !mem2hex( stub->direct_memio, addr, out_ptr, length)) {
+             strcpy ( (char *)out_ptr, "E03");
+             send_size = 3;
+           }
+diff --git i/desmume/src/gdbstub/gdbstub_internal.h w/desmume/src/gdbstub/gdbstub_internal.h
+index 747720e..aed239d 100644
+--- i/desmume/src/gdbstub/gdbstub_internal.h
++++ w/desmume/src/gdbstub/gdbstub_internal.h
+@@ -70,8 +70,11 @@ struct breakpoint_gdb {
+ 
+ 
+ /*
++ * emucap: raised from 2048 in step with BUFMAX (gdbstub.cpp). readPacket_gdb bounds pos_index by
++ * BUFMAX while writing into this buffer, so the two must stay equal or a large inbound packet would
++ * overrun the input buffer.
+  */
+-#define BUFMAX_GDB 2048
++#define BUFMAX_GDB 0x8000
+ 
+ struct packet_reader_gdb {
+   int state;

@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -27,11 +27,29 @@ use sha1::{Digest, Sha1};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 use crate::pc98_bridge::{BridgeEnv, BridgeError as GdbError, GdbTransport};
 
-const MAX_READ_CHUNK: usize = 0x4000;
+/// Bulk-read chunk size for the GDB `m addr,len` path. A read reply is 2 hex chars per byte written
+/// into the DeSmuME stub's fixed `hidden_buffer[BUFMAX]`; a chunk whose reply overruns that buffer
+/// segfaults the emulator (the crash the `0006` fork patch also hard-guards against in the `'m'`
+/// handler). Kept provably within `GDBSTUB_BUFMAX` — see `read_chunk_fits_gdbstub_reply_buffer`.
+const MAX_READ_CHUNK: usize = 0x2000;
+/// The DeSmuME fork's GDB-stub reply buffer size (`BUFMAX` in gdbstub.cpp, raised from 2 KiB by the
+/// `0006` fork patch). The bridge must never issue an `m` read whose hex reply + framing exceeds it.
+const GDBSTUB_BUFMAX: usize = 0x8000;
+/// Bytes the stub adds around an `m` reply payload in `hidden_buffer`: the leading `$`, the trailing
+/// `#` + two checksum chars, and the NUL. `2*len + GDBSTUB_REPLY_FRAMING` must fit `GDBSTUB_BUFMAX`.
+const GDBSTUB_REPLY_FRAMING: usize = 5;
+// Compile-time guard: a full MAX_READ_CHUNK read reply must fit the fork's gdbstub reply buffer, or a
+// bulk read (dump_memory/find_pattern) overflows `hidden_buffer` and segfaults DeSmuME (the live crash
+// this fix targets). Enforced at build time so a future MAX_READ_CHUNK bump cannot silently regress it.
+const _: () = assert!(MAX_READ_CHUNK * 2 + GDBSTUB_REPLY_FRAMING <= GDBSTUB_BUFMAX);
 /// Cap on a single `read_memory` length (matches the Mesen adapter's READ_CAP). A larger region is
 /// read in chunks — an unbounded length would preallocate `length*2` and tie up the bridge on one
 /// request. The region-size check in `route` also bounds it, but this caps the 4 GB `arm9`/`arm7` bus.
 const MAX_READ_LEN: usize = 0x2_0000;
+/// Cap on a single `find_pattern` scan window (128 KB, matching the pc98 adapter). The 4 GB
+/// `arm9`/`arm7` bus views would otherwise stream the whole address space over the GDB `m` path;
+/// a longer request is scanned up to this cap and reported as `truncated_scan`.
+const MAX_FIND_LEN: usize = 128 * 1024;
 
 const METHODS: &[&str] = &[
     "hello",
@@ -40,6 +58,8 @@ const METHODS: &[&str] = &[
     "read_memory",
     "write_memory",
     "get_state",
+    "find_pattern",
+    "dump_memory",
     "step_instructions",
     "set_breakpoint",
     "clear_breakpoint",
@@ -64,8 +84,6 @@ const METHODS: &[&str] = &[
 const UNSUPPORTED_METHODS: &[&str] = &[
     "run_frames",
     "probe",
-    "find_pattern",
-    "dump_memory",
     "watch_register",
     "set_trace",
     "get_trace",
@@ -105,6 +123,10 @@ struct NdsRegion {
     base: u64,
     size: u64,
     cpu: CpuId,
+    /// True for a bounded RAM window that `dump_memory` snapshots whole. The `arm9`/`arm7`
+    /// full-bus views (4 GB, mostly ROM/MMIO/mirrors) are not dumpable — only the finite `main`
+    /// RAM is meaningful for a cross-ROM diff.
+    dumpable: bool,
 }
 
 /// v1 minimal NDS memory map. `main` is the shared 4 MB Main RAM (read via the ARM9 bus by
@@ -115,18 +137,21 @@ const MEMORY_REGIONS: &[NdsRegion] = &[
         base: 0x0200_0000,
         size: 0x0040_0000,
         cpu: CpuId::Arm9,
+        dumpable: true,
     },
     NdsRegion {
         name: "arm9",
         base: 0,
         size: 0x1_0000_0000,
         cpu: CpuId::Arm9,
+        dumpable: false,
     },
     NdsRegion {
         name: "arm7",
         base: 0,
         size: 0x1_0000_0000,
         cpu: CpuId::Arm7,
+        dumpable: false,
     },
 ];
 
@@ -275,19 +300,27 @@ impl<G: GdbTransport> CpuConn<G> {
         Ok(())
     }
 
-    fn pause(&mut self) -> NdsResult<()> {
+    /// Halt the core. Returns whether pausing drained a *reportable* async stop — a breakpoint or
+    /// signal the bridge did NOT cause (queued as an event). When it did, the core is legitimately
+    /// halted at that stop and callers must not auto-resume past it (resuming would drift the PC
+    /// and lose the stopped state); when it did not, the bridge injected the pause itself and
+    /// callers may undo it by resuming.
+    fn pause(&mut self) -> NdsResult<bool> {
         if !self.frozen {
             // 인터럽트 전에 대기 중인 스톱(BP 히트 S05 등)을 드레인해 큐에 넣는다 — 안 그러면 interrupt()의
             // 읽기가 그 S05를 삼켜 poll_events가 BP 히트를 잃는다. 드레인으로 이미 멈춘 게 드러나면(frozen)
             // 인터럽트를 생략한다(멈춘 스텁에 0x03은 무응답→hang 위험). 살아있으면 인터럽트하고 그 응답도
             // note_stop한다 — 우리 SIGINT(S02)는 note_stop이 거르고, 인터럽트 순간 실제 스톱이면 큐에 남는다.
+            let events_before = self.events.len();
             self.drain_stops()?;
+            let drained_reportable = self.events.len() > events_before;
             if !self.frozen {
                 let stop = self.gdb.interrupt()?;
                 self.note_stop(stop);
             }
+            return Ok(drained_reportable);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn resume(&mut self) -> NdsResult<()> {
@@ -335,11 +368,13 @@ impl<G: GdbTransport> CpuConn<G> {
     /// 모든 명령(데이터 read·override)은 이걸 거쳐 running이면 잠깐 pause→frozen에서 전송→running 복원한다.
     fn with_frozen<T>(&mut self, f: impl FnOnce(&mut Self) -> NdsResult<T>) -> NdsResult<T> {
         let was_running = !self.frozen;
-        if was_running {
-            self.pause()?;
-        }
+        // Pausing a running core may drain a real breakpoint stop that was already pending. In that
+        // case the core is legitimately halted at the breakpoint and must not be resumed past it
+        // (that would drift the PC and misattribute the hit) — only undo the pause when the bridge
+        // itself injected it, i.e. no reportable stop was drained.
+        let resume_after = if was_running { !self.pause()? } else { false };
         let r = f(self);
-        if was_running {
+        if resume_after {
             let _ = self.resume();
         }
         r
@@ -472,6 +507,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "get_rom_info" => self.get_rom_info(),
             "read_memory" => self.read_memory(&req.params),
             "write_memory" => self.write_memory(&req.params),
+            "find_pattern" => self.find_pattern(&req.params),
+            "dump_memory" => self.dump_memory(&req.params),
             "get_state" => self.get_state(&req.params),
             "step" => self.step(&req.params),
             "step_instructions" => self.step_instructions(&req.params),
@@ -629,6 +666,221 @@ impl<G: GdbTransport> NdsBridge<G> {
             )));
         }
         Ok(json!({ "written": size, "cpu": cpu.as_str() }))
+    }
+
+    /// Scan a memory region for a hex byte pattern, returning the matching region-relative offsets.
+    /// Mirrors the pc98/Mednafen/Mesen `find_pattern`: `memory_type` (default `main`), `hex` pattern,
+    /// optional `start`/`length` window, `max_matches` (1..4096, default 256) and `align` (default 1).
+    /// The scan window is capped at `MAX_FIND_LEN` and reported via `truncated_scan`. The bulk read
+    /// rides the same GDB `m` path as `read_memory`, so a short/failed stub read errors cleanly.
+    fn find_pattern(&mut self, params: &Value) -> NdsResult<Value> {
+        let memory_type = params
+            .get("memory_type")
+            .and_then(Value::as_str)
+            .unwrap_or("main")
+            .to_string();
+        let region = *memory_region(&memory_type).ok_or_else(|| {
+            NdsBridgeError::BadParams(format!("unsupported memory_type: {memory_type}"))
+        })?;
+        let pattern = hex::decode(required_str(params, "hex")?)
+            .map_err(|_| NdsBridgeError::BadParams("hex decode failed".into()))?;
+        if pattern.is_empty() {
+            return Err(NdsBridgeError::BadParams(
+                "hex must contain at least one byte".into(),
+            ));
+        }
+
+        let start = optional_num(params, "start")?.unwrap_or(0);
+        let mut length = optional_num(params, "length")?
+            .unwrap_or_else(|| region.size.saturating_sub(start));
+        if start >= region.size {
+            length = 0;
+        } else {
+            length = length.min(region.size - start);
+        }
+        let length = length as usize;
+        let truncated_scan = length > MAX_FIND_LEN;
+        let scan_len = length.min(MAX_FIND_LEN);
+        let max_matches = optional_num(params, "max_matches")?.unwrap_or(256).clamp(1, 4096) as usize;
+        let align = optional_num(params, "align")?.unwrap_or(1).max(1) as usize;
+
+        let buf = if scan_len == 0 {
+            Vec::new()
+        } else {
+            self.read_region_bytes(&memory_type, start, scan_len)?
+        };
+        let mut matches = Vec::new();
+        let mut truncated_matches = false;
+        let mut pos = 0usize;
+        while pos <= buf.len().saturating_sub(pattern.len()) {
+            let Some(idx) = find_subslice(&buf[pos..], &pattern) else {
+                break;
+            };
+            let rel = pos + idx;
+            if rel.is_multiple_of(align) {
+                if matches.len() >= max_matches {
+                    truncated_matches = true;
+                    break;
+                }
+                matches.push(start + rel as u64);
+            }
+            pos = rel + 1;
+        }
+
+        Ok(json!({
+            "matches": matches,
+            "count": matches.len(),
+            "truncated": truncated_scan || truncated_matches,
+            "truncated_scan": truncated_scan,
+            "truncated_matches": truncated_matches,
+            "scanned": scan_len,
+            "start": start,
+            "memory_type": memory_type,
+            "cpu": region.cpu.as_str(),
+        }))
+    }
+
+    /// Snapshot every bounded NDS RAM region to `<path>/<name>.bin` plus a `regions.json` manifest
+    /// (`RegionMeta` keys: name/memory_type/base_address/size). The MCP host writes `state.json`
+    /// itself, so the bridge only emits the region bytes + manifest. Each region is read whole under a
+    /// single freeze (no torn snapshot) with per-chunk length validation, written to a temp file whose
+    /// size is verified, then atomically renamed — a short/failed read never leaves a partial `.bin`.
+    fn dump_memory(&mut self, params: &Value) -> NdsResult<Value> {
+        let path = PathBuf::from(required_str(params, "path")?);
+        std::fs::create_dir_all(&path)?;
+        let mut metas = Vec::new();
+        for region in self.dump_regions() {
+            let name = region.name;
+            let size = region.size as usize;
+            let bytes = self.read_region_bytes(name, 0, size)?;
+            if bytes.len() as u64 != region.size {
+                return Err(NdsBridgeError::Emulator(format!(
+                    "dump {name}: read {} of {} bytes",
+                    bytes.len(),
+                    region.size
+                )));
+            }
+            let final_path = path.join(format!("{name}.bin"));
+            let tmp_path = path.join(format!(".{name}.bin.partial"));
+            std::fs::write(&tmp_path, &bytes)?;
+            let written = std::fs::metadata(&tmp_path)?.len();
+            if written != region.size {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(NdsBridgeError::Emulator(format!(
+                    "dump {name}: wrote {written} of {} bytes to disk",
+                    region.size
+                )));
+            }
+            std::fs::rename(&tmp_path, &final_path)?;
+            metas.push(json!({
+                "name": name,
+                "memory_type": name,
+                "base_address": region.base,
+                "size": region.size,
+            }));
+        }
+        // regions.json is written last, only after every .bin is complete, so a mid-dump failure
+        // never leaves a full manifest pointing at a truncated region.
+        let regions_path = path.join("regions.json");
+        std::fs::write(&regions_path, serde_json::to_vec(&metas)?)?;
+        Ok(json!({ "path": path.display().to_string(), "regions": metas.len() }))
+    }
+
+    /// The bounded RAM regions `dump_memory` snapshots — every `dumpable` region whose CPU is
+    /// attached (ARM7-hosted regions are skipped when no ARM7 connection is present).
+    fn dump_regions(&self) -> Vec<NdsRegion> {
+        MEMORY_REGIONS
+            .iter()
+            .copied()
+            .filter(|r| r.dumpable && (r.cpu != CpuId::Arm7 || self.arm7.is_some()))
+            .collect()
+    }
+
+    /// Read `length` bytes at region-relative `start` from `memory_type` over the routed CPU's GDB
+    /// `m` path, in bounded chunks. `main` is shared Main RAM that BOTH cores write and ARM7 is an
+    /// independent core HITL resumes alongside ARM9, so the read is taken under a freeze of *every*
+    /// attached core — a running ARM7 would otherwise mutate `main` mid-read and tear the snapshot
+    /// (false find_pattern results / an inconsistent dump). Each chunk's decoded length is checked
+    /// against the request, so a short or failed stub read errors cleanly instead of yielding
+    /// truncated bytes (dump/scan integrity).
+    fn read_region_bytes(
+        &mut self,
+        memory_type: &str,
+        start: u64,
+        length: usize,
+    ) -> NdsResult<Vec<u8>> {
+        let region = *memory_region(memory_type).ok_or_else(|| {
+            NdsBridgeError::BadParams(format!("unsupported memory_type: {memory_type}"))
+        })?;
+        if !matches!(start.checked_add(length as u64), Some(end) if end <= region.size) {
+            return Err(NdsBridgeError::BadParams(format!(
+                "{memory_type} access out of range: offset {start:#x}+{length:#x} exceeds region size {size:#x}",
+                size = region.size
+            )));
+        }
+        self.with_all_cores_frozen(|bridge| bridge.read_region_chunks(region, start, length))
+    }
+
+    /// The chunked `m`-read loop for a bulk read, assuming every core is already frozen (see
+    /// `with_all_cores_frozen`). `read_abs_hex`'s own `with_frozen` is a no-op here since the core is
+    /// held, so no chunk re-pauses/resumes and the whole read is one consistent snapshot.
+    fn read_region_chunks(
+        &mut self,
+        region: NdsRegion,
+        start: u64,
+        length: usize,
+    ) -> NdsResult<Vec<u8>> {
+        let base = region.base;
+        let conn = self.cpu_mut(region.cpu)?;
+        let mut out = Vec::with_capacity(length);
+        let mut offset = 0usize;
+        while offset < length {
+            let chunk = MAX_READ_CHUNK.min(length - offset);
+            let addr = base + start + offset as u64;
+            let hex = conn.read_abs_hex(addr, chunk)?;
+            let bytes = hex::decode(&hex)
+                .map_err(|_| NdsBridgeError::Emulator("GDB returned invalid hex".into()))?;
+            if bytes.len() != chunk {
+                return Err(NdsBridgeError::Emulator(format!(
+                    "short GDB read at {addr:#x}: requested {chunk} bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            out.extend_from_slice(&bytes);
+            offset += chunk;
+        }
+        Ok(out)
+    }
+
+    /// Run `f` with every attached core frozen, then restore each core to its prior running/frozen
+    /// state. Used for shared-RAM bulk reads (dump_memory/find_pattern): ARM9 and ARM7 run behind
+    /// independent stubs, so freezing only the routed core leaves the other free to mutate shared
+    /// `main` RAM mid-read. A core the bridge pauses here is resumed afterwards; a core that was
+    /// already halted — or one whose pause drained a real breakpoint stop (`pause` returns `true`) —
+    /// is left halted, so this never resumes past a genuine stop or un-pauses a deliberately frozen core.
+    fn with_all_cores_frozen<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> NdsResult<T>,
+    ) -> NdsResult<T> {
+        let resume_arm9 = if self.arm9.frozen {
+            false
+        } else {
+            !self.arm9.pause()?
+        };
+        let resume_arm7 = match self.arm7.as_mut() {
+            Some(a7) if !a7.frozen => !a7.pause()?,
+            _ => false,
+        };
+        let r = f(self);
+        if resume_arm7 {
+            if let Some(a7) = self.arm7.as_mut() {
+                let _ = a7.resume();
+            }
+        }
+        if resume_arm9 {
+            let _ = self.arm9.resume();
+        }
+        r
     }
 
     fn get_state(&mut self, params: &Value) -> NdsResult<Value> {
@@ -1419,6 +1671,13 @@ fn required_str<'a>(params: &'a Value, key: &str) -> NdsResult<&'a str> {
         .ok_or_else(|| NdsBridgeError::BadParams(format!("missing required param: {key}")))
 }
 
+fn find_subslice(buf: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > buf.len() {
+        return None;
+    }
+    buf.windows(needle.len()).position(|w| w == needle)
+}
+
 fn is_stop_packet(resp: &str) -> bool {
     resp.starts_with('S') || resp.starts_with('T')
 }
@@ -1633,6 +1892,13 @@ mod tests {
                     .iter()
                     .map(|(a, b)| ((*a).into(), (*b).into()))
                     .collect(),
+                ..Default::default()
+            }
+        }
+
+        fn from_pairs(replies: Vec<(String, String)>) -> Self {
+            Self {
+                replies: replies.into_iter().collect(),
                 ..Default::default()
             }
         }
@@ -2032,6 +2298,78 @@ mod tests {
     }
 
     #[test]
+    fn pending_breakpoint_stop_leaves_core_halted_after_data_command() {
+        // A real exec-breakpoint stop (S05) is pending on the socket while the bridge still believes
+        // the core is running. A data command's with_frozen pause drains that stop (preserving the
+        // event) but must NOT auto-resume past it: the bridge only caused the pause when it injected
+        // an interrupt, not when a real stop was drained. So the core stays halted, no `c` is sent,
+        // and enrichment reads the true stopped PC (0x0200_0000) — matching the exec breakpoint.
+        let regs = arm_regs_hex(&[(15, 0x0200_0000)], 0);
+        let mut bridge = bridge_arm9_only(&[
+            ("?", "S05"),
+            ("Z0,2000000,4", "OK"),
+            ("g", &regs),
+            ("g", &regs), // enrich_event re-reads regs at poll time
+        ]);
+        let set = bridge.handle_request(Request::new(
+            1,
+            "set_breakpoint",
+            json!({"cpu": "arm9", "address": "0x2000000", "kind": "exec"}),
+        ));
+        let bp_id = set.result.unwrap()["id"].as_u64().unwrap();
+        bridge.arm9.frozen = false; // bridge believes the core is running
+        bridge.arm9.gdb.nonblocking.push_back("S05".into()); // a breakpoint hit is pending
+
+        let _ = bridge.handle_request(Request::new(2, "get_state", json!({})));
+        assert!(
+            bridge.arm9.frozen,
+            "core must stay halted at the breakpoint, not be resumed past it"
+        );
+        assert!(
+            !bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
+            "no continue may be sent after draining a real breakpoint stop: {:?}",
+            bridge.arm9.gdb.calls
+        );
+
+        let events = bridge
+            .handle_request(Request::new(3, "poll_events", json!({})))
+            .result
+            .unwrap();
+        let arr = events["events"].as_array().unwrap();
+        let hit = arr
+            .iter()
+            .find(|e| e["signal"] == "05")
+            .expect("pending breakpoint hit was lost");
+        // State stays consistent: the halted PC still matches the breakpoint, so it is attributed.
+        assert_eq!(hit["type"], "breakpoint_hit");
+        assert_eq!(hit["breakpoint_id"], bp_id);
+        assert_eq!(hit["address"], 0x0200_0000);
+    }
+
+    #[test]
+    fn data_command_resumes_running_core_when_no_stop_was_pending() {
+        // Non-regression for the pause-fix: when the bridge itself injects the pause (no real stop
+        // is pending), with_frozen must still resume the core afterwards so it keeps running.
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("m2000000,4", "aabbccdd")]);
+        bridge.arm9.frozen = false; // running, nothing pending
+        let r = bridge.handle_request(Request::new(
+            1,
+            "read_memory",
+            json!({"memory_type": "main", "address": 0, "length": 4}),
+        ));
+        assert!(r.ok, "{:?}", r.error);
+        assert!(
+            !bridge.arm9.frozen,
+            "core the bridge paused itself must be resumed back to running"
+        );
+        assert!(
+            bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
+            "a bridge-injected pause must be undone with a continue: {:?}",
+            bridge.arm9.gdb.calls
+        );
+    }
+
+    #[test]
     fn unsupported_method_returns_unsupported_error_kind() {
         let mut bridge = bridge_arm9_only(&[("?", "S05")]);
         for method in ["run_frames", "probe", "set_trace", "watch_register"] {
@@ -2409,5 +2747,182 @@ mod tests {
     fn opcode_hex_to_le_bytes_reverses_byte_order() {
         assert_eq!(opcode_hex_to_le_bytes("e3a00001"), "0100a0e3");
         assert_eq!(opcode_hex_to_le_bytes("2001"), "0120");
+    }
+
+    #[test]
+    fn find_pattern_scans_main_region_with_match_limit() {
+        // main+0 maps to the ARM9 bus at 0x0200_0000. "aa00" occurs at rel offsets 0,2,4,6;
+        // max_matches=2 keeps [0,2] and marks the scan truncated.
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("m2000000,8", "aa00aa00aa00aa00")]);
+        let response = bridge.handle_request(Request::new(
+            7,
+            "find_pattern",
+            json!({"memory_type":"main","start":0,"length":8,"hex":"aa00","max_matches":2}),
+        ));
+        let result = response.result.unwrap();
+        assert_eq!(result["matches"], json!([0, 2]));
+        assert_eq!(result["count"], 2);
+        assert_eq!(result["truncated_matches"], true);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["cpu"], "arm9");
+    }
+
+    #[test]
+    fn find_pattern_absent_returns_no_matches() {
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
+        let response = bridge.handle_request(Request::new(
+            8,
+            "find_pattern",
+            json!({"memory_type":"main","start":0,"length":8,"hex":"aa00"}),
+        ));
+        let result = response.result.unwrap();
+        assert_eq!(result["matches"], json!([]));
+        assert_eq!(result["count"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn find_pattern_offsets_are_region_relative_to_start() {
+        // start=4 within main reads from 0x0200_0004; the pattern sits at buffer offset 2, so the
+        // reported match is start(4)+2 = 6 — a region-relative offset, matching the pc98 shape.
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("m2000004,4", "0000aa00")]);
+        let response = bridge.handle_request(Request::new(
+            9,
+            "find_pattern",
+            json!({"memory_type":"main","start":4,"length":4,"hex":"aa00"}),
+        ));
+        let result = response.result.unwrap();
+        assert_eq!(result["matches"], json!([6]));
+        assert_eq!(result["count"], 1);
+    }
+
+    #[test]
+    fn dump_memory_writes_regions_under_requested_directory() {
+        // Feed a full zero read for every dumpable region, then assert the .bin sizes, the
+        // regions.json manifest keys, and the returned region count.
+        let mut replies = vec![("?".to_string(), "S05".to_string())];
+        let dump_regions: Vec<NdsRegion> = MEMORY_REGIONS
+            .iter()
+            .copied()
+            .filter(|r| r.dumpable && r.cpu == CpuId::Arm9)
+            .collect();
+        for region in &dump_regions {
+            let mut offset = 0usize;
+            while offset < region.size as usize {
+                let chunk = MAX_READ_CHUNK.min(region.size as usize - offset);
+                replies.push((
+                    format!("m{:x},{:x}", region.base as usize + offset, chunk),
+                    "00".repeat(chunk),
+                ));
+                offset += chunk;
+            }
+        }
+        let mut bridge = bridge_arm9_only_pairs(replies);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("dump");
+        let response = bridge.handle_request(Request::new(
+            12,
+            "dump_memory",
+            json!({"path": out.to_str().unwrap()}),
+        ));
+        assert!(response.ok, "dump failed: {:?}", response.error);
+        assert_eq!(response.result.unwrap()["regions"], dump_regions.len());
+
+        let regions: Value =
+            serde_json::from_slice(&std::fs::read(out.join("regions.json")).unwrap()).unwrap();
+        let regions = regions.as_array().unwrap();
+        assert_eq!(regions.len(), dump_regions.len());
+        let main_meta = regions.iter().find(|r| r["name"] == "main").unwrap();
+        assert_eq!(main_meta["memory_type"], "main");
+        assert_eq!(main_meta["base_address"], 0x0200_0000u64);
+        assert_eq!(main_meta["size"], 0x0040_0000u64);
+        assert_eq!(
+            std::fs::metadata(out.join("main.bin")).unwrap().len(),
+            memory_region("main").unwrap().size
+        );
+    }
+
+    #[test]
+    fn dump_memory_short_read_fails_without_partial_bin() {
+        // A stub read that returns fewer bytes than requested must abort the dump cleanly: no
+        // partial main.bin, no leftover temp, and no regions.json — the length check catches it
+        // before anything is placed on disk.
+        let mut bridge =
+            bridge_arm9_only(&[("?", "S05"), ("m2000000,2000", "00")]); // 1 byte, want MAX_READ_CHUNK
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("dump");
+        let response = bridge.handle_request(Request::new(
+            13,
+            "dump_memory",
+            json!({"path": out.to_str().unwrap()}),
+        ));
+        assert!(!response.ok, "short read must fail the dump");
+        assert_eq!(response.error.unwrap().kind, "emulator_error");
+        assert!(
+            !out.join("main.bin").exists(),
+            "a short read must not leave a partial main.bin"
+        );
+        assert!(
+            !out.join(".main.bin.partial").exists(),
+            "the temp file must not be left behind"
+        );
+        assert!(
+            !out.join("regions.json").exists(),
+            "regions.json must not be written when a region read fails"
+        );
+    }
+
+    #[test]
+    fn shared_read_freezes_running_arm7_then_restores_it() {
+        // `main` is shared Main RAM both cores write. ARM7 is an independent core that HITL resumes
+        // alongside ARM9, so a bulk read (find_pattern/dump_memory) must freeze ARM7 too — else a
+        // running ARM7 mutates `main` mid-read and tears the snapshot. A running ARM7 must be paused
+        // for the read and restored to running after (proven by the resume `c` it receives).
+        let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false; // HITL both-running
+        bridge.arm7.as_mut().unwrap().frozen = false;
+        let resp = bridge.handle_request(Request::new(
+            1,
+            "find_pattern",
+            json!({"memory_type": "main", "start": 0, "length": 8, "hex": "aa"}),
+        ));
+        assert!(resp.ok, "{:?}", resp.error);
+        let a7 = bridge.arm7.as_ref().unwrap();
+        assert!(
+            a7.gdb.calls.iter().any(|c| c == "c"),
+            "a running ARM7 must be frozen for the shared read and resumed after: {:?}",
+            a7.gdb.calls
+        );
+        assert!(!a7.frozen, "ARM7 must be restored to running after the read");
+        assert!(!bridge.arm9.frozen, "ARM9 must be restored to running after the read");
+    }
+
+    #[test]
+    fn shared_read_leaves_already_frozen_arm7_frozen() {
+        // If ARM7 is already halted, the bulk read must not spuriously resume it (that would drift a
+        // core the agent deliberately paused). Only ARM9 is running here.
+        let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]); // stays frozen after the handshake
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false;
+        let resp = bridge.handle_request(Request::new(
+            2,
+            "find_pattern",
+            json!({"memory_type": "main", "start": 0, "length": 8, "hex": "aa"}),
+        ));
+        assert!(resp.ok, "{:?}", resp.error);
+        let a7 = bridge.arm7.as_ref().unwrap();
+        assert!(a7.frozen, "an already-frozen ARM7 must stay frozen");
+        assert!(
+            !a7.gdb.calls.iter().any(|c| c == "c"),
+            "an already-frozen ARM7 must not be resumed by a shared read: {:?}",
+            a7.gdb.calls
+        );
+    }
+
+    fn bridge_arm9_only_pairs(replies: Vec<(String, String)>) -> NdsBridge<FakeGdb> {
+        NdsBridge::new(FakeGdb::from_pairs(replies), None, BridgeEnv::default())
     }
 }

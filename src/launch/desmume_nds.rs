@@ -136,7 +136,7 @@ fn wait_survives(pid: u32, settle: Duration, on_exit: &str) -> io::Result<()> {
     let deadline = Instant::now() + settle;
     while Instant::now() < deadline {
         if !process_alive(pid) {
-            return Err(io::Error::new(io::ErrorKind::Other, on_exit.to_string()));
+            return Err(io::Error::other(on_exit.to_string()));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
