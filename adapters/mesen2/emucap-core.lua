@@ -72,7 +72,7 @@ local KEEPALIVE_FRAMES = 30
 local deferred = nil           -- run_frames/press_buttons 진행 상태 { id, kind, remaining, age }
 local pending_io = nil         -- save_state/load_state 진행 상태 { id, kind, path, ref }
 local next_bp_id = 1
-local breakpoints = {}         -- id -> { ref, kind, start, end, pause_on_hit, auto_savestate }
+local breakpoints = {}         -- id -> { ref, kind, start, end, pause_on_hit }
 local reset_bp = nil           -- break_on_reset: 리셋 핸들러 exec BP { ref, handler }
 local EVENT_CAP = 256
 local READ_CAP = 0x20000       -- read_memory 상한(워치독 안전: 대량 읽기가 emu 스레드를 초단위 블록하지 않게 — find_pattern SCAN_CAP과 동형)
@@ -724,16 +724,47 @@ local function band(a, b)
   return r
 end
 
--- 값-조건 BP가 비교할 접근 값. value_len=1이면 콜백이 준 접근 바이트(read=읽힌 값, write=쓰일 값)를
--- 그대로 쓴다. value_len>1이면 저바이트=접근 바이트, 상위는 addr+i에서 little-endian으로 읽는다(SNES).
+-- 값-조건 BP가 비교할 접근 값(little-endian). value_len=1이면 콜백이 준 접근 바이트(read=읽힌 값,
+-- write=쓰일 값)를 그대로 쓴다. value_len>1일 때:
+--   • write BP: write 콜백은 pre-write·per-byte라 emu.read(addr+i)는 아직 안 쓰인 옛 바이트를 준다 →
+--     상위바이트를 메모리에서 읽으면 stale 값으로 재구성돼 미스/오발화한다. 대신 실제로 쓰이는 바이트를
+--     각 per-byte write 콜백의 value로 누적해 재구성한다(폭 전체를 콜백에 등록해야 상위 바이트 콜백이
+--     닿는다 — set_breakpoint의 mirror 폭 확장 참조). 폭 전체가 관측되기 전엔 nil(미결정)을 돌려 on_access가
+--     hit를 미룬다. burst 정체성: 각 write는 진행 중 burst의 기대 다음 오프셋(wnext)이어야 이어 붙고,
+--     아니면(비연속·역순·저바이트 재시작) burst를 버린다 — 시간적으로 무관한 산발 write가 슬롯을 채워
+--     존재한 적 없는 값을 재구성하는 오발화를 막는다. 그래서 폭 전체가 '한 store로 연속' 쓰였을 때만 매치한다.
+--     가정: 타깃 CPU(65816·Z80·ARM)는 워드 store를 저바이트부터(little-endian, low→high) 쓴다. 저바이트를
+--     나중에 쓰는 store(예 GB PUSH의 high→low)는 재구성되지 않아 값-BP가 발화하지 않는다(오발화보다 미발화 선택).
+--   • read BP: 상위바이트는 이미 메모리에 있으므로(비파괴 read) addr+i를 little-endian으로 읽는다.
 local function access_value(bp, addr, value)
-  if (bp.value_len or 1) <= 1 then return value end
-  -- 상위바이트 읽기용 memory_type. 버스주소로 변환한 BP는 addr이 버스주소이므로 RAM-상대
-  -- memory_type(예 smsWorkRam)으로 addr+i를 읽으면 범위 밖을 읽는다 — 버스 memtype으로 읽어야 한다.
+  local len = bp.value_len or 1
+  if len <= 1 then return value end
+  if bp.kind == "write" and not bp.is_vram_recon then
+    local off = addr - bp.start
+    -- 뱅크 미러($80) 콜백은 절대주소(예 0x802118)로 발화하므로 canonical span(bp.start 기준)으로
+    -- 되돌린다 — 안 그러면 off가 0x800000+가 되어 폭>1 write 누적이 영영 완결되지 않는다. 미러는 +0x800000.
+    if off >= 0x800000 then off = off - 0x800000 end
+    if off < 0 or off >= len then return nil end
+    local buf = bp.wbytes
+    if off == 0 then
+      buf = { [0] = value }; bp.wbytes = buf; bp.wnext = 1                -- 저바이트 → 새 burst 시작
+    elseif buf ~= nil and off == bp.wnext then
+      buf[off] = value; bp.wnext = off + 1                               -- 기대 다음 오프셋 → 이어 붙임
+    else
+      bp.wbytes = nil; bp.wnext = nil; return nil                        -- 비연속·역순 → burst 폐기, 판정 보류
+    end
+    if bp.wnext < len then return nil end                                -- 폭 미완결 → 판정 보류
+    local v = 0
+    for i = 0, len - 1 do v = v + buf[i] * (256 ^ i) end
+    bp.wbytes = nil; bp.wnext = nil                                      -- 소비 완료 → 다음 burst용 리셋
+    return v
+  end
+  -- read(및 vram_recon value_len>1 폴백): 상위바이트 읽기용 memory_type. 버스주소로 변환한 BP는 addr이
+  -- 버스주소이므로 RAM-상대 memory_type(예 smsWorkRam)으로 addr+i를 읽으면 범위 밖을 읽는다 — 버스 memtype으로.
   local mt = (bp.bus_translated and emu.memType[SYS.default_memtype])
     or emu.memType[bp.memory_type] or emu.memType[SYS.default_memtype]
   local v = value
-  for i = 1, bp.value_len - 1 do
+  for i = 1, len - 1 do
     v = v + emu.read(addr + i, mt, false) * (256 ^ i)
   end
   return v
@@ -802,6 +833,17 @@ local function setup_vram_recon_bp(bp, budget)
 end
 
 function handlers.set_breakpoint(p)
+  -- auto_savestate 정직화(조용한 no-op 제거): BP 히트는 read/write/이벤트(nmi·irq·dma) 콜백 안에서
+  -- 일어나는데 emu.createSavestate는 exec 콜백 컨텍스트 전용이라(docs/research/mesen2-lua-api.md — 이벤트·
+  -- codeBreak 컨텍스트에선 실패) 히트 순간 세이브스테이트를 원자적으로 못 뜬다. 조용히 받아 no-op하면
+  -- 호출자가 상태가 캡처된 줄 오인하므로 명시적으로 거부한다. 히트 순간 원자 캡처는 `snapshot` 스펙
+  -- (record_hit이 read로 이벤트에 담음), 전체 세이브스테이트는 poll_events로 히트를 받은 뒤 `save_state`
+  -- verb(전용 exec 콜백 on_io_exec로 안전하게 뜸)를 쓴다.
+  if p.auto_savestate then
+    return false, "unsupported",
+      "auto_savestate는 BP 히트에서 미지원 — createSavestate는 exec 콜백 전용이라 read/write/이벤트/codeBreak 콜백에선 실패한다. "
+      .. "히트 순간 원자 캡처는 snapshot= 스펙을, 전체 상태는 poll_events로 히트 확인 후 save_state verb를 써라."
+  end
   local id = next_bp_id; next_bp_id = next_bp_id + 1
   -- NMI/IRQ: 메모리 접근이 아니라 이벤트(인터럽트 진입). exec BP가 못 잡는 NMI/VBlank 컨텍스트를
   -- 그 진입에서 freeze해 핸들러 상태를 검사·step하게 한다.
@@ -886,7 +928,7 @@ function handlers.set_breakpoint(p)
   local has_value = (p.value ~= nil) and (p.kind ~= "exec")
   local bp = {
     id = id, kind = p.kind, memory_type = p.memory_type,
-    pause_on_hit = p.pause_on_hit, auto_savestate = p.auto_savestate,
+    pause_on_hit = p.pause_on_hit,
     start = p.start or 0, end_ = p["end"] or p.start or 0,
     cbtype = cbtype, pc_min = p.pc_min, pc_max = p.pc_max,   -- pc 조건(선택)
     has_value = has_value, value = p.value or 0,
@@ -936,7 +978,13 @@ function handlers.set_breakpoint(p)
   local function on_access(addr, value)
     if bp.has_value then
       local v = access_value(bp, addr, value)
+      if v == nil then return end                                                -- 폭>1 write burst 미완결 → 판정 보류
       if band(v, bp.value_mask) ~= band(bp.value, bp.value_mask) then return end  -- 값 불일치 → 무시
+      if bp.value_len > 1 then
+        -- 폭>1: 히트 주소·값을 개별 바이트가 아니라 베이스 주소와 재구성한 전체 값으로 보고한다.
+        -- write=완결 콜백은 상위 바이트라 베이스는 등록 저주소(bp.start), read=접근 저바이트 주소(addr).
+        record_hit(bp, (bp.kind == "write") and bp.start or addr, v); return
+      end
     end
     record_hit(bp, addr, value)
   end
@@ -944,10 +992,19 @@ function handlers.set_breakpoint(p)
   -- ($2117 등) 준 단일 주소면, 게임이 어느 뱅크($00 슬로우/$80 패스트)에서 접근하든 잡게 $00·$80 미러를
   -- 둘 다 등록한다(Mesen 콜백은 뱅크별 절대주소 — bank $00만 걸면 bank $80 실행 게임의 $2117 등을 놓침
   -- ). 범위 BP·뱅크 명시 주소($XX0000+)·LowRAM($0000-$1FFF, snesWorkRam 권장)은 그대로.
-  local mirrors = { { bp.start, bp.end_ } }
+  --
+  -- 폭 확장과 뱅크 미러는 직교한다: 폭>1 write 값-BP는 len 연속 바이트가 각각 per-byte write 콜백으로
+  -- 오므로 상위 바이트 콜백까지 닿게 폭 전체(span)를 등록해야 한다(안 그러면 저바이트만 트리거돼
+  -- access_value 누적이 영영 완결 안 됨 → 값-BP 미발화). $2000-$7FFF의 폭>1 write 값-BP는 상위 바이트
+  -- 주소'와' 그 뱅크 미러가 둘 다 필요하므로 두 축을 합성한다 — span을 먼저 구해 각 미러가 폭 전체를 덮게.
+  local span = bp.end_
+  if p.kind == "write" and bp.has_value and bp.value_len > 1 and bp.start == bp.end_ then
+    span = bp.start + bp.value_len - 1
+  end
+  local mirrors = { { bp.start, span } }
   if SYS.bank_mirror and (p.kind == "read" or p.kind == "write") and p.memory_type == SYS.default_memtype
      and bp.start == bp.end_ and bp.start >= 0x2000 and bp.start < 0x8000 then
-    mirrors = { { bp.start, bp.start }, { bp.start + 0x800000, bp.start + 0x800000 } }
+    mirrors = { { bp.start, span }, { bp.start + 0x800000, span + 0x800000 } }
   end
   bp.mirror_refs = {}
   for _, m in ipairs(mirrors) do
@@ -983,7 +1040,7 @@ function handlers.list_breakpoints()
       start = bp.start, ["end"] = bp.end_,
       register = bp.register, min = bp.min, max = bp.max,   -- reg 워치(watch_register)
       pc_min = bp.pc_min, pc_max = bp.pc_max,            -- pc 조건
-      pause_on_hit = bp.pause_on_hit, auto_savestate = bp.auto_savestate,
+      pause_on_hit = bp.pause_on_hit,
     }
   end
   return true, { breakpoints = as_array(out) }
