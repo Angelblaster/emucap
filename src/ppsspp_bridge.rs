@@ -113,6 +113,15 @@ const SAVESTATE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// fork's wait. Kept bounded so a wedged reboot still surfaces an error rather than hanging forever.
 const RESET_READ_TIMEOUT: Duration = Duration::from_secs(35);
 
+/// After `game.reset` acks, how many times to poll `cpu.status.stepping` — and the gap between polls
+/// — to confirm the reboot actually left the CPU halted at the fresh boot entry before reporting
+/// completion. The headless fork only acks once the reboot finished and halted the core
+/// (`CORE_STEPPING_CPU`), so the first poll already reads stepping (no wait). A display:true GUI
+/// session does not block `game.reset` and keeps the core running through an async reboot, so these
+/// polls read "still running" and `reset` reports the async reboot instead of a false "completed".
+const RESET_HALT_POLLS: u32 = 3;
+const RESET_HALT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 /// Methods this bridge actually dispatches today — kept truthful to `handle_request` (a caller must
 /// be able to trust `status.methods`/`hello.methods`; see `CLAUDE.md`). Grows as later tasks add
 /// handlers.
@@ -771,33 +780,26 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// (`src/live/tools.rs`), so a direct bridge dump is already diff-ready.
     fn dump_memory(&mut self, params: &Value) -> BridgeResult<Value> {
         let path = PathBuf::from(required_str(params, "path")?);
-        // Build the whole dump in a sibling staging dir first, then swap it into `path` atomically —
-        // so a short/failed `memory.read` mid-stream never overwrites a prior good dump with a
-        // truncated `main.bin` beside a `regions.json` that still advertises the full region size.
-        let staging = staging_dir(&path)?;
-        std::fs::create_dir_all(&staging)?;
-        let built = self.build_dump(&staging);
-        let metas = match built {
-            Ok(metas) => metas,
-            Err(e) => {
-                // Discard the partial staging tree; the previous dump (if any) at `path` is untouched.
-                let _ = std::fs::remove_dir_all(&staging);
-                return Err(e);
-            }
-        };
-        if let Err(e) = replace_dir(&staging, &path) {
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(BridgeError::Io(e));
-        }
-        // state.json is written by the MCP host (src/live/tools.rs) uniformly for every adapter, so the
-        // bridge writes only the region .bins + regions.json — matching the PC-98/NDS bridges (no
-        // redundant get_state round-trip here that the host would immediately overwrite).
+        // The MCP host (src/live/tools.rs) hands us its own `dump-staging` sibling dir and does the
+        // single atomic swap of the finished staging into the final dump location, so the bridge
+        // writes region files directly into `path` with no dir-level swap of its own — mirroring the
+        // NDS bridge. Each region streams to a `.partial` temp that is size-verified then atomically
+        // renamed into `<name>.bin`, and `regions.json` is written last, so a short/failed
+        // `memory.read` mid-stream leaves no truncated `.bin` and no manifest advertising one — the
+        // host discards this whole staging dir on error.
+        std::fs::create_dir_all(&path)?;
+        let metas = self.build_dump(&path)?;
+        // state.json is written by the MCP host uniformly for every adapter, so the bridge writes
+        // only the region .bins + regions.json — matching the PC-98/NDS bridges (no redundant
+        // get_state round-trip here that the host would immediately overwrite).
         Ok(json!({ "path": path.display().to_string(), "regions": metas.len() }))
     }
 
     /// Stream every `MEMORY_TYPES` region into `<name>.bin` under `dir` and write `regions.json`,
-    /// verifying each `.bin` ends up exactly the region size. Any read/write error propagates so the
-    /// caller can discard `dir` without publishing a partial dump. Returns the region metadata written.
+    /// verifying each `.bin` ends up exactly the region size. Each region streams to a `.partial`
+    /// temp that is renamed into place only after its size is verified, and any read/write error
+    /// discards that temp before propagating — so a partial dump leaves no truncated `.bin`. Returns
+    /// the region metadata written.
     fn build_dump(&mut self, dir: &Path) -> BridgeResult<Vec<Value>> {
         let mut metas = Vec::new();
         for &name in MEMORY_TYPES {
@@ -809,23 +811,19 @@ impl<T: WsTransport> PpssppBridge<T> {
                     )))
                 }
             };
-            let bin_path = dir.join(format!("{name}.bin"));
-            let mut file = File::create(&bin_path)?;
-            let mut offset = 0u64;
-            while offset < size {
-                let chunk = MAX_READ_LEN.min((size - offset) as usize);
-                let bytes = self.read_main_bytes(offset, chunk)?;
-                file.write_all(&bytes)?;
-                // Advance by what was actually read (read_main_bytes already guarantees == chunk).
-                offset += bytes.len() as u64;
+            let tmp_path = dir.join(format!(".{name}.bin.partial"));
+            if let Err(e) = self.stream_region_to(&tmp_path, size) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
             }
-            file.flush()?;
-            let written = std::fs::metadata(&bin_path)?.len();
+            let written = std::fs::metadata(&tmp_path)?.len();
             if written != size {
+                let _ = std::fs::remove_file(&tmp_path);
                 return Err(BridgeError::Emulator(format!(
                     "dump_memory: {name}.bin is {written:#x} bytes, expected region size {size:#x}"
                 )));
             }
+            std::fs::rename(&tmp_path, dir.join(format!("{name}.bin")))?;
             metas.push(json!({
                 "name": name,
                 "memory_type": name,
@@ -835,6 +833,23 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
         std::fs::write(dir.join("regions.json"), serde_json::to_vec(&metas)?)?;
         Ok(metas)
+    }
+
+    /// Stream `size` bytes of `main` (user RAM) into the file at `path`, reading PPSSPP in
+    /// `MAX_READ_LEN` chunks. Any short/failed `memory.read` propagates so `build_dump` can discard
+    /// the partial file.
+    fn stream_region_to(&mut self, path: &Path, size: u64) -> BridgeResult<()> {
+        let mut file = File::create(path)?;
+        let mut offset = 0u64;
+        while offset < size {
+            let chunk = MAX_READ_LEN.min((size - offset) as usize);
+            let bytes = self.read_main_bytes(offset, chunk)?;
+            file.write_all(&bytes)?;
+            // Advance by what was actually read (read_main_bytes already guarantees == chunk).
+            offset += bytes.len() as u64;
+        }
+        file.flush()?;
+        Ok(())
     }
 
     /// `cpu.getAllRegs` → the `id:0` ("GPR") category flattened into `cpu.<name>: value` (MIPS GPRs
@@ -1263,6 +1278,10 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// the NDS bridge dropping its own SIGINT stops. `breakpoint_id` filters like the NDS bridge: a
     /// non-matching event is held in `self.events` for a later poll instead of being dropped.
     fn poll_events(&mut self, params: &Value) -> BridgeResult<Value> {
+        // Validate the `breakpoint_id` filter BEFORE draining the transport (which is destructive) or
+        // touching `self.events`: a malformed filter must fail without consuming — and thereby losing
+        // forever — already-buffered breakpoint-hit events.
+        let filter_id = optional_num(params, "breakpoint_id")?;
         let raw = self.ws.drain_events();
         let mut fresh = Vec::new();
         // Count the spontaneous events this drain actually discards (log lines, `cpu.resume`,
@@ -1280,7 +1299,6 @@ impl<T: WsTransport> PpssppBridge<T> {
         let mut all = std::mem::take(&mut self.events);
         all.append(&mut fresh);
 
-        let filter_id = optional_num(params, "breakpoint_id")?;
         let mut out = Vec::new();
         for event in all {
             let matches_filter = match filter_id {
@@ -1556,21 +1574,54 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// the same way `save_state` outlasts the fork's save wait. Bridge-side breakpoints are left
     /// tracked as-is: PPSSPP's breakpoints live in a WS-side global registry (`g_breakpoints`) that
     /// survives the reset, so `self.bps` stays in sync (the next run-loop `g_breakpoints.Frame()`
-    /// re-arms them against the freshly booted code). Mirroring the initial launch, the reboot leaves
-    /// the CPU halted at the fresh boot entry (state `frozen`) so a caller can re-arm breakpoints
-    /// before running — resume to run it. `post_reset_pc` reports that boot-entry pc as verifiable
-    /// evidence the machine really rebooted (a no-op would leave the pc progressing deep in-game).
+    /// re-arms them against the freshly booted code). Mirroring the initial launch, the headless
+    /// reboot leaves the CPU halted at the fresh boot entry (state `frozen`) so a caller can re-arm
+    /// breakpoints before running — resume to run it. `post_reset_pc` reports that boot-entry pc as
+    /// verifiable evidence the machine really rebooted (a no-op would leave the pc progressing deep
+    /// in-game).
+    ///
+    /// Only the headless fork blocks the ack — a display:true GUI session does not (its
+    /// `game.reset` posts a UI message and returns immediately, and the async reboot keeps the core
+    /// running rather than halting). So the ack alone does not prove the reboot completed: this
+    /// confirms the halted state (`wait_for_reset_halt`) before claiming `completed`. When the core
+    /// is halted the reboot is confirmed and `post_reset_pc` is the boot entry; when it is still
+    /// running the reboot is in flight, so `reset` reports `status:"rebooting"` and withholds a
+    /// `post_reset_pc` — the live pc there is a stale in-game value, not reset evidence. `status` is
+    /// the single source of truth for whether the core halted (`completed`) or is still rebooting.
     fn reset(&mut self, _params: &Value) -> BridgeResult<Value> {
         self.ws
             .call_with_timeout("game.reset", json!({}), RESET_READ_TIMEOUT)?;
+        if !self.wait_for_reset_halt()? {
+            // The core never halted: the reboot is running asynchronously (display:true GUI). Report
+            // that honestly instead of a false "completed" with the still-in-game pc — get_state /
+            // poll_events track the reboot as it settles.
+            return Ok(json!({ "status": "rebooting" }));
+        }
         let mut result = json!({ "status": "completed" });
-        // Best-effort: surface the post-reboot pc so a caller can confirm the reset took effect.
+        // Halted at the fresh boot entry — surface that pc as verifiable reset evidence.
         if let Ok(state) = self.fetch_cpu_state() {
             if let Some(pc) = state.get("cpu.pc").and_then(Value::as_u64) {
                 result["post_reset_pc"] = json!(pc);
             }
         }
         Ok(result)
+    }
+
+    /// Poll `cpu.status.stepping` after a `game.reset` ack to confirm the reboot left the CPU halted
+    /// at the fresh boot entry. Returns `true` on the first poll that reads halted (the headless
+    /// path, which acks already-halted, returns immediately with no sleep); returns `false` if the
+    /// core is still running after `RESET_HALT_POLLS` tries (a display:true GUI session, whose async
+    /// reboot keeps the core running). See `reset`.
+    fn wait_for_reset_halt(&mut self) -> BridgeResult<bool> {
+        for attempt in 0..RESET_HALT_POLLS {
+            if self.cpu_is_stepping()? {
+                return Ok(true);
+            }
+            if attempt + 1 < RESET_HALT_POLLS {
+                std::thread::sleep(RESET_HALT_POLL_INTERVAL);
+            }
+        }
+        Ok(false)
     }
 
     /// `game.status` for the running disc's id/version/title plus a locally computed sha1 of the
@@ -1696,50 +1747,6 @@ fn breakpoint_condition(params: &Value) -> BridgeResult<Option<String>> {
         Ok(None)
     } else {
         Ok(Some(clauses.join(" && ")))
-    }
-}
-
-/// A unique sibling of `dst` (same parent, so a later `rename` stays on one filesystem and is
-/// atomic) tagged with `label`, this process id, and a nanosecond stamp. Used to stage a fresh
-/// memory dump before swapping it over any prior dump. Errors if `dst` has no parent directory.
-fn sibling_path(dst: &Path, label: &str) -> BridgeResult<PathBuf> {
-    let parent = dst.parent().ok_or_else(|| {
-        BridgeError::BadParams(format!(
-            "dump path {} has no parent directory to stage under",
-            dst.display()
-        ))
-    })?;
-    let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("dump");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Ok(parent.join(format!(".{name}.{label}.{}.{nanos}", std::process::id())))
-}
-
-fn staging_dir(dst: &Path) -> BridgeResult<PathBuf> {
-    sibling_path(dst, "dump-staging")
-}
-
-/// Atomically move the fully-built staging dump `staging` into place at `dst`. If `dst` is absent it
-/// is a single `rename`; if a prior dump exists there it is moved to a backup, `staging` is renamed
-/// in, and the backup is dropped only on success (rolled back on failure) — so a prior good dump is
-/// never left half-replaced.
-fn replace_dir(staging: &Path, dst: &Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        return std::fs::rename(staging, dst);
-    }
-    let backup = sibling_path(dst, "dump-old").map_err(std::io::Error::other)?;
-    std::fs::rename(dst, &backup)?;
-    match std::fs::rename(staging, dst) {
-        Ok(()) => {
-            let _ = std::fs::remove_dir_all(&backup);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::rename(&backup, dst);
-            Err(e)
-        }
     }
 }
 
@@ -3224,7 +3231,7 @@ mod tests {
 
     #[test]
     fn set_breakpoint_after_reclear_seeds_from_live_counter_so_first_hit_not_missed() {
-        // Round-2 seed logic (unchanged): a sole breakpoint on a range is hit (shared memcheck
+        // Seed logic: a sole breakpoint on a range is hit (shared memcheck
         // numHits→1), then cleared — clearing the LAST bridge id on the range removes the memcheck,
         // so PPSSPP resets its numHits. Re-adding creates a FRESH memcheck at numHits=0. Seeding the
         // re-add from PPSSPP's live counter (0) makes the first real hit (0→1) satisfy
@@ -3429,6 +3436,36 @@ mod tests {
         // The id=1 hit was held back, not dropped — an unfiltered poll must still see it.
         let unfiltered = bridge.handle_request(Request::new(4, "poll_events", json!({})));
         let events = unfiltered.result.unwrap()["events"].clone();
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["breakpoint_id"], 1);
+    }
+
+    #[test]
+    fn poll_events_malformed_filter_errors_without_losing_buffered_hits() {
+        // A malformed breakpoint_id must be rejected BEFORE the transport is drained — otherwise the
+        // failed request destructively consumes an already-buffered breakpoint-hit event and loses
+        // it forever. Only one cpu.getAllRegs reply is queued (for the later valid poll's enrich):
+        // the malformed poll must not consume anything from the transport.
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[
+            ("cpu.breakpoint.add", json!({"event":"cpu.breakpoint.add"})),
+            ("cpu.getAllRegs", gpr_only_pc(0x100)),
+        ]));
+        bridge.handle_request(Request::new(1, "set_breakpoint", json!({"address": 0x100})));
+        bridge
+            .ws
+            .push_event(json!({"event":"cpu.stepping","pc":0x100,"ticks":1}));
+
+        let bad = bridge.handle_request(Request::new(
+            2,
+            "poll_events",
+            json!({"breakpoint_id": "not-a-number"}),
+        ));
+        assert!(!bad.ok);
+        assert_eq!(bad.error.unwrap().kind, "bad_params");
+
+        // The buffered hit survived the failed poll — a subsequent valid poll still surfaces it.
+        let good = bridge.handle_request(Request::new(3, "poll_events", json!({})));
+        let events = good.result.unwrap()["events"].clone();
         assert_eq!(events.as_array().unwrap().len(), 1);
         assert_eq!(events[0]["breakpoint_id"], 1);
     }
@@ -3935,15 +3972,21 @@ mod tests {
 
     #[test]
     fn reset_calls_game_reset_with_reboot_budget_and_reports_post_reset_pc() {
+        // Headless path: the fork blocks game.reset until the reboot completed and left the core
+        // halted at the fresh boot entry, so the halt poll reads stepping on the first check and the
+        // bridge reports a confirmed completion with the boot-entry pc.
         let mut bridge = PpssppBridge::new(FakeWs::with(&[
             ("game.reset", json!({"event":"game.reset"})),
-            // The fork's ack means "rebooted"; the bridge then reads the fresh boot-entry pc.
+            ("cpu.status", json!({"event":"cpu.status","stepping":true,"paused":false})),
             ("cpu.getAllRegs", gpr_only_pc(0x0880_4128)),
         ]));
         let resp = bridge.handle_request(Request::new(1, "reset", json!({})));
         assert!(resp.ok, "{:?}", resp.error);
         let result = resp.result.unwrap();
         assert_eq!(result["status"], "completed");
+        // `status` is the single source of truth for whether the core is halted — no redundant
+        // `stopped` boolean derivable from it.
+        assert!(result.get("stopped").is_none());
         assert_eq!(result["post_reset_pc"], 0x0880_4128u32);
         assert_eq!(bridge.ws.calls[0].0, "game.reset");
         // game.reset must ride the extended reboot budget, not the default fail-fast read — an 8s
@@ -3952,6 +3995,36 @@ mod tests {
             bridge.ws.call_timeouts,
             vec![("game.reset".to_string(), RESET_READ_TIMEOUT)]
         );
+    }
+
+    #[test]
+    fn reset_display_session_reports_async_reboot_not_false_completed_while_running() {
+        // display:true GUI session: the fork does NOT block game.reset (only the headless build
+        // does), so the ack returns while the reboot is still queued on the GUI pump and the core
+        // keeps running. The halt poll never reads stepping, so the bridge must report the async
+        // reboot truthfully — NOT a false "completed" with the stale, still-in-game pc.
+        let mut replies: Vec<(&str, Value)> = vec![("game.reset", json!({"event":"game.reset"}))];
+        for _ in 0..RESET_HALT_POLLS {
+            replies.push((
+                "cpu.status",
+                json!({"event":"cpu.status","stepping":false,"paused":false}),
+            ));
+        }
+        let mut bridge = PpssppBridge::new(FakeWs::with(&replies));
+        let resp = bridge.handle_request(Request::new(1, "reset", json!({})));
+        assert!(resp.ok, "{:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_ne!(
+            result["status"], "completed",
+            "must not claim completed while the GUI reboot is still in flight"
+        );
+        assert_eq!(result["status"], "rebooting");
+        // No redundant `stopped` boolean — `status` alone distinguishes rebooting (running) from
+        // completed (halted).
+        assert!(result.get("stopped").is_none());
+        // No boot-entry pc is claimed while the core is still running the pre-reset game — the live
+        // pc would be a stale, misleading value, not reset evidence.
+        assert!(result.get("post_reset_pc").is_none());
     }
 
     // --- dump_memory ---
@@ -4086,13 +4159,17 @@ mod tests {
             out.join("state.json").exists(),
             "the prior state.json must survive a failed re-dump"
         );
-        // No staging leftovers cluttering the dump root's parent.
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        // The bridge writes region files directly into the requested dir (the host owns the atomic
+        // dir swap), so a mid-stream failure must leave no `.partial` region temp behind in it.
+        let leftovers: Vec<_> = std::fs::read_dir(&out)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains("dump-staging"))
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
             .collect();
-        assert!(leftovers.is_empty(), "staging dir must be cleaned up on failure");
+        assert!(
+            leftovers.is_empty(),
+            "partial region temp must be cleaned up on failure"
+        );
     }
 
     // --- get_rom_info ---

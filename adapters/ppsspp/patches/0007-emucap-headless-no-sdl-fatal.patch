@@ -1,0 +1,53 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 4dfcc74d53..d454b93479 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -324,33 +324,26 @@ set(SDL_TTF_LIB_TARGET "")
+ set(FONTCONFIG_LIB_TARGET "")
+ 
+ if(NOT LIBRETRO AND NOT IOS AND NOT LOONGARCH64_DEVICE AND NOT ANDROID)
++	# emucap: SDL3/SDL3_ttf back the desktop GUI (PPSSPPSDL) frontend only. When missing, warn and
++	# leave SDL_LIB_TARGET empty; the PPSSPPSDL target below is guarded on it, so a headless-only host
++	# (no SDL3) still configures and builds PPSSPPHeadless instead of failing the configure.
+ 	find_package(SDL3 QUIET)
+-	if(NOT SDL3_FOUND)
+-		if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (EXISTS "/usr/bin/apt" OR EXISTS "/usr/bin/apt-get" OR EXISTS "/etc/debian_version"))
+-			message(FATAL_ERROR "SDL3 not found. Install dependencies with: sudo apt install libsdl3-dev libsdl3-ttf-dev")
+-		else()
+-			message(FATAL_ERROR "SDL3 not found. Install SDL3 development packages for your distribution and retry.")
+-		endif()
+-	endif()
+-	set(SDL_LIB_TARGET SDL3::SDL3)
+ 	find_package(SDL3_ttf QUIET)
+-	if(NOT SDL3_ttf_FOUND)
+-		if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (EXISTS "/usr/bin/apt" OR EXISTS "/usr/bin/apt-get" OR EXISTS "/etc/debian_version"))
+-			message(FATAL_ERROR "SDL3_ttf not found. Install dependencies with: sudo apt install libsdl3-ttf-dev")
++	if(SDL3_FOUND AND SDL3_ttf_FOUND)
++		set(SDL_LIB_TARGET SDL3::SDL3)
++		set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
++		message(STATUS "Using SDL3 and SDL3_ttf")
++		add_compile_definitions(USE_SDL3_TTF)
++		find_package(Fontconfig QUIET)
++		if(Fontconfig_FOUND)
++			set(FONTCONFIG_LIB_TARGET Fontconfig::Fontconfig)
++			add_compile_definitions(USE_SDL3_TTF_FONTCONFIG)
++			message(STATUS "Using Fontconfig for SDL3_ttf fallback fonts")
+ 		else()
+-			message(FATAL_ERROR "SDL3_ttf not found. Install SDL3_ttf development packages for your distribution and retry.")
++			message(WARNING "Fontconfig not found - SDL3_ttf fallback fonts for missing glyphs will be limited")
+ 		endif()
+-	endif()
+-	set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
+-	message(STATUS "Using SDL3 and SDL3_ttf")
+-	add_compile_definitions(USE_SDL3_TTF)
+-	find_package(Fontconfig QUIET)
+-	if(Fontconfig_FOUND)
+-		set(FONTCONFIG_LIB_TARGET Fontconfig::Fontconfig)
+-		add_compile_definitions(USE_SDL3_TTF_FONTCONFIG)
+-		message(STATUS "Using Fontconfig for SDL3_ttf fallback fonts")
+ 	else()
+-		message(WARNING "Fontconfig not found - SDL3_ttf fallback fonts for missing glyphs will be limited")
++		message(WARNING "SDL3/SDL3_ttf not found - the desktop GUI (PPSSPPSDL) target is disabled; PPSSPPHeadless still builds. Install SDL3 + SDL3_ttf to enable display:true.")
+ 	endif()
+ endif()
+ 
