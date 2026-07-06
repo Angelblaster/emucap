@@ -2,6 +2,32 @@
 
 Beta software — interfaces may still change.
 
+## 0.4.1
+
+Robustness and correctness hardening across every adapter and the shared control/session layer.
+
+### Fixed
+- NDS: `find_pattern` and `dump_memory` no longer crash the emulator — a large scan overflowed a fixed debugger buffer; memory reads and writes are now clamped to the buffer and chunked.
+- NDS: agent `touch` lands at the requested coordinate instead of at 1/16 of it.
+- NDS: `write_memory` caps and chunks a large write instead of silently dropping one that exceeds the debugger packet buffer.
+- NDS: a shared-RAM (`main`) write leaves both cores in their prior running/frozen state, and a stray interrupt echo no longer re-freezes a resumed core.
+- NDS: `poll_events` validates its filter before draining, and preserves one core's events when the other core's drain errors.
+- PC-98: `save_state` writes atomically — a mid-save failure no longer destroys a previously valid state at the same path.
+- PC-98: `run_frames` and frame-step drain a pending stop first, so a stale breakpoint hit is not mis-reported as the frames result.
+- PC-98: the pause/interrupt echo no longer surfaces as a phantom breakpoint event.
+- PSP: `poll_events` validates its filter before draining, so a malformed filter no longer discards buffered hits.
+- PSP: `reset` reports accurately for a `display: true` (GUI) session instead of claiming completion while the reboot is still in flight.
+- Mesen: a multi-byte write value-breakpoint on a system-register address ($2000–$7FFF) fires on both bank mirrors and compares the bytes actually written; `auto_savestate` is rejected rather than silently ignored.
+- Mednafen: the Saturn `physical` address space is rejected in `probe` and `find_pattern` (matching `read_memory`/`write_memory`) instead of returning silent zeros.
+- `dump_memory` publishes atomically for every adapter — a failed dump never destroys a prior one — and refuses a destination that is a file or symlink.
+- Session identity is keyed per session, so a second session in the same working directory can no longer adopt another's running emulator.
+- Broker mode fences responses by session, so a stale reply after a session hand-off is rejected.
+- Launch: `caffeinate` (the HITL display keep-awake) is reaped across all display adapters instead of leaking one zombie per relaunch, and a failed launch no longer leaves a staging temp directory behind.
+
+### Changed
+- PSP `adapters/ppsspp/build.sh`: `PPSSPPHeadless` is the guaranteed build; the GUI build (`PPSSPPSDL`, for `display: true`) is best-effort and no longer required at configure time, so a host without SDL3 still builds the headless debugger.
+- The atomic directory swap behind `dump_memory` uses a single-syscall exchange where the platform provides one.
+
 ## 0.4.0
 
 ### Added
