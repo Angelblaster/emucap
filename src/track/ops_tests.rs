@@ -383,7 +383,7 @@ fn finish_run_by_id_closes_orphan_without_active_state() {
         store::load_run(root, "sha_a", &run.id).unwrap().status,
         RunStatus::Aborted
     );
-    // 미존재 id는 Ok(None)(조용한 실패 아님 — 호출부가 정직 에러로 처리)
+    // 미존재 id는 Ok(None) — 호출부가 에러로 처리한다(조용히 성공시키지 않는다)
     assert!(
         ops::finish_run_by_id(root, "NOPE", RunStatus::Done, "2026-06-30T02:00:00Z")
             .unwrap()

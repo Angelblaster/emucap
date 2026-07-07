@@ -207,7 +207,7 @@ pub fn log_gate(
 }
 
 /// 이미 캡처된 파일을 artifact로 등록한다 — 경로해소(절대=그대로·상대=git_root 기준) + 존재검사
-/// + 정직 에러까지 여기서 한다. 반환 `{artifact_id: <id>}`.
+/// + 에러 처리까지 여기서 한다. 반환 `{artifact_id: <id>}`.
 #[allow(clippy::too_many_arguments)]
 pub fn log_artifact(
     root: &Path,

@@ -453,7 +453,7 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "content": ["gba"],
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
-            "notes": "ARM7: disassemble/call_stack are honest-unsupported; memory/state/BP/save/input/screenshot are supported."
+            "notes": "ARM7: disassemble/call_stack are unsupported; memory/state/BP/save/input/screenshot are supported."
         },
         {
             "system": "nes",

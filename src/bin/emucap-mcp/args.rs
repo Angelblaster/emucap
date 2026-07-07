@@ -224,8 +224,8 @@ pub(crate) struct PathArgs {
 
 /// 프레임/명령 진행 인자의 상한(~60fps로 약 4.6시간분). 상한 없는 n·frames·count·max_frames는
 /// deferred 명령을 사실상 무한 루프시켜 어댑터를 붙잡고, raw_call(및 그것이 쥔 SharedLink mutex)을
-/// wedge한다. regression.rs의 MAX_REPLAY_FRAMES와 같은 취지의 상한 — 초과는 조용히 자르지
-/// 않고(silent-wrong 금지) 에러로 드러낸다.
+/// wedge한다. regression.rs의 MAX_REPLAY_FRAMES와 같은 취지의 상한 — 초과를 조용히 잘라
+/// 잘못된 결과를 내는 대신 에러로 드러낸다.
 pub(crate) const MAX_FRAME_ARG: u64 = 1_000_000;
 
 /// 프레임/명령 수 필드용 디시리얼라이저 — MAX_FRAME_ARG 초과를 거부한다. 값이 존재할 때만 호출되고

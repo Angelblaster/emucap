@@ -1026,8 +1026,8 @@ impl<G: GdbTransport> NdsBridge<G> {
         }
         // NDS GDB-RSP는 단일 주소 exec BP만이다(Z0/Z1 @ addr, 4바이트). 코어 BP 페이로드의 범위(end)·pc/value
         // 필터·비-pausing·auto_savestate·snapshot은 브리지가 아직 구현 안 했다. 이들을 조용히 무시하면(성공인데
-        // start만 걸리거나 GDB가 무조건 halt) 호출자가 오해하므로, 지원 서브셋만 통과시키고 나머지는 큰소리로
-        // 거부한다. 진짜 지원은 후속 TODO.
+        // start만 걸리거나 GDB가 무조건 halt) 호출자가 오해하므로, 지원 서브셋만 통과시키고 나머지는
+        // 거부한다. 필터 지원은 후속 TODO.
         if let (Some(s), Some(e)) = (optional_num(params, "start")?, optional_num(params, "end")?) {
             if e != s {
                 return Err(NdsBridgeError::Unsupported(

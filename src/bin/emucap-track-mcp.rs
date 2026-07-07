@@ -311,7 +311,7 @@ impl EmucapTrack {
         // resume(재연결 복원): connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running
         // run이 있으면 supersede+새 run이 아니라 그 run을 active로 재바인딩한다(파편화 0). rom이 다르거나
         // 일치 running이 없으면 None → 아래 supersede 경로(start_run의 finish_stale_running)가 직전 run을
-        // 마감하고 새 run을 만든다(#56 보존). best-effort: 조회 에러는 fall-through해 start_run이 정직하게 노출.
+        // 마감하고 새 run을 만든다(#56 보존). best-effort: 조회 에러는 fall-through해 start_run이 노출한다.
         if let Some(cref) = a.connection_ref.as_deref() {
             if let Ok(Some(binding)) =
                 emucap::track::mcp_ops::find_resumable_run(&root, cref, &a.rom_sha1)
@@ -352,7 +352,7 @@ impl EmucapTrack {
         ) {
             Ok(v) => {
                 // start_run이 만든 run_id로 active를 바인딩한다. run_id가 없으면(있을 수 없는 내부
-                // 불변식 위반) 조용히 성공시키지 않고 정직하게 에러로 노출한다.
+                // 불변식 위반) 조용히 성공시키지 않고 에러로 노출한다.
                 match v.get("run_id").and_then(|s| s.as_str()) {
                     Some(run_id) => {
                         *self.active_run.lock().unwrap_or_else(|e| e.into_inner()) =
