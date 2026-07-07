@@ -151,12 +151,12 @@ const METHODS: &[&str] = &[
 ];
 
 /// PSP surface concretely planned for later tasks — none right now. Frame-based `step` is *not*
-/// here: PPSSPP has no frame-advance primitive, so it is a permanent platform gap (an honest
+/// here: PPSSPP has no frame-advance primitive, so it is a permanent platform gap (an
 /// `unsupported`), not a pending feature. It must not be advertised as "planned", which would imply
-/// it is merely not-yet-callable; the real stepping capability is disclosed truthfully by
+/// it is merely not-yet-callable; the stepping capability is at instruction granularity, exposed by
 /// `step_instructions` being in `METHODS` and `capability_notes.step_units == ["instructions"]`.
 /// Surfaced under `capability_notes.planned_methods` (alongside `UNSUPPORTED_METHODS`, below) so a
-/// caller can see the target shape without `methods` lying about what works right now.
+/// caller can see the target shape while `methods` reflects what works right now.
 const PLANNED_METHODS: &[&str] = &[];
 
 /// Real emucap tool names this bridge does not (yet) implement — mirrors the NDS bridge's
@@ -947,17 +947,21 @@ impl<T: WsTransport> PpssppBridge<T> {
     }
 
     /// kind `exec` → `cpu.breakpoint.add {address, enabled, condition?}`; kind `read`/`write` →
-    /// `memory.breakpoint.add {address, size, read/write, condition?}`. `address`/`start` is a raw
-    /// absolute PSP address (matching `disassemble`'s convention, e.g. straight from `get_state`'s
-    /// `cpu.pc`) — not routed through a `memory_type` base like `read_memory`, since an exec
-    /// breakpoint is rarely inside `main` RAM alone and PPSSPP's own API takes an absolute address
-    /// either way. `pc_min`/`pc_max` (optional) compile into a PPSSPP `condition` expression
+    /// `memory.breakpoint.add {address, size, read/write, condition?}`. Address resolution is
+    /// symmetric with `read_memory`/`write_memory`: when a `memory_type` region is named, `address`/
+    /// `start` is a region offset routed through the same `route_main_address` (→ `PSP_MAIN_RAM_BASE
+    /// + offset`, out-of-range rejected), so `memory_type:"main"` lands the breakpoint where
+    /// `read_memory` reads instead of at a raw low address that never fires. With no `memory_type` the
+    /// value is a raw absolute PSP address (matching `disassemble`'s convention, e.g. straight from
+    /// `get_state`'s `cpu.pc`), since an exec breakpoint's PC is not always inside `main` RAM and
+    /// PPSSPP's own API takes an absolute address either way. `pc_min`/`pc_max` (optional) compile
+    /// into a PPSSPP `condition` expression
     /// (`"(pc >= ..) && (pc <= ..)"`); an explicit `condition` string is passed through verbatim and
     /// ANDed with any pc_min/pc_max clauses — PPSSPP parses/validates it and a bad expression comes
     /// back as an `emulator_error`, not a silently-ignored one. `pause_on_hit` (default true) maps to
     /// PPSSPP's `enabled` (a `false` value is honored — unlike the NDS/GDB bridge, PPSSPP natively
     /// supports a log-only, non-pausing breakpoint). `auto_savestate`/`snapshot`/value filters
-    /// (`value`/`value_mask`/`value_len`) are not implemented yet (TODO) and are rejected loudly
+    /// (`value`/`value_mask`/`value_len`) are not implemented yet (TODO) and are rejected
     /// rather than silently ignored.
     fn set_breakpoint(&mut self, params: &Value) -> BridgeResult<Value> {
         let kind = params
@@ -992,7 +996,28 @@ impl<T: WsTransport> PpssppBridge<T> {
                 )));
             }
         }
-        let address = absolute_address(params)?;
+        // Span the routed bounds check covers when a `memory_type` is named: 1 byte for an exec
+        // point, the memory breakpoint's `length` for read/write. Reused as the memcheck size below.
+        let route_len = if kind == "exec" {
+            1
+        } else {
+            optional_num(params, "length")?.unwrap_or(1).max(1)
+        };
+        // Reject a range exec point (start != end) in the CALLER's own offset coordinates — BEFORE
+        // routing. Comparing a routed absolute address against the un-routed `end` offset would
+        // falsely reject every offset-based exec point (main offset 0x4000 routes to 0x08804000,
+        // which never equals end 0x4000), making memory_type exec breakpoints unusable.
+        if kind == "exec" {
+            if let Some(end) = optional_num(params, "end")? {
+                if end != region_offset(params)? {
+                    return Err(BridgeError::Unsupported(
+                        "psp bridge: range exec breakpoints unsupported — single address only (start==end) (TODO)"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        let address = route_breakpoint_address(params, route_len)?;
         let pause_on_hit = params
             .get("pause_on_hit")
             .and_then(Value::as_bool)
@@ -1000,14 +1025,7 @@ impl<T: WsTransport> PpssppBridge<T> {
         let condition = breakpoint_condition(params)?;
 
         if kind == "exec" {
-            if let Some(end) = optional_num(params, "end")? {
-                if end != address {
-                    return Err(BridgeError::Unsupported(
-                        "psp bridge: range exec breakpoints unsupported — single address only (start==end) (TODO)"
-                            .into(),
-                    ));
-                }
-            }
+            // Range/end check already done above, in caller offset coordinates, before routing.
             // A same-address exec duplicate is accepted (not refused) and refcounted by
             // clear_breakpoint: an exec hit is attributed by PC == address, so duplicates are
             // semantically equivalent — unlike a memory read/write pair on one range, which the shared
@@ -1033,7 +1051,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             );
             Ok(json!({ "id": id, "kind": kind, "address": address }))
         } else {
-            let length = optional_num(params, "length")?.unwrap_or(1).max(1);
+            let length = route_len;
             // PPSSPP keeps ONE memcheck per (address, size) with a single shared hit counter and no
             // per-access attribution. A read and a write breakpoint on the SAME range would collapse
             // into that one memcheck, so a hit could not be told apart between the two bridge ids
@@ -1206,10 +1224,10 @@ impl<T: WsTransport> PpssppBridge<T> {
 
     /// Wire method `step` — both MCP step tools arrive here (same as the NDS bridge): the
     /// instruction-step tool sends `{frames:n, unit:"instructions"}`, the frame-step tool sends
-    /// `{frames:n}` with no `unit`. PPSSPP has no frame-advance primitive (see the adapter README /
-    /// commit scoping frame-step out of v1), so only the instruction-unit case is honored — a
-    /// frame-step request is rejected loudly rather than silently reinterpreted as an instruction
-    /// count (which would make a 60-frame advance step 60 instructions and derail freeze-step/tap).
+    /// `{frames:n}` with no `unit`. PPSSPP has no frame-advance primitive (see the adapter README),
+    /// so only the instruction-unit case is honored — a frame-step request is rejected rather than
+    /// silently reinterpreted as an instruction count (which would make a 60-frame advance step 60
+    /// instructions and derail freeze-step/tap).
     /// `unit:"instructions"` (and the lenient bare `step` with no unit and no `frames`) route to the
     /// same `cpu.stepInto` logic as the `step_instructions` wire method.
     ///
@@ -1217,7 +1235,7 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// composites — `tap`/`tap_sequence`/`hold_until` — stay correctly disabled on PSP, since they
     /// drive frame `step` which PPSSPP cannot do), and it is *not* claimed as "planned" either
     /// (frame-step is a permanent gap, not a pending feature). The stepping that does work is
-    /// advertised honestly as `step_instructions` in `METHODS` plus `step_units == ["instructions"]`.
+    /// advertised as `step_instructions` in `METHODS` plus `step_units == ["instructions"]`.
     /// The dispatch arm stays because the shared MCP protocol delivers instruction stepping *as*
     /// wire `step {unit:"instructions"}` (see `src/live/tools.rs`), and because dispatching it lets
     /// a frame-step request return a precise `unsupported` rather than `unknown_method`.
@@ -1593,7 +1611,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             .call_with_timeout("game.reset", json!({}), RESET_READ_TIMEOUT)?;
         if !self.wait_for_reset_halt()? {
             // The core never halted: the reboot is running asynchronously (display:true GUI). Report
-            // that honestly instead of a false "completed" with the still-in-game pc — get_state /
+            // that instead of a false "completed" with the still-in-game pc — get_state /
             // poll_events track the reboot as it settles.
             return Ok(json!({ "status": "rebooting" }));
         }
@@ -1675,7 +1693,7 @@ fn capability_notes() -> Value {
     // `planned_methods` discloses every real emucap tool name this bridge doesn't dispatch yet —
     // both concretely planned (`PLANNED_METHODS`) and platform-gapped (`UNSUPPORTED_METHODS`, which
     // resolve to an `unsupported` error rather than `unknown_method`) — so a caller can see the
-    // honest not-yet-here surface without a trial call.
+    // not-yet-here surface without a trial call.
     let mut planned: Vec<&str> = PLANNED_METHODS.to_vec();
     planned.extend_from_slice(UNSUPPORTED_METHODS);
     json!({
@@ -1821,6 +1839,22 @@ fn absolute_address(params: &Value) -> BridgeResult<u64> {
     ))
 }
 
+/// Resolve a `set_breakpoint` address, symmetric with `read_memory`/`write_memory`. When a
+/// `memory_type` region is named, the `address`/`start` is a region offset routed through the same
+/// `route_main_address` those two use — mapped to `PSP_MAIN_RAM_BASE + offset` with the identical
+/// out-of-range rejection — so `memory_type:"main"` lands the breakpoint where `read_memory` reads,
+/// not at a raw low address that never fires. Without a `memory_type` the value stays a raw absolute
+/// PSP address (e.g. `cpu.pc` from `get_state`), matching `disassemble`'s convention. `len` is the
+/// watched span (1 for an exec point, the memory breakpoint's `length` for read/write) and bounds
+/// `[offset, offset+len)` to the region exactly as read/write do.
+fn route_breakpoint_address(params: &Value, len: u64) -> BridgeResult<u64> {
+    if params.get("memory_type").is_some() {
+        route_main_address(params, len)
+    } else {
+        absolute_address(params)
+    }
+}
+
 fn required_num(params: &Value, key: &str) -> BridgeResult<u64> {
     let value = params
         .get(key)
@@ -1904,11 +1938,11 @@ mod tests {
         call_timeouts: Vec<(String, Duration)>,
         /// Models PPSSPP replies that arrive slowly: event name → the minimum read budget under
         /// which the reply arrives in time. A `call_with_timeout` with a shorter budget times out
-        /// (a `bridge_error`) exactly like the pre-fix socket read — reproducing the desync.
+        /// (a `bridge_error`) when the read budget is too short — reproducing the desync.
         slow_replies: HashMap<String, Duration>,
         /// Event names whose `call_ticketed` should time out (a `WouldBlock` read) without consuming
         /// a reply — models a breakpoint halting the CPU mid-press so the timed release ack never
-        /// fires, reproducing the finding-#3 desync/stuck-button.
+        /// fires, reproducing the desync/stuck-button.
         timeout_events: std::collections::HashSet<String>,
     }
 
@@ -1966,8 +2000,8 @@ mod tests {
         ) -> Result<Value, BridgeError> {
             self.call_timeouts.push((event.to_string(), timeout));
             // A slow reply only arrives if the read budget outlasts its required wait; too small a
-            // budget times out like the real socket read (a `bridge_error`), without consuming the
-            // reply — the pre-fix desync.
+            // budget times out like a socket read (a `bridge_error`), without consuming the
+            // reply — reproducing the desync.
             if let Some(required) = self.slow_replies.get(event).copied() {
                 if timeout < required {
                     return Err(BridgeError::Io(std::io::Error::new(
@@ -2076,7 +2110,7 @@ mod tests {
     #[test]
     fn step_frame_request_is_unsupported_not_reinterpreted_as_instructions() {
         // The MCP frame-step tool sends wire `step` with `{frames:n}` and no `unit`. PPSSPP has no
-        // frame-advance, so this must be rejected loudly — not silently stepped as n instructions.
+        // frame-advance, so this must be rejected — not silently stepped as n instructions.
         let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
         let resp = bridge.handle_request(Request::new(1, "step", json!({"frames": 60})));
         assert!(!resp.ok);
@@ -2171,7 +2205,7 @@ mod tests {
         let caps = &result["capability_notes"];
         assert_eq!(caps["disassemble"], true);
         assert_eq!(caps["breakpoints"], true);
-        // Stepping IS available, at instruction granularity only — this is the honest disclosure of
+        // Stepping IS available, at instruction granularity only — this is the disclosure of
         // the step capability, so `step` is *not* listed as a "planned"/not-yet-callable method.
         assert_eq!(caps["step_units"], json!(["instructions"]));
         assert_eq!(caps["screenshot"], true);
@@ -2179,9 +2213,9 @@ mod tests {
         assert_eq!(caps["state_restore"], true);
 
         // capability_notes.planned_methods discloses real emucap tool names not dispatched today
-        // (all platform-gapped → an honest "unsupported"). Frame `step` is NOT here: it is a
+        // (all platform-gapped → an "unsupported"). Frame `step` is NOT here: it is a
         // permanent gap conveyed by step_units, not a pending feature — advertising it as planned
-        // while wire `step {unit:instructions}` is dispatched-and-working was the finding-#5 lie.
+        // while wire `step {unit:instructions}` is dispatched-and-working would misrepresent it.
         let planned = caps["planned_methods"].as_array().unwrap();
         assert!(
             !planned.iter().any(|m| m == "step"),
@@ -2244,7 +2278,7 @@ mod tests {
     #[test]
     fn unsupported_whole_methods_return_unsupported_not_unknown_method() {
         // Real emucap tool names with no PPSSPP WS/fork primitive behind them yet must report the
-        // honest "unsupported" kind, not "unknown_method" (reserved for genuine typos).
+        // "unsupported" kind, not "unknown_method" (reserved for genuine typos).
         for name in [
             "run_frames",
             "probe",
@@ -2611,6 +2645,77 @@ mod tests {
         assert_eq!(params["size"], 1);
         assert_eq!(params["write"], true);
         assert_eq!(params["read"], false);
+    }
+
+    #[test]
+    fn set_breakpoint_memory_type_main_routes_offset_and_rejects_out_of_range() {
+        // memory_type:"main" + offset must resolve exactly like read_memory (PSP_MAIN_RAM_BASE +
+        // offset) instead of being discarded to a raw low address that never fires. An offset that
+        // leaves the region is rejected before any WS call — symmetric with read/write_memory.
+        let offset = 0x4000u64;
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+            "cpu.breakpoint.add",
+            json!({"event": "cpu.breakpoint.add"}),
+        )]));
+        let resp = bridge.handle_request(Request::new(
+            1,
+            "set_breakpoint",
+            json!({"memory_type": "main", "start": offset}),
+        ));
+        assert!(resp.ok, "{:?}", resp.error);
+        // Same absolute address read_memory(main, 0x4000) maps to (see
+        // read_memory_maps_main_offset_to_absolute_address_and_decodes_hex).
+        let expected = PSP_MAIN_RAM_BASE + offset;
+        assert_eq!(resp.result.unwrap()["address"], expected);
+        assert_eq!(bridge.ws.calls[0].0, "cpu.breakpoint.add");
+        assert_eq!(bridge.ws.calls[0].1["address"], expected);
+
+        // An out-of-range main offset is rejected, not silently armed at a bad address.
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
+        let resp = bridge.handle_request(Request::new(
+            2,
+            "set_breakpoint",
+            json!({"memory_type": "main", "start": PSP_MAIN_RAM_SIZE}),
+        ));
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().kind, "bad_params");
+        assert!(
+            bridge.ws.calls.is_empty(),
+            "must not arm a breakpoint for an out-of-range main offset"
+        );
+    }
+
+    #[test]
+    fn set_breakpoint_memory_type_exec_with_end_equal_start_arms() {
+        // Regression: the MCP wrapper always sends `end` (single-address calls use end==start). The
+        // exec range check must compare in offset coordinates BEFORE routing — comparing the routed
+        // absolute `address` against the un-routed `end` offset falsely rejected every offset-based
+        // exec point (main offset 0x4000 routes to 0x08804000, which never equals end 0x4000).
+        let offset = 0x4000u64;
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+            "cpu.breakpoint.add",
+            json!({"event": "cpu.breakpoint.add"}),
+        )]));
+        let resp = bridge.handle_request(Request::new(
+            1,
+            "set_breakpoint",
+            json!({"memory_type": "main", "start": offset, "end": offset}),
+        ));
+        assert!(resp.ok, "{:?}", resp.error);
+        let expected = PSP_MAIN_RAM_BASE + offset;
+        assert_eq!(resp.result.unwrap()["address"], expected);
+        assert_eq!(bridge.ws.calls[0].1["address"], expected);
+
+        // A genuine range (end != start in offset coordinates) is still rejected.
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
+        let resp = bridge.handle_request(Request::new(
+            2,
+            "set_breakpoint",
+            json!({"memory_type": "main", "start": offset, "end": offset + 0x10}),
+        ));
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().kind, "unsupported");
+        assert!(bridge.ws.calls.is_empty());
     }
 
     #[test]
@@ -3162,11 +3267,10 @@ mod tests {
 
     #[test]
     fn set_breakpoint_duplicate_address_inherits_hit_count_so_no_false_hit() {
-        // Finding #4 (original duplicate case): PPSSPP reuses the existing memcheck and PRESERVES
-        // numHits on a re-add. A second breakpoint at an already-hit address/size seeded last_hits=0
-        // would make the very next unrelated stop look like a fresh hit on it. The fix seeds each add
-        // from PPSSPP's live counter (`memory.breakpoint.list`), which for a duplicate returns the
-        // preserved hit count.
+        // PPSSPP reuses the existing memcheck and PRESERVES numHits on a re-add. A second
+        // breakpoint at an already-hit address/size seeded last_hits=0 would make the very next
+        // unrelated stop look like a fresh hit on it. The bridge seeds each add from PPSSPP's live
+        // counter (`memory.breakpoint.list`), which for a duplicate returns the preserved hit count.
         let mut bridge = PpssppBridge::new(FakeWs::with(&[
             ("memory.breakpoint.add", json!({"event":"memory.breakpoint.add"})),
             // bp1 seed — fresh memcheck, no hits yet.
@@ -3304,7 +3408,7 @@ mod tests {
 
     #[test]
     fn clearing_one_duplicate_memory_breakpoint_keeps_the_shared_memcheck_for_the_survivor() {
-        // Finding #4: PPSSPP keeps ONE memcheck per (address, size); bp1 and bp2 both watch it.
+        // PPSSPP keeps ONE memcheck per (address, size); bp1 and bp2 both watch it.
         // Clearing bp1 must NOT tear the shared memcheck down while bp2 still lives — otherwise bp2
         // would stay in list_breakpoints but never stop again. So the first clear sends no
         // memory.breakpoint.remove (a survivor remains) and a later access still attributes a hit to
@@ -3382,7 +3486,7 @@ mod tests {
 
     #[test]
     fn set_breakpoint_rejects_read_and_write_on_the_same_range() {
-        // Finding #5: a read and a write breakpoint on the SAME (address, size) collapse into one
+        // A read and a write breakpoint on the SAME (address, size) collapse into one
         // PPSSPP memcheck with one shared hit counter, so a hit could not be told apart between the
         // two bridge ids. Refuse the ambiguous pair rather than advertise a disambiguation PPSSPP
         // cannot provide. (A different size on the same address is a distinct memcheck — allowed.)
@@ -3697,7 +3801,7 @@ mod tests {
 
     #[test]
     fn press_buttons_timeout_releases_inputs_and_surfaces_error() {
-        // Finding #3: an exec breakpoint halts the CPU mid-press. The pre-check passed while
+        // An exec breakpoint halts the CPU mid-press. The pre-check passed while
         // running, then frames stopped, so PPSSPP's timed release ack never fires and the ticketed
         // read times out (WouldBlock) with the button still held. The bridge must release every
         // input (empty input.buttons.send) and return a clear timeout error, not leave it stuck.

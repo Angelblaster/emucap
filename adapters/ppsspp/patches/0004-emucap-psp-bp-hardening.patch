@@ -202,7 +202,7 @@ index a44f64db4d..31b9e7423f 100644
 +	// all-or-nothing: with DEBUGGER set we deliberately keep the whole server loopback even when disc
 +	// sharing (DISCS) is also enabled — i.e. LAN disc sharing is unavailable while the debugger is on
 +	// (the debugger's confinement wins over disc reach). The loopback decision must NOT depend on
-+	// DISCS: DEBUGGER|DISCS previously flipped this to a wildcard bind and re-exposed /debugger. emucap
++	// DISCS: with DEBUGGER|DISCS both set, that would flip to a wildcard bind and re-expose /debugger. emucap
 +	// only ever enables DEBUGGER (headless main), so disc sharing is moot here; this is defense in depth.
 +	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) != 0;
  	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
