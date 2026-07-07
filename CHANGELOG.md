@@ -2,6 +2,21 @@
 
 Beta software — interfaces may still change.
 
+## 0.5.0
+
+### Added
+- **WonderSwan / WonderSwan Color** (`wswan`), a fifth system on the Mednafen fork (NEC V30MZ, x86 little-endian): memory, registers, screenshot, buttons (including the independent vertical/horizontal cursor pads), save/load state, disassemble (built-in x86), execution and read/write breakpoints, value-conditioned breakpoints, `find_pattern`, `dump_memory`, instruction stepping, `set_layer_enable`, `watch_register`, and `call_stack`. Load a `.ws`/`.wsc` ROM. Not yet supported for WonderSwan: `break_on_reset` and `get_video_state`/`resolve_tile` (video, tile, and palette data are reachable through `ram`/`physical` but have no dedicated decoder).
+
+### Fixed
+- A breakpoint that would be accepted but never fire is now rejected with a message naming the correct address form, across the adapters this release touched:
+  - PC Engine: an exec breakpoint above the 16-bit logical space (which the core drops) is rejected, and an over-wide `start..end` span no longer makes the core iterate billions of addresses.
+  - PSP: `set_breakpoint` with a `memory_type` resolves the offset the same way `read_memory`/`write_memory` do (`main` → the absolute RAM address) instead of arming at a raw low address.
+  - Game Boy: a breakpoint on a banked region (VRAM / WRAM / cart RAM) at an offset outside the CPU-visible window is rejected instead of aliasing onto unrelated memory; NES PPU / palette / OAM (off the CPU bus) are rejected instead of never firing.
+  - PC-98: a breakpoint offset past the end of its memory region is rejected before arming.
+  - Flycast: an exec breakpoint given in any SH-4 cached/uncached mirror form matches the running PC.
+  - WonderSwan: exec breakpoints use the 16-bit IP; read/write breakpoints accept only `physical`/`ram`; write value-conditions accept only `value_len=1`.
+- WonderSwan `call_stack` classifies calls and returns that sit behind V30MZ instruction prefixes.
+
 ## 0.4.1
 
 Robustness and correctness hardening across every adapter and the shared control/session layer.

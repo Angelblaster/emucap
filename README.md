@@ -7,10 +7,10 @@ controls a running emulator's memory, state, and screen so it can analyze a
 problem a human described in plain language. A common Core plus per-emulator
 adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
 GBA · NES), a Mednafen fork
-(Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast), a
-DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
+(Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
+(Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.4.1 — beta.** This repository is under active, continuous development;
+**v0.5.0 — beta.** This repository is under active, continuous development;
 interfaces and behavior may still change between updates.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -157,9 +157,9 @@ Pick one to start. **Mesen2 is the lightest — no source build.**
   Z80 for Game Gear / Master System, SM83 for Game Boy / GBC, ARM7 for GBA, 6502 for
   NES). GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
   GBC / NES need none. → `adapters/mesen2/README.md`
-- **Mednafen (Saturn · PSX · PCE · MD)** — build the fork with
+- **Mednafen (Saturn · PSX · PCE · MD · WonderSwan/WSC)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux
-  `libsdl2-dev`). One binary handles all four systems. PSX and PCE-CD need BIOS
+  `libsdl2-dev`). One binary handles all five systems. PSX and PCE-CD need BIOS
   files (not committed to the repo). → `adapters/mednafen/README.md`
 - **Flycast (Dreamcast)** — build with `adapters/flycast/build.sh`; it builds in an
   emucap-owned work tree and treats any `FLYCAST_SRC` checkout as read-only input.

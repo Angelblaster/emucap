@@ -5,10 +5,10 @@
 레트로 게임 패치 디버깅을 위한 MCP 인프라. 실행 중인 에뮬레이터의 메모리·상태·화면을 AI
 에이전트가 읽고 제어해, 사람이 설명한 문제를 분석하도록 돕는다. 공통 Core + 어댑터로 여러
 에뮬레이터를 지원한다 — Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·
-PlayStation·PC Engine·Mega Drive/Genesis), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
+PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), MAME PC-98.
 
-**v0.4.1 — 베타.** 이 저장소는 계속 개발 중이며, 인터페이스·동작은 업데이트마다 바뀔 수 있다.
+**v0.5.0 — 베타.** 이 저장소는 계속 개발 중이며, 인터페이스·동작은 업데이트마다 바뀔 수 있다.
 
 ## 플랫폼
 
