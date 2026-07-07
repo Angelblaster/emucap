@@ -833,7 +833,7 @@ local function setup_vram_recon_bp(bp, budget)
 end
 
 function handlers.set_breakpoint(p)
-  -- auto_savestate 정직화(조용한 no-op 제거): BP 히트는 read/write/이벤트(nmi·irq·dma) 콜백 안에서
+  -- auto_savestate: BP 히트는 read/write/이벤트(nmi·irq·dma) 콜백 안에서
   -- 일어나는데 emu.createSavestate는 exec 콜백 컨텍스트 전용이라(docs/research/mesen2-lua-api.md — 이벤트·
   -- codeBreak 컨텍스트에선 실패) 히트 순간 세이브스테이트를 원자적으로 못 뜬다. 조용히 받아 no-op하면
   -- 호출자가 상태가 캡처된 줄 오인하므로 명시적으로 거부한다. 히트 순간 원자 캡처는 `snapshot` 스펙
@@ -943,7 +943,19 @@ function handlers.set_breakpoint(p)
     local base = SYS.bp_bus_base[bp.memory_type]
     -- 변환하면 콜백 addr이 버스주소가 된다. value_len>1의 상위바이트를 읽을 때 RAM-상대 memory_type이
     -- 아니라 버스 memtype으로 읽어야 하므로 표시해 둔다(access_value 참조).
-    if base then bp.start = bp.start + base; bp.end_ = bp.end_ + base; bp.bus_translated = true end
+    if base then
+      -- 뱅크된 memtype(GB CGB VRAM/WRAM/카트RAM)은 뱅크당 고정 버스 window(예 0x2000)만 CPU 버스에 보인다 —
+      -- 그 밖 offset은 안정된 버스주소가 없다(gbVideoRam:0x2000 → base+off=0xA000=카트RAM에 오발화). base+offset을
+      -- 조용히 걸면 무관 메모리에 걸리므로, bp_bus_window 지정 시 window 밖 offset은 명확히 거부한다(read_memory는 여전히 offset으로 됨).
+      local window = SYS.bp_bus_window and SYS.bp_bus_window[bp.memory_type]
+      if window and bp.end_ >= window then
+        return false, "bad_params", string.format(
+          "%s BP offset 0x%X가 CPU-버스 window(0x%X) 밖 — 뱅크된 영역은 뱅크당 고정 버스주소만 있어 그 밖 offset은 "
+            .. "안정된 BP 주소가 없다. window 안 offset이나 CPU-버스 memory_type으로 걸어라",
+          bp.memory_type, bp.end_, window)
+      end
+      bp.start = bp.start + base; bp.end_ = bp.end_ + base; bp.bus_translated = true
+    end
   end
   -- snapshot: 히트 순간 atomic 캡처할 메모리 스펙 리스트("mt:addr:len", addr는 0x/$/10진). record_hit이
   -- 레지스터(항상)와 함께 이벤트에 싣는다 → 워치독 드리프트/데드맨 무관하게 히트 순간 보존.
@@ -957,9 +969,9 @@ function handlers.set_breakpoint(p)
       end
     end
   end
-  -- non-CPU-버스 memtype 라우팅(조용한 실패 제거): VDP VRAM/CRAM 등은 CPU 버스에 없어 Mesen memory
-  -- 콜백이 절대 안 잡는다(실측). SYS.non_bus_write_memtypes로 (a) 재구성 경로 또는 (b) 정직한 에러로 보낸다 —
-  -- 조용히 ROM 주소에 걸려 영영 미발동하던 것을 막는다. 선언 안 한 시스템(SNES 등)은 종전 CPU-버스 경로 그대로.
+  -- non-CPU-버스 memtype 라우팅: VDP VRAM/CRAM 등은 CPU 버스에 없어 Mesen memory
+  -- 콜백이 절대 안 잡는다(실측). SYS.non_bus_write_memtypes로 (a) 재구성 경로 또는 (b) 에러로 보낸다 —
+  -- 조용히 ROM 주소에 걸려 영영 미발동하는 것을 막는다. 선언 안 한 시스템(SNES 등)은 종전 CPU-버스 경로 그대로.
   if (p.kind == "write" or p.kind == "read") and SYS.non_bus_write_memtypes then
     local disp = SYS.non_bus_write_memtypes[bp.memory_type]
     if disp == "vram_recon" then
@@ -972,7 +984,7 @@ function handlers.set_breakpoint(p)
       return true, { id = id, mechanism = "vdp_write_reconstruction", max_instructions = budget }
     elseif disp then
       return false, "unsupported", bp.memory_type
-        .. "은 CPU 버스에 없어(VDP 포트 write) memory " .. p.kind .. " BP로 못 잡는다 — 재구성 미구현(TODO). status.methods 참조"
+        .. "은 CPU 버스에 없어(VDP/PPU 등 비-CPU-버스 메모리 — 포트 write로만 접근) memory " .. p.kind .. " BP로 못 잡는다 — 재구성 미구현(TODO). status.methods 참조"
     end
   end
   local function on_access(addr, value)

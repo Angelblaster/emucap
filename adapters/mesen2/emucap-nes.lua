@@ -24,6 +24,19 @@ SYS = {
   -- $00xx(내부RAM/ROM)에 걸려 미발동한다. nesWorkRam/nesSaveRam(카트 PRG-RAM)은 버스 $6000-$7FFF.
   -- nesInternalRam은 offset 0 = 버스 $0000이라 identity(맵에 없음). 이미 버스인 nesMemory도 그대로.
   bp_bus_base = { nesWorkRam = 0x6000, nesSaveRam = 0x6000 },
+  -- PPU측 메모리는 6502 CPU 버스에 없다 — CPU는 PPU 레지스터($2006/$2007 등)를 통해서만 접근하고, Mesen
+  -- memory 콜백은 CPU 버스 접근만 잡으므로 이 memType들에 write/read BP를 걸면 절대 발화하지 않는다(조용한
+  -- 미발동). bp_bus_base로 변환할 CPU-버스 주소가 없어 에러로 거부한다(SMS smsPaletteRam과 동형).
+  -- Mesen Lua엔 PPU 콜백이 없어 재구성 미구현(TODO — $2007 write 훅으로 SMS VDP처럼 재구성 가능).
+  non_bus_write_memtypes = {
+    nesPpuMemory          = "error",  -- PPU 주소공간 $0000-$3FFF 의사메모리(패턴/네임/팔레트 전체)
+    nesNametableRam       = "error",  -- 네임테이블 VRAM
+    nesPaletteRam         = "error",  -- 팔레트 RAM $3F00
+    nesSpriteRam          = "error",  -- primary OAM($2004로만 접근)
+    nesSecondarySpriteRam = "error",  -- secondary OAM(있으면)
+    nesChrRam             = "error",  -- CHR RAM(PPU 패턴 테이블)
+    nesChrRom             = "error",  -- CHR ROM(PPU 패턴 테이블)
+  },
   -- 덤프 리전(emucap diff 입력). base는 버스/PPU주소(참조용), 실제 read는 memType offset 0부터.
   -- 없는 리전(PRG-RAM 미탑재 등)은 zero-fill로 안전(GB와 동일 처리).
   dump_regions = {

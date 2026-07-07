@@ -21,9 +21,20 @@ SYS = {
   bank_mirror = false,   -- SM83엔 SNES식 $00/$80 뱅크 미러 없음
   dma_supported = false, -- SNES식 MDMAEN DMA 컨트롤러 없음 → dma kind BP는 미구현(TODO — 고칠 것)(GB OAM DMA는 별개)
   -- read/write BP 주소 변환 맵: RAM offset을 SM83 버스 base로 변환. 안 하면 addMemoryCallback이 버스
-  -- $00xx(ROM)에 걸려 미발동한다. 고정 매핑만 등록(work RAM $C000, HRAM $FF80) — offset < $2000 유효
-  -- (CGB WRAM 뱅크2~7·switchable은 고정 버스주소 없음). 이미 버스인 gameboyMemory는 맵에 없어 그대로.
-  bp_bus_base = { gbWorkRam = 0xC000, gbHighRam = 0xFF80 },
+  -- $00xx(ROM)에 걸려 미발동한다. SM83은 전 메모리가 CPU 버스($0000-$FFFF)에 매핑돼(NES PPU처럼 off-bus인
+  -- 영역이 없다) 전부 base 변환으로 잡는다 → non_bus_write_memtypes 불필요. 고정 base만 등록:
+  -- work RAM $C000·HRAM $FF80·VRAM(gbVideoRam) $8000·OAM(gbSpriteRam) $FE00·외부 카트RAM(gbCartRam) $A000.
+  -- offset < 뱅크크기만 유효(WRAM CGB 뱅크2~7·카트RAM 다뱅크는 고정 버스주소 없음). gameboyMemory는 이미 버스라 맵에 없다.
+  bp_bus_base = {
+    gbWorkRam = 0xC000, gbHighRam = 0xFF80,
+    gbVideoRam = 0x8000, gbSpriteRam = 0xFE00, gbCartRam = 0xA000,
+  },
+  -- 뱅크된 memtype의 CPU-버스 window(뱅크당 크기). 이 밖 offset은 고정 버스주소가 없어 BP 거부(read_memory는
+  -- offset으로 됨). VRAM/WRAM/카트RAM은 8KB 슬롯(0x2000)만 버스에 보인다(CGB 추가 뱅크는 스위칭). HRAM/OAM은
+  -- 전부 버스라 window 불필요(미등록 → 체크 없음). region_sizes(read_memory용 CGB-최대)와 다른 값임에 유의.
+  bp_bus_window = {
+    gbWorkRam = 0x2000, gbVideoRam = 0x2000, gbCartRam = 0x2000,
+  },
   -- 덤프 리전(emucap diff 입력). base는 버스주소(참조용), 실제 read는 memType offset 0부터. CGB-최대 크기로
   -- 잡는다(DMG는 남는 뱅크가 zero-fill로 안전, 실측). wram=CGB 32KB, vram=CGB 16KB, oam=160B, hram=127B.
   dump_regions = {
