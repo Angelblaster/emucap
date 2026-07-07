@@ -437,6 +437,8 @@ fn normalize_system(system: &str) -> Option<&'static str> {
         "md" | "genesis" | "megadrive" | "mega-drive" | "sega-genesis" | "sega-megadrive" => {
             Some("md")
         }
+        "wswan" | "ws" | "wsc" | "wonderswan" | "wonderswan-color" | "wonderswancolor"
+        | "wonderswan_color" => Some("wswan"),
         "pc98" | "pc-98" | "mame-pc98" | "pc9801" | "pc9821" => Some("pc98"),
         "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
         "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
@@ -692,6 +694,13 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("ws" | "wsc" | "wsr") => serde_json::json!({
+            "system": "wswan",
+            "confidence": "extension",
+            "reason": "WonderSwan / WonderSwan Color ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("gdi" | "cdi") => serde_json::json!({
             "system": "dc",
             "confidence": "extension",
@@ -745,6 +754,7 @@ fn adapter_for_system(system: &str) -> (&'static str, Option<&'static str>) {
         "psx" => ("mednafen", Some("psx")),
         "pce" => ("mednafen", Some("pce")),
         "md" => ("mednafen", Some("md")),
+        "wswan" => ("mednafen", Some("wswan")),
         "pc98" => ("mame_pc98", None),
         "dc" => ("flycast", None),
         "nds" => ("desmume_nds", None),

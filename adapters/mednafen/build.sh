@@ -465,9 +465,31 @@ perl -0777 -pi -e 's{return \(d\.pc \+ d\.w - 2\) & d\.memmsk;}{return (d.pc + (
   "$SRC/src/desa68/desa68.c"
 inject_check '(s32)(s16)d.w - 2) & d.memmsk' "$SRC/src/desa68/desa68.c" "desa68.c relPC 16비트 disp 부호확장 패치 실패"
 
-# 5. configure — ss+psx+pce+md 활성(한 바이너리 멀티시스템). Saturn은 host_cpu 자동탐지 실패라
-#    --enable-ss 명시 필수. psx/pce/md는 기본 on이나 명시해 의도를 고정한다.
-echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-debugger)"
+# 4p. 값-조건 BP 기록 — WonderSwan/WSC(wswan/debug.cpp): V30MZ debug 훅의 read/write BP 매칭 지점.
+#     read/write 훅은 20비트 물리 주소 A를 받고(v30mz PutMemB/GetMemB의 (seg<<4)+off), WriteHandler는
+#     쓰는 값 V가 스코프에 있으므로 값을 직접 주입한다(PCE WriteHandler와 동형). read는 fallback
+#     (emucap_read_value_for_bp가 physical에서 리틀엔디언으로 읽음)이 정확하므로 값 없이 기록한다.
+perl -0777 -pi -e 's/(static bool FoundBPoint = 0;\n)/${1}extern "C" void emucap_bp_record(unsigned len, unsigned addr, int is_write);\nextern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value);\n/ unless m{emucap_bp_record}' \
+  "$SRC/src/wswan/debug.cpp"
+perl -0777 -pi -e 's{(static uint8 ReadHandler\(uint32 A\).*?if\(testA >= bpit->A\[0\] && testA <= bpit->A\[1\]\)\n\s*\{\n)(\s*FoundBPoint = 1;)}{${1}   emucap_bp_record(1, testA, 0);\n${2}}s unless m{emucap_bp_record\(1, testA}' \
+  "$SRC/src/wswan/debug.cpp"
+perl -0777 -pi -e 's{(static void WriteHandler\(uint32 A, uint8 V\).*?if\(testA >= bpit->A\[0\] && testA <= bpit->A\[1\]\)\n\s*\{\n)(\s*FoundBPoint = 1;)}{${1}   emucap_bp_record_value(1, testA, 1, V);\n${2}}s unless m{emucap_bp_record_value\(1, testA}' \
+  "$SRC/src/wswan/debug.cpp"
+inject_check 'emucap_bp_record(1, testA, 0)' "$SRC/src/wswan/debug.cpp" "wswan/debug.cpp read BP 기록 삽입 실패"
+inject_check 'emucap_bp_record_value(1, testA, 1, V)' "$SRC/src/wswan/debug.cpp" "wswan/debug.cpp write BP 값주입 삽입 실패"
+
+# 4q. 입력 진단 — WonderSwan(wswan/main.cpp): 코어가 매 프레임 PortDeviceData(=주입된 PortData[0])를
+#     WSButtonStatus로 읽는 지점. 게임에 도달한 버튼 비트를 status.last_game_input에 노출한다(패드 래치 등가).
+#     extern "C" 선언은 파일 스코프(namespace 진입 전)에 둔다 — 함수 본문 안엔 linkage-spec을 못 쓴다.
+perl -0777 -pi -e 's/(#include "debug\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
+  "$SRC/src/wswan/main.cpp"
+perl -0777 -pi -e 's{(WSButtonStatus = MDFN_de16lsb\(PortDeviceData\);\n)}{${1} ::emucap_game_data_store((unsigned short)WSButtonStatus);\n} unless m{::emucap_game_data_store}' \
+  "$SRC/src/wswan/main.cpp"
+inject_check '::emucap_game_data_store((unsigned short)WSButtonStatus)' "$SRC/src/wswan/main.cpp" "wswan/main.cpp 입력진단 삽입 실패"
+
+# 5. configure — ss+psx+pce+md+wswan 활성(한 바이너리 멀티시스템). Saturn은 host_cpu 자동탐지 실패라
+#    --enable-ss 명시 필수. psx/pce/md/wswan은 기본 on이나 명시해 의도를 고정한다.
+echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-wswan --enable-debugger)"
 cd "$SRC"
 if command -v brew >/dev/null 2>&1; then
   export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -477,7 +499,7 @@ fi
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*) export LIBS="-lws2_32 ${LIBS:-}" ;;
 esac
-./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-debugger >/dev/null
+./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-wswan --enable-debugger >/dev/null
 
 # 6. emucap.cpp를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
 perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) /' \
@@ -488,7 +510,8 @@ echo "→ make"
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 
 echo ""
-echo "✓ 빌드 완료: $SRC/src/mednafen (ss + psx + pce + md)"
+echo "✓ 빌드 완료: $SRC/src/mednafen (ss + psx + pce + md + wswan)"
 echo "  실행: adapters/mednafen/launch.sh <disc_or_rom> <status.listening_port> [name] [force_module]"
 echo "  예:   MEDNAFEN_FORCE_MODULE=pce adapters/mednafen/launch.sh <pce.cue|rom.pce> 47800"
 echo "  예:   MEDNAFEN_FORCE_MODULE=md adapters/mednafen/launch.sh <rom.md|rom.gen|rom.smd> 47800"
+echo "  예:   MEDNAFEN_FORCE_MODULE=wswan adapters/mednafen/launch.sh <rom.ws|rom.wsc> 47800"

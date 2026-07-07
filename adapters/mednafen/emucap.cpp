@@ -414,6 +414,10 @@ bool is_md() {
   return !strcmp(system_shortname(), "md");
 }
 
+bool is_ws() {
+  return !strcmp(system_shortname(), "wswan");
+}
+
 std::string hex_bytes(const uint8* data, size_t len) {
   std::string out;
   out.reserve(len * 2);
@@ -464,6 +468,7 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   bool psx = is_psx();
   bool pce = is_pce();
   bool md = is_md();
+  bool ws = is_ws();
   if (psx) {
     // PSX(MIPS): cpu aspace 단일 경로. cpu는 addr_mask로 KUSEG/KSEG0/KSEG1 미러를 접고
     // MainRAM·스크래치패드(0x1F800000~)·BIOS(0x1FC00000~)·HW(0x1F801000~)를 모두 디코드하므로
@@ -478,6 +483,10 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
     // Mega Drive/Genesis(68000): debugger read/write BP가 24비트 CPU physical 주소를 보고한다.
     // Work RAM은 0xFF0000~0xFFFFFF mirror이며, 다바이트 값은 68000 big-endian으로 조립한다.
     asname = "cpu"; off = addr & 0xFFFFFF;
+  } else if (ws) {
+    // WonderSwan(V30MZ, x86계): read/write BP가 20비트 물리 주소를 보고한다(v30mz PutMemB/GetMemB의
+    // (seg<<4)+off). physical aspace가 WSwan_readmem20으로 구현돼 있어 그대로 읽고, 값은 x86 리틀엔디언.
+    asname = "physical"; off = addr & 0xFFFFF;
   } else {
     // Saturn(SH-2): physical aspace는 미구현(0 반환)이라 RAM/메모리 region을 SH-2 외부버스 주소로
     // 식별해 해당 aspace에서 값을 읽는다(set_breakpoint의 region→버스 변환과 같은 kSSBusRegions를
@@ -494,8 +503,8 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   unsigned n = len > 4 ? 4 : (len < 1 ? 1 : len);
   sp->GetAddressSpaceBytes(asname, off, n, buf);
   uint32 v = 0;
-  if (psx || pce)
-    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280 little-endian
+  if (psx || pce || ws)
+    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280/V30MZ little-endian
   else
     for (unsigned i = 0; i < n; i++) v = (v << 8) | buf[i];           // SH-2/68000 big-endian
   return v;
@@ -511,6 +520,9 @@ CallKind classify_instr(uint32 pc) {
     off = pc & 0xFFFF;
   } else if (is_md()) {
     off = pc & 0xFFFFFF;
+  } else if (is_ws()) {
+    // WonderSwan(V30MZ): PC는 IP offset이다. cs aspace가 현재 CS:IP를 (CS<<4)+off로 물리 변환해 읽는다.
+    asname = "cs"; off = pc & 0xFFFF;
   } else if (is_ss()) {
     // SH-2 PC는 외부버스 주소 — kSSBusRegions로 region을 찾아 읽는다("physical" 미구현).
     asname = "physical";
@@ -525,7 +537,20 @@ CallKind classify_instr(uint32 pc) {
   // psx: asname="cpu", off=pc(기본값)
   AddressSpaceType* sp = find_aspace(asname);
   if (!sp) return CK_OTHER;
-  uint8 b[4] = {0, 0, 0, 0};
+  uint8 b[6] = {0, 0, 0, 0, 0, 0};
+  if (is_ws()) {  // V30MZ(NEC V30, 8086 계열): 가변길이 — 선행 프리픽스를 건너뛴 뒤 opcode로 call/ret 판별.
+    sp->GetAddressSpaceBytes(asname, off, 6, b);
+    unsigned i = 0;
+    // V30 프리픽스: 세그먼트 오버라이드(ES/CS/SS/DS=0x26/2E/36/3E)·LOCK(0xF0)·REP/REPNE(0xF2/F3)만.
+    // 0x64/65/66/67(FS/GS·operand/address-size 오버라이드)은 386+ 도입이라 V30MZ엔 없다.
+    while (i < 4 && (b[i] == 0x26 || b[i] == 0x2E || b[i] == 0x36 || b[i] == 0x3E ||
+                     b[i] == 0xF0 || b[i] == 0xF2 || b[i] == 0xF3)) i++;
+    uint8 op = b[i];
+    if (op == 0xE8 || op == 0x9A) return CK_CALL;  // CALL rel16 / CALL far
+    if (op == 0xFF) { unsigned reg = (b[i + 1] >> 3) & 7; if (reg == 2 || reg == 3) return CK_CALL; }  // CALL r/m near/far
+    if (op == 0xC3 || op == 0xC2 || op == 0xCB || op == 0xCA) return CK_RETURN;  // RET near/far
+    return CK_OTHER;
+  }
   if (is_pce()) {  // HuC6280: 8비트 opcode
     sp->GetAddressSpaceBytes(asname, off, 1, b);
     if (b[0] == 0x20) return CK_CALL;   // JSR
@@ -923,7 +948,7 @@ void handle_dump_memory(long id, const std::string& line) {
 
   static uint8 buf[0x10000];   // 64KB 청크(거대 length로 인한 과대 할당·스택 부담 회피)
   std::string metas;           // regions.json 항목(실제로 쓴 space만)
-  std::string skipped;         // 캡 초과로 건너뛴 합성 전체-버스 공간(정직하게 reply로 보고)
+  std::string skipped;         // 캡 초과로 건너뛴 합성 전체-버스 공간(reply로 보고)
   size_t count = 0;
   try {
     for (auto& as : *CurGame->Debugger->AddressSpaces) {
@@ -1004,7 +1029,9 @@ void resolve_sp_reg() {
   static const char* ss_names[] = {"R15", "SP", nullptr};
   static const char* psx_names[] = {"SP", "sp", "R29", "r29", nullptr};
   static const char* pce_names[] = {"SP", "S", nullptr};
-  const char** names = is_md() ? md_names : is_ss() ? ss_names : is_psx() ? psx_names : pce_names;
+  static const char* ws_names[] = {"SP", nullptr};  // V30MZ 스택 포인터(debug.cpp V30MZ_Regs)
+  const char** names = is_md() ? md_names : is_ss() ? ss_names : is_psx() ? psx_names
+                     : is_ws() ? ws_names : pce_names;
   uint32 v;
   for (int i = 0; names[i]; i++) {
     if (read_register_by_name(names[i], v)) {
@@ -1139,11 +1166,30 @@ const BtnOff g_mdbtn[] = {
   {nullptr, 0}
 };
 
+// WonderSwan/WSC 내장 패드. wswan/main.cpp IDII_GP 선언 순서가 곧 raw bit(WSButtonStatus =
+// MDFN_de16lsb(PortData[0])): X커서 0-3(up/right/down/left), Y커서 4-7, start 8, a 9, b 10.
+// 세로/가로 겸용이라 커서가 두 벌(X/Y)이다 — 공통 up/down/left/right는 X커서로, x1-x4/y1-y4는 명시.
+// memory.cpp의 키매트릭스 읽기(H/X=&0xF, V/Y=>>4&0xF, buttons=>>8<<1)와 정확히 일치한다.
+const BtnOff g_wsbtn[] = {
+  {"up-x", 0}, {"x1", 0}, {"up", 0},
+  {"right-x", 1}, {"x2", 1}, {"right", 1},
+  {"down-x", 2}, {"x3", 2}, {"down", 2},
+  {"left-x", 3}, {"x4", 3}, {"left", 3},
+  {"up-y", 4}, {"y1", 4},
+  {"right-y", 5}, {"y2", 5},
+  {"down-y", 6}, {"y3", 6},
+  {"left-y", 7}, {"y4", 7},
+  {"start", 8}, {"enter", 8}, {"return", 8},
+  {"a", 9}, {"b", 10},
+  {nullptr, 0}
+};
+
 // 활성 시스템의 버튼 테이블(런타임 분기). buttons_to_mask/mask_to_buttons가 사용.
 const BtnOff* active_btntab() {
   if (is_psx()) return g_psxbtn;
   if (is_pce()) return g_pcebtn;
   if (is_md()) return g_mdbtn;
+  if (is_ws()) return g_wsbtn;
   return g_satbtn;
 }
 
@@ -1590,7 +1636,7 @@ void handle_resolve_tile(long id, const std::string& line) {
 // 0..N, SS=NBG0..3/RBG0/1/Sprite)를 파싱해 이름↔비트를 매핑한다. layers(이름 배열, 대소문자 무시 → 그
 // 비트만 set·나머지 clear) 또는 mask(raw uint)로 마스크를 조립해 MDFNI_SetLayerEnableMask로 적용한다. 둘
 // 다 생략 시 적용 없이 조회만(코어에 getter 부재 → 섀도 g_layer_enable_mask 반환). LayerNames 없는
-// 시스템(PSX)은 unsupported, 알 수 없는 layer 이름은 bad_params(조용히 무시 금지). 반환
+// 시스템(PSX)은 unsupported, 알 수 없는 layer 이름은 조용히 무시하지 않고 bad_params. 반환
 // {layer_names, mask, enabled:[이름]}. 마스크는 디버그 override라 바꿀 때까지 유지(지속성 안내는 tool에).
 void handle_set_layer_enable(long id, const std::string& line) {
   if (!MDFNGameInfo || !MDFNGameInfo->LayerNames) {
@@ -1701,7 +1747,7 @@ void handle_set_layer_enable(long id, const std::string& line) {
 //    같은 값 → 추적 MCP run_start의 rom_sha1 그룹핑 키로 정본.
 //  - sha1: sha1(EMUCAP_CONTENT 파일 바이트). 보조 — 단일파일 ROM/.chd엔 정확, .cue는 디스크립터-only
 //    (참조하는 .bin 미포함)라 충돌 가능. 컨트랙트 일관성(Mesen/PC-98이 sha1 반환) 위해 유지.
-// EMUCAP_CONTENT 미설정 → unsupported, MDFNGameInfo null(게임 미로드) → bad_state 정직 에러.
+// EMUCAP_CONTENT 미설정 → unsupported, MDFNGameInfo null(게임 미로드) → bad_state 에러.
 void handle_get_rom_info(long id) {
   if (!MDFNGameInfo) {
     reply_err(id, "bad_state", "MDFNGameInfo 미초기화 — 게임 미로드");
@@ -1726,7 +1772,7 @@ void handle_get_rom_info(long id) {
       if (c >= 'A' && c <= 'Z') c += 32;  // locale-독립 소문자화
   }
 
-  // size + sha1: EMUCAP_CONTENT 파일 바이트를 읽어 Mednafen sha1(one-shot). 파일 없음/IO 실패는 정직 에러.
+  // size + sha1: EMUCAP_CONTENT 파일 바이트를 읽어 Mednafen sha1(one-shot). 파일 없음/IO 실패는 에러.
   // sha1 API가 one-shot(스트리밍은 상류 #if 0)이라 파일을 통째 읽으므로, 대형 단일파일 디스크
   // 이미지(.chd/.iso/.bin 직접 지정)의 메모리 스파이크를 막기 위해 64MB 초과면 sha1을 건너뛴다(보조
   // 필드일 뿐 — canonical 정체성은 파일을 안 읽는 content_md5다). 건너뛰면 sha1="skipped:too_large".
@@ -2180,7 +2226,7 @@ void handle(const std::string& line) {
     std::string kind = json_str(line, "kind");
     if (kind.empty()) kind = "exec";  // kind 생략 시 기본 exec
     // exec/read/write만 지원한다. nmi/irq/dma 등은 이 디버거에 없다 — 조용히 exec로 처리(silent-wrong,
-    // "보이는데 안 됨")하지 않고 supported를 동반해 정직하게 거부한다.
+    // "보이는데 안 됨")하지 않고 supported를 동반해 거부한다.
     if (kind != "exec" && kind != "read" && kind != "write") {
       std::string m = "kind '" + kind + "'는 미지원 — supported: exec, read, write";
       reply_err(id, "unsupported", m.c_str());
@@ -2199,7 +2245,19 @@ void handle(const std::string& line) {
     bool logical = true;
     bool adapter_bp = false;
     if (is_pce()) {
-      if ((type == BPOINT_READ || type == BPOINT_WRITE) && mt == "physical") {
+      // HuC6280 exec BP는 16비트 논리 주소(MPR 뱅킹) — 코어(pce/debug.cpp)가 i<65536만 arm하고 거대 span은
+      // O(span) 루프라, MD/SS/WS처럼 범위 밖을 조용히 드롭하지 않고 명확히 거부한다(exec 상한이 DoS도 캡).
+      if (type == BPOINT_PC) {
+        if (start > 0xFFFF || end > 0xFFFF) {
+          reply_err(id, "bad_params",
+                    "PCE exec BP는 16비트 논리 주소(0x0000..0xFFFF, MPR 뱅킹) — 물리/뱅크 주소가 아니다");
+          return;
+        }
+      } else if ((type == BPOINT_READ || type == BPOINT_WRITE) && mt == "physical") {
+        if (start > 0x1FFFFF || end > 0x1FFFFF) {
+          reply_err(id, "bad_params", "PCE physical BP는 21비트(0x000000..0x1FFFFF)");
+          return;
+        }
         logical = false;
       } else if ((type == BPOINT_READ || type == BPOINT_WRITE) && (mt == "vram0" || mt == "vram1")) {
         // PCE Debugger AUX BP uses VDC VRAM word addresses, with bit16 selecting VDC-B on SGX.
@@ -2209,6 +2267,12 @@ void handle(const std::string& line) {
         start = (long)((vdc << 16) | (((uint32)start) >> 1));
         end = (long)((vdc << 16) | (((uint32)end) >> 1));
         logical = true;
+      } else if (type == BPOINT_READ || type == BPOINT_WRITE) {
+        // 기본 logical(cpu, 16비트) read/write BP: 범위 밖은 GetLastLogicalReadAddr(16비트)와 안 맞아 미발화.
+        if (start > 0xFFFF || end > 0xFFFF) {
+          reply_err(id, "bad_params", "PCE 논리 read/write BP는 16비트(0x0000..0xFFFF); 물리는 memory_type=physical");
+          return;
+        }
       }
     } else if (is_md()) {
       if (type == BPOINT_READ || type == BPOINT_WRITE) {
@@ -2272,13 +2336,47 @@ void handle(const std::string& line) {
             }
           }
           if (!matched) {
-            // 조용한 미발화 금지: 변환 불가 memory_type은 수락-후-미발화 대신 명확히 거부.
+            // 변환 불가 memory_type은 수락-후-미발화 대신 명확히 거부한다.
             reply_err(id, "unsupported",
                       "SS read/write BP는 physical(raw 버스주소) 및 workraml/workramh/scspram/vdp1vram/"
                       "vdp2vram/cram만 지원 — backup/vdp1fb0/vdp1fb1/scspmprog/scsptemp/scspmems/dspprog는 "
                       "SH-2 외부버스 선형주소가 없어 BP 미지원(physical+버스주소로 걸어라)");
             return;
           }
+        }
+      }
+    } else if (is_ws()) {
+      // WonderSwan(V30MZ, x86 세그먼트): exec BP는 현재 CS 안의 16비트 논리 IP로 비교된다(get_state의
+      // V30MZ.IP). read/write BP는 20비트 물리 주소((seg<<4)+off)다(MD/SS와 동형) —
+      // 범위 밖 주소(예: (CS<<4)+IP 선형값을 exec BP에 준 경우)는 수락-후-미발화 대신 명확히 거부한다.
+      if (type == BPOINT_PC) {
+        if (start > 0xFFFF || end > 0xFFFF) {
+          reply_err(id, "bad_params",
+                    "WonderSwan exec BP는 16비트 논리 IP(0x0000..0xFFFF) 기준 — (CS<<4)+IP 선형주소가 아니라 "
+                    "IP offset을 줘라(get_state의 V30MZ.IP가 BP 주소, V30MZ.CS는 세그먼트). read/write BP만 20비트 physical.");
+          return;
+        }
+      } else {
+        // read/write BP는 물리 주소 기준(Mednafen WS 디버거의 read/write BP가 물리). memory_type을 whitelist로
+        // 검증한다(blacklist 아님) — physical(20비트)·ram(16비트 내부RAM=physical 0x0-0xFFFF)만 허용하고, cs/ss/ds/es
+        // 세그먼트뷰·오타·미지원 memtype은 거부한다. 안 그러면 세그먼트/미지원 memtype을 조용히 physical offset에
+        // 걸어 엉뚱한 주소를 관측한다(DS:off가 아니라 physical:off; 값-조건 read도 physical로 읽어 필터도 틀어짐).
+        if (mt.empty() || mt == "physical") {
+          if (start > 0xFFFFF || end > 0xFFFFF) {
+            reply_err(id, "bad_params", "WonderSwan physical BP는 20비트(0x00000..0xFFFFF)");
+            return;
+          }
+        } else if (mt == "ram") {
+          // ram(0x0000-0xFFFF 내부RAM)은 physical 0x0-0xFFFF에 매핑 — 그 위 offset은 physical 뱅크1로 새므로 bound한다.
+          if (start > 0xFFFF || end > 0xFFFF) {
+            reply_err(id, "bad_params", "WonderSwan ram BP는 16비트 내부 RAM(0x0000..0xFFFF) — 그 위는 physical로 걸어라");
+            return;
+          }
+        } else {
+          reply_err(id, "bad_params",
+                    "WonderSwan read/write BP memory_type은 physical(20비트)/ram(16비트)만 — cs/ss/ds/es 세그먼트뷰는 "
+                    "read_memory용이고 BP엔 세그먼트가 안 적용된다. (seg<<4)+off를 physical로 줘라");
+          return;
         }
       }
     }
@@ -2292,6 +2390,15 @@ void handle(const std::string& line) {
       json_num(line, "value_len", val_len);
       if (val_len < 1) val_len = 1;
       if (val_len > 4) val_len = 4;
+      // WonderSwan(V30MZ)은 워드/롱을 per-byte로 쓴다(PutMemB) — write BP 훅이 매 바이트를 1바이트씩 주입해
+      // value_len>1의 전체 값을 재구성 못 한다(주입 1바이트 vs 다바이트 value 비교라 조용히 미발화). read는
+      // physical에서 value_len 바이트 읽어 정확하므로 write만 거부한다(연속 byte-write 누적은 후속 과제).
+      if (is_ws() && type == BPOINT_WRITE && val_len > 1) {
+        reply_err(id, "unsupported",
+                  "WonderSwan write BP는 값-조건 value_len>1 미지원 — V30MZ가 워드를 per-byte로 써 훅이 1바이트만 "
+                  "주입한다. value_len=1로 걸거나 read BP를 써라(read는 다바이트 지원)");
+        return;
+      }
       // write BP의 value 필터는 *쓰는 값*과 비교한다 — CPU 메모리 write는 MD/PCE/PSX/SS 전부 어댑터가
       // 쓰는 값을 주입하므로 동작한다(emucap_bp_record_value: MD=클론버스 DBG_BusWrite, PCE=WriteHandler
       // V, PSX=GPR[rt] 콜백 스레딩, SS=디코더 복제 R[m]/CtrlRegs/CheatMemRead+op). MD VDP write는
@@ -2299,8 +2406,8 @@ void handle(const std::string& line) {
       // 위 주입으로 잡힌다. read BP value는 읽는 값=현재 메모리라 fallback이 정확.
       // 단 보조(AUX) 주소공간 BP(현재 PCE vram0/1 → BPOINT_AUX_*)는 has_value가 강제 false(아래)라
       // value를 *조용히 무시*하게 된다 — 그 VDP 경로엔 값 주입이 아직 없기 때문. 조용한 무시는
-      // silent-wrong이므로 정직하게 거부한다(blanket "미지원"이 아니라 *이 좁은 aux+value*만 — CPU
-      // write+value는 전 시스템 동작). 정공법(aux/VDP write 경로 값 주입)은 후속 과제다.
+      // silent-wrong이므로 거부한다(blanket "미지원"이 아니라 *이 좁은 aux+value*만 — CPU
+      // write+value는 전 시스템 동작). aux/VDP write 경로 값 주입은 후속 과제다.
       if (has_value && (type == BPOINT_AUX_READ || type == BPOINT_AUX_WRITE)) {
         reply_err(id, "unsupported",
                   "값-조건 BP는 보조(VDP/비디오 메모리) 주소공간에 아직 미지원 — 쓰는 값 주입이 CPU "

@@ -1,4 +1,4 @@
-# emucap — Mednafen (Sega Saturn · Sony PlayStation · PC Engine · Mega Drive) adapter
+# emucap — Mednafen (Sega Saturn · Sony PlayStation · PC Engine · Mega Drive · WonderSwan/WSC) adapter
 
 Mednafen has no Lua like Mesen, so **we patch Mednafen and inject a socket
 client (`emucap.cpp`)** — a C++ port of Mesen's `emucap-core.lua`. It connects to
@@ -6,9 +6,9 @@ emucap-mcp and serves the same NDJSON protocol, so the Rust side (TcpLink · too
 · MCP) stays unchanged.
 
 **One binary handles Saturn (ss) · PlayStation (psx) · PC Engine (pce) · Mega
-Drive (md), all of them.** Mednafen auto-detects the system from the loaded disc/
+Drive (md) · WonderSwan/WSC (wswan), all of them.** Mednafen auto-detects the system from the loaded disc/
 ROM, and at runtime emucap branches on `CurGame->shortname` ("ss"/"psx"/"pce"/
-"md") for system-specific behavior (address-space mapping · button table ·
+"md"/"wswan") for system-specific behavior (address-space mapping · button table ·
 endianness). The common debugger interface works on each system unmodified. PCE
 analysis defaults to the accuracy/debugger-first `pce` core. `pce_fast` is also
 built, but since Mednafen provides no Debugger pointer there, the memory/register/
@@ -146,10 +146,27 @@ pin it with `MEDNAFEN_FORCE_MODULE=md` or the 4th launch argument `md`. For the 
   `cpu` address-space write is a no-op, so `write_memory("cpu", ...)` is rejected by the adapter. A `vdpreg` write
   can change the screen mode · IRQ · scroll table reference, so use it only when needed during analysis, and keep
   smoke tests read-centric.
+- **WonderSwan/WSC (wswan, NEC V30MZ x86, little-endian)**: `physical` (20-bit CPU physical — the space exec is
+  disassembled from and where read/write BP addresses and value reads live) · `ram` (internal RAM: 16KB mono / 64KB
+  WSC, mapped at physical bank 0) · `cs`/`ss`/`ds`/`es` (segment-relative views for `read_memory`, resolved through the
+  live segment register). exec BP addresses are the IP offset (16-bit, within the current code segment, same basis as
+  `disassemble` and `get_state`'s `V30MZ.IP`); read/write BP addresses are 20-bit `physical` or 16-bit `ram` **only** —
+  the `cs`/`ss`/`ds`/`es` segment views are rejected for breakpoints (they are `read_memory` views; a BP does not apply
+  the segment, so it would silently watch the wrong physical address). Value-conditioned **read** BPs support `value_len`
+  1–4; value-conditioned **write** BPs are `value_len=1` only — V30MZ writes a word/long as separate bytes, so the write
+  hook injects one byte and cannot reconstruct a multi-byte value (rejected, not silently missed).
+  Not supported for wswan: `break_on_reset`; `get_video_state` / `resolve_tile` (video/tile/palette live in main RAM,
+  reachable via `ram`/`physical`, but there is no dedicated video decoder); `call_stack` is best-effort (V30MZ opcode
+  classification with prefix skipping, no full instruction decode). Everything else in the Mednafen debugger surface
+  (read/write, get\_state, disassemble via built-in zedis, screenshot, save/load, exec/read/write BP, find\_pattern,
+  dump\_memory, step\_instructions, set\_trace, watch\_register, set\_layer\_enable) is inherited.
 
 Button names: Saturn `a/b/c/x/y/z/l/r/start/directions` (`l`=`ls` · `r`=`rs` aliases), PSX `cross/circle/triangle/square/l1/l2/r1/r2/
 start/select/directions` (SNES-style `l`=`l1` · `r`=`r1` aliases, plus DualShock `l3/r3`), PCE `i/ii/run/select/directions` (convenience aliases `a/b/start`,
-6-button `iii/iv/v/vi`), MD `a/b/c/x/y/z/mode/start/directions`. All are active-high. The third argument of Mednafen's `IDIIS_Button*` is
+6-button `iii/iv/v/vi`), MD `a/b/c/x/y/z/mode/start/directions`, WonderSwan `a/b/start` + two discrete cursor pads
+`up-x/right-x/down-x/left-x` (aliases `x1..x4` and the default `up/right/down/left`) and `up-y/right-y/down-y/left-y`
+(`y1..y4`) — the X and Y pads are independent buttons (up+down can be pressed together), matching the vertical/horizontal
+dual orientation. All are active-high. The third argument of Mednafen's `IDIIS_Button*` is
 not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core's IDII declaration order and padding.
 
 ## Implementation scope
@@ -162,7 +179,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   and `pc_min`/`pc_max` filters. **The write value-condition works across all systems by injecting the *value being written***
   (SS=decoder-cloned 21 opcodes [including RMW] · PSX=GPR[rt] callback threading · PCE=WriteHandler V · MD=cloned bus; width-masked).
   The read value-condition falls back since the value read = current memory. Auxiliary (VDP/video memory) address-space value-BPs
-  have no value injection in that write path yet, so they *honestly reject rather than silently ignore* (the proper fix is follow-up). **SS write/read BPs
+  have no value injection in that write path yet, so they *reject rather than silently ignore* (value injection there is follow-up). **SS write/read BPs
   auto-convert the memory_type (`workraml`/`workramh`/`scspram`/`vdp1vram`/`vdp2vram`/`cram`) to SH-2 external-bus addresses**
   before firing (a non-convertible type is `unsupported` — no accept-but-never-fire; accesses that go only through the cache-through 0x2x
   mirror are uncovered). PCE supports `cpu` logical,
