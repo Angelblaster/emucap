@@ -2,6 +2,15 @@
 
 Beta software — interfaces may still change.
 
+## 0.6.0
+
+### Added
+- Mesen Game Gear / Game Boy(GBC): `call_stack` frames, `get_trace` entries, and breakpoint-hit events now carry the ROM `bank` alongside the pc. On these systems the CPU bus is 16-bit and ROM is paged, so a bare address is ambiguous (the same address is different banks at different times); the bank is captured when the code ran and disambiguates it. `call_stack` frames are now `{pc, bank}` objects uniformly across all Mesen systems and `get_trace` entries gain `bank` (`bank` is `null`/omitted where the bank is already in the pc, as on SNES, or the system does not page ROM). `get_trace` tracks bank switches via a shadow refreshed only when the mapper is written, so it adds no per-instruction cost. `status.bank_tagging` advertises tagging only when the loaded cart actually exposes the bank fields, and a `null` bank means the bank is undetermined for that address (e.g. an MBC1 mode-1 / MBC1M low region, which Mesen does not resolve, is reported `null` rather than a wrong bank 0) — so a bank is trustworthy only where non-null.
+
+### Fixed
+- PSP: an execution breakpoint at a raw PC (e.g. straight from `get_state`'s `cpu.pc`, as the adapter README documents) now arms at that address. In 0.5.0 the address was mis-read as a `main` offset and rejected as out of range; `memory_type` is now ignored for an exec breakpoint, which takes an absolute address like `disassemble`. Read/write breakpoints still resolve their `memory_type` offset the way `read_memory`/`write_memory` do.
+- Mesen: `call_stack` no longer collapses to an empty stack while tracing. The shadow call stack popped on return opcodes, which over-popped on Z80/SM83 conditional returns that were not taken and on interrupt returns (pushed with no matching call opcode), pinning the depth at 0 — most visibly on Game Gear and Game Boy/GBC. Returns are now recognized by the stack pointer unwinding instead (popping at the return site), and `call_stack` reads the freeze-point register snapshot so a treadmill-drifted read cannot skew the depth. This also fixes the same interrupt-return over-pop on SNES and NES.
+
 ## 0.5.0
 
 ### Added
