@@ -947,14 +947,14 @@ impl<T: WsTransport> PpssppBridge<T> {
     }
 
     /// kind `exec` → `cpu.breakpoint.add {address, enabled, condition?}`; kind `read`/`write` →
-    /// `memory.breakpoint.add {address, size, read/write, condition?}`. Address resolution is
-    /// symmetric with `read_memory`/`write_memory`: when a `memory_type` region is named, `address`/
-    /// `start` is a region offset routed through the same `route_main_address` (→ `PSP_MAIN_RAM_BASE
-    /// + offset`, out-of-range rejected), so `memory_type:"main"` lands the breakpoint where
-    /// `read_memory` reads instead of at a raw low address that never fires. With no `memory_type` the
-    /// value is a raw absolute PSP address (matching `disassemble`'s convention, e.g. straight from
-    /// `get_state`'s `cpu.pc`), since an exec breakpoint's PC is not always inside `main` RAM and
-    /// PPSSPP's own API takes an absolute address either way. `pc_min`/`pc_max` (optional) compile
+    /// `memory.breakpoint.add {address, size, read/write, condition?}`. Address resolution follows the
+    /// kind. An exec `address`/`start` is a raw absolute PSP address — a PC straight from `get_state`'s
+    /// `cpu.pc` or `disassemble` — and `memory_type` is ignored (a PC is not a `main` offset and is not
+    /// always inside `main` RAM; PPSSPP's cpu breakpoint takes an absolute address either way). A
+    /// read/write `address`/`start` is symmetric with `read_memory`/`write_memory`: a `memory_type`
+    /// region offset routed through the same `route_main_address` (→ `PSP_MAIN_RAM_BASE + offset`,
+    /// out-of-range rejected), so the watchpoint lands where `read_memory` reads instead of at a raw
+    /// low address that never fires. `pc_min`/`pc_max` (optional) compile
     /// into a PPSSPP `condition` expression
     /// (`"(pc >= ..) && (pc <= ..)"`); an explicit `condition` string is passed through verbatim and
     /// ANDed with any pc_min/pc_max clauses — PPSSPP parses/validates it and a bad expression comes
@@ -996,17 +996,16 @@ impl<T: WsTransport> PpssppBridge<T> {
                 )));
             }
         }
-        // Span the routed bounds check covers when a `memory_type` is named: 1 byte for an exec
-        // point, the memory breakpoint's `length` for read/write. Reused as the memcheck size below.
+        // Watched span: 1 for an exec point (a single PC, no routing), the memory breakpoint's
+        // `length` for read/write — used for both the routed bounds check and the memcheck size below.
         let route_len = if kind == "exec" {
             1
         } else {
             optional_num(params, "length")?.unwrap_or(1).max(1)
         };
-        // Reject a range exec point (start != end) in the CALLER's own offset coordinates — BEFORE
-        // routing. Comparing a routed absolute address against the un-routed `end` offset would
-        // falsely reject every offset-based exec point (main offset 0x4000 routes to 0x08804000,
-        // which never equals end 0x4000), making memory_type exec breakpoints unusable.
+        // Reject a range exec point (start != end): PPSSPP's cpu breakpoint is a single address, not
+        // a span. `end` and `start` are compared as-is — both are raw absolute addresses (an exec
+        // breakpoint does not route, unlike a read/write watchpoint), so the comparison is direct.
         if kind == "exec" {
             if let Some(end) = optional_num(params, "end")? {
                 if end != region_offset(params)? {
@@ -1017,7 +1016,7 @@ impl<T: WsTransport> PpssppBridge<T> {
                 }
             }
         }
-        let address = route_breakpoint_address(params, route_len)?;
+        let address = route_breakpoint_address(&kind, params, route_len)?;
         let pause_on_hit = params
             .get("pause_on_hit")
             .and_then(Value::as_bool)
@@ -1839,19 +1838,19 @@ fn absolute_address(params: &Value) -> BridgeResult<u64> {
     ))
 }
 
-/// Resolve a `set_breakpoint` address, symmetric with `read_memory`/`write_memory`. When a
-/// `memory_type` region is named, the `address`/`start` is a region offset routed through the same
-/// `route_main_address` those two use — mapped to `PSP_MAIN_RAM_BASE + offset` with the identical
-/// out-of-range rejection — so `memory_type:"main"` lands the breakpoint where `read_memory` reads,
-/// not at a raw low address that never fires. Without a `memory_type` the value stays a raw absolute
-/// PSP address (e.g. `cpu.pc` from `get_state`), matching `disassemble`'s convention. `len` is the
-/// watched span (1 for an exec point, the memory breakpoint's `length` for read/write) and bounds
-/// `[offset, offset+len)` to the region exactly as read/write do.
-fn route_breakpoint_address(params: &Value, len: u64) -> BridgeResult<u64> {
-    if params.get("memory_type").is_some() {
-        route_main_address(params, len)
-    } else {
+/// Resolve a `set_breakpoint` address by kind. An exec breakpoint's `address`/`start` is a raw
+/// absolute PSP address — a PC straight from `get_state`'s `cpu.pc` or `disassemble` — so
+/// `memory_type` is ignored (a PC is not a `main`-region offset and is not always inside `main` RAM;
+/// PPSSPP's cpu breakpoint takes an absolute address either way). A read/write watchpoint's
+/// `address`/`start` is symmetric with `read_memory`/`write_memory`: a `memory_type` region offset
+/// routed through the same `route_main_address` those two use (→ `PSP_MAIN_RAM_BASE + offset`, with
+/// the identical out-of-range rejection), so it lands where `read_memory` reads. `len` is the watched
+/// span (the memory breakpoint's `length`) and bounds `[offset, offset+len)` to the region.
+fn route_breakpoint_address(kind: &str, params: &Value, len: u64) -> BridgeResult<u64> {
+    if kind == "exec" {
         absolute_address(params)
+    } else {
+        route_main_address(params, len)
     }
 }
 
@@ -2604,10 +2603,12 @@ mod tests {
                     {"address": 0x0880_0100u32, "size": 4, "hits": 0}]}),
             ),
         ]));
+        // A read/write watchpoint takes a memory_type offset (symmetric with read_memory), so offset
+        // 0x100 in `main` resolves to PSP_MAIN_RAM_BASE + 0x100 = 0x0880_0100.
         let resp = bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "read", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "read", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         assert!(resp.ok, "{:?}", resp.error);
         let result = resp.result.unwrap();
@@ -2638,10 +2639,11 @@ mod tests {
         let resp = bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0200u32}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x200}),
         ));
         assert!(resp.ok, "{:?}", resp.error);
         let (_, params) = &bridge.ws.calls[0];
+        assert_eq!(params["address"], 0x0880_0200u32);
         assert_eq!(params["size"], 1);
         assert_eq!(params["write"], true);
         assert_eq!(params["read"], false);
@@ -2649,25 +2651,32 @@ mod tests {
 
     #[test]
     fn set_breakpoint_memory_type_main_routes_offset_and_rejects_out_of_range() {
-        // memory_type:"main" + offset must resolve exactly like read_memory (PSP_MAIN_RAM_BASE +
-        // offset) instead of being discarded to a raw low address that never fires. An offset that
-        // leaves the region is rejected before any WS call — symmetric with read/write_memory.
+        // A read/write watchpoint's memory_type:"main" + offset resolves exactly like read_memory
+        // (PSP_MAIN_RAM_BASE + offset) instead of a raw low address that never fires, and an offset
+        // that leaves the region is rejected before any WS call — symmetric with read/write_memory.
+        // (Exec breakpoints take an absolute PC and do NOT route; see
+        // set_breakpoint_exec_ignores_memory_type_and_arms_at_raw_pc.)
         let offset = 0x4000u64;
-        let mut bridge = PpssppBridge::new(FakeWs::with(&[(
-            "cpu.breakpoint.add",
-            json!({"event": "cpu.breakpoint.add"}),
-        )]));
+        let expected = PSP_MAIN_RAM_BASE + offset;
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[
+            (
+                "memory.breakpoint.add",
+                json!({"event": "memory.breakpoint.add"}),
+            ),
+            (
+                "memory.breakpoint.list",
+                json!({"event":"memory.breakpoint.list","breakpoints":[
+                    {"address": expected, "size": 1, "hits": 0}]}),
+            ),
+        ]));
         let resp = bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"memory_type": "main", "start": offset}),
+            json!({"kind": "write", "memory_type": "main", "start": offset}),
         ));
         assert!(resp.ok, "{:?}", resp.error);
-        // Same absolute address read_memory(main, 0x4000) maps to (see
-        // read_memory_maps_main_offset_to_absolute_address_and_decodes_hex).
-        let expected = PSP_MAIN_RAM_BASE + offset;
         assert_eq!(resp.result.unwrap()["address"], expected);
-        assert_eq!(bridge.ws.calls[0].0, "cpu.breakpoint.add");
+        assert_eq!(bridge.ws.calls[0].0, "memory.breakpoint.add");
         assert_eq!(bridge.ws.calls[0].1["address"], expected);
 
         // An out-of-range main offset is rejected, not silently armed at a bad address.
@@ -2675,7 +2684,7 @@ mod tests {
         let resp = bridge.handle_request(Request::new(
             2,
             "set_breakpoint",
-            json!({"memory_type": "main", "start": PSP_MAIN_RAM_SIZE}),
+            json!({"kind": "write", "memory_type": "main", "start": PSP_MAIN_RAM_SIZE}),
         ));
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().kind, "bad_params");
@@ -2686,12 +2695,14 @@ mod tests {
     }
 
     #[test]
-    fn set_breakpoint_memory_type_exec_with_end_equal_start_arms() {
-        // Regression: the MCP wrapper always sends `end` (single-address calls use end==start). The
-        // exec range check must compare in offset coordinates BEFORE routing — comparing the routed
-        // absolute `address` against the un-routed `end` offset falsely rejected every offset-based
-        // exec point (main offset 0x4000 routes to 0x08804000, which never equals end 0x4000).
-        let offset = 0x4000u64;
+    fn set_breakpoint_exec_ignores_memory_type_and_arms_at_raw_pc() {
+        // Regression (0.5.0 exec-BP contract): the MCP wrapper ALWAYS sends `memory_type` (a required
+        // field) and, for a single-address call, end==start. An exec breakpoint's address is a raw PC
+        // (absolute, e.g. `cpu.pc` from get_state) — it must NOT be offset-routed like a read/write
+        // watchpoint, or a README-documented cpu.pc anchor (0x0880_4128) would be mis-read as a `main`
+        // offset (0x0880_4128 > region size) and rejected as out of range. Arm at the raw address;
+        // memory_type is ignored.
+        let pc = 0x0880_4128u64;
         let mut bridge = PpssppBridge::new(FakeWs::with(&[(
             "cpu.breakpoint.add",
             json!({"event": "cpu.breakpoint.add"}),
@@ -2699,19 +2710,20 @@ mod tests {
         let resp = bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"memory_type": "main", "start": offset, "end": offset}),
+            json!({"kind": "exec", "memory_type": "main", "start": pc, "end": pc}),
         ));
         assert!(resp.ok, "{:?}", resp.error);
-        let expected = PSP_MAIN_RAM_BASE + offset;
-        assert_eq!(resp.result.unwrap()["address"], expected);
-        assert_eq!(bridge.ws.calls[0].1["address"], expected);
+        assert_eq!(resp.result.unwrap()["address"], pc);
+        assert_eq!(bridge.ws.calls[0].0, "cpu.breakpoint.add");
+        assert_eq!(bridge.ws.calls[0].1["address"], pc);
 
-        // A genuine range (end != start in offset coordinates) is still rejected.
+        // A genuine range exec point (end != start) is still rejected — PPSSPP's cpu breakpoint is a
+        // single address.
         let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
         let resp = bridge.handle_request(Request::new(
             2,
             "set_breakpoint",
-            json!({"memory_type": "main", "start": offset, "end": offset + 0x10}),
+            json!({"kind": "exec", "memory_type": "main", "start": pc, "end": pc + 0x10}),
         ));
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().kind, "unsupported");
@@ -2868,11 +2880,12 @@ mod tests {
                 "memory.breakpoint.add",
                 json!({"event":"memory.breakpoint.add"}),
             ),
-            // add reads back the live counter to seed last_hits (calls[1]).
+            // add reads back the live counter to seed last_hits (calls[1]). A write watchpoint routes
+            // its memory_type offset 0x200 to PSP_MAIN_RAM_BASE + 0x200 = 0x0880_0200.
             (
                 "memory.breakpoint.list",
                 json!({"event":"memory.breakpoint.list","breakpoints":[
-                    {"address": 0x200, "size": 8, "hits": 0}]}),
+                    {"address": 0x0880_0200u32, "size": 8, "hits": 0}]}),
             ),
             (
                 "memory.breakpoint.remove",
@@ -2882,14 +2895,14 @@ mod tests {
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x200, "length": 8}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x200, "length": 8}),
         ));
         let resp = bridge.handle_request(Request::new(2, "clear_breakpoint", json!({"id": 1})));
         assert!(resp.ok, "{:?}", resp.error);
         // calls: [0]=add, [1]=list (seed), [2]=remove.
         let (event, params) = &bridge.ws.calls[2];
         assert_eq!(event, "memory.breakpoint.remove");
-        assert_eq!(params["address"], 0x200);
+        assert_eq!(params["address"], 0x0880_0200u32);
         assert_eq!(params["size"], 8);
     }
 
@@ -2912,9 +2925,11 @@ mod tests {
             (
                 "memory.breakpoint.list",
                 json!({"event":"memory.breakpoint.list","breakpoints":[
-                    {"address": 0x200, "size": 2, "hits": 0}]}),
+                    {"address": 0x0880_0200u32, "size": 2, "hits": 0}]}),
             ),
         ]));
+        // exec BP takes a raw absolute PC (0x100); the read watchpoint's memory_type offset 0x200
+        // routes to PSP_MAIN_RAM_BASE + 0x200 = 0x0880_0200.
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
@@ -2923,7 +2938,7 @@ mod tests {
         bridge.handle_request(Request::new(
             2,
             "set_breakpoint",
-            json!({"kind": "read", "address": 0x200, "length": 2}),
+            json!({"kind": "read", "memory_type": "main", "start": 0x200, "length": 2}),
         ));
         let resp = bridge.handle_request(Request::new(3, "list_breakpoints", json!({})));
         assert!(resp.ok, "{:?}", resp.error);
@@ -2932,7 +2947,7 @@ mod tests {
             rows,
             json!([
                 {"id": 1, "kind": "exec", "address": 0x100},
-                {"id": 2, "kind": "read", "address": 0x200, "length": 2},
+                {"id": 2, "kind": "read", "address": 0x0880_0200u32, "length": 2},
             ])
         );
     }
@@ -3225,7 +3240,7 @@ mod tests {
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         // The stop's pc is the writing instruction's address (0x08809000), not the watched address
         // — exec pc-matching cannot attribute this, so the hits-delta cross-check must.
@@ -3303,7 +3318,7 @@ mod tests {
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         bridge
             .ws
@@ -3314,7 +3329,7 @@ mod tests {
         let add2 = bridge.handle_request(Request::new(
             3,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         assert_eq!(add2.result.unwrap()["id"], 2);
         // An unrelated stop with the counter unchanged at 1 must be a generic stop, not a false hit.
@@ -3377,7 +3392,7 @@ mod tests {
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         bridge
             .ws
@@ -3391,7 +3406,7 @@ mod tests {
         let re_add = bridge.handle_request(Request::new(
             4,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         assert_eq!(re_add.result.unwrap()["id"], 2);
         // The first real hit on the re-added breakpoint must NOT be missed.
@@ -3442,12 +3457,12 @@ mod tests {
         bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "read", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "read", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         bridge.handle_request(Request::new(
             2,
             "set_breakpoint",
-            json!({"kind": "read", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "read", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         // Clear bp1 — bp2 survives, so the shared memcheck must stay (no remove call).
         let cleared = bridge.handle_request(Request::new(3, "clear_breakpoint", json!({"id": 1})));
@@ -3501,7 +3516,7 @@ mod tests {
         let read = bridge.handle_request(Request::new(
             1,
             "set_breakpoint",
-            json!({"kind": "read", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "read", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         assert!(read.ok, "{:?}", read.error);
         // A write on the exact same range must be refused before any WS round trip (only the two
@@ -3509,7 +3524,7 @@ mod tests {
         let write = bridge.handle_request(Request::new(
             2,
             "set_breakpoint",
-            json!({"kind": "write", "address": 0x0880_0100u32, "length": 4}),
+            json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
         ));
         assert!(!write.ok);
         assert_eq!(write.error.unwrap().kind, "bad_params");

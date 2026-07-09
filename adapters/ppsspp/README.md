@@ -167,8 +167,11 @@ shares it. Keeping the debugger WebSocket answering read-only commands (`cpu.get
 |---|---|
 | `main` | PSP user RAM, base `0x08800000` (`Core/MemMap.h: PSP_GetUserMemoryBase()`). `read_memory`/`write_memory`'s `address`/`start` offset is added to this base. |
 
-`disassemble` and `set_breakpoint` take a raw absolute PSP address instead (no `memory_type` base
-added) — e.g. straight from `get_state`'s `cpu.pc`.
+`disassemble` and **exec** breakpoints take a raw absolute PSP address instead (no `memory_type` base
+added) — e.g. straight from `get_state`'s `cpu.pc` (`memory_type` is ignored for an exec breakpoint).
+**read/write** breakpoints resolve their `address`/`start` the same way `read_memory`/`write_memory`
+do — a `memory_type` region offset added to the base — so a watchpoint lands where `read_memory`
+reads.
 
 ## Buttons
 
