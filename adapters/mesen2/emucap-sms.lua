@@ -78,6 +78,26 @@ end
 -- write BP 대상 주소도 평범한 Z80 메모리라 SNES식 포트 라벨을 달지 않는다 → nil(하드코딩 누수 방지).
 SYS.port_semantics = nil
 
+-- ROM 뱅크 태깅(Sega 매퍼): getState cart.prgBanks0/1/2 = 각 16KB 슬롯(0x0000/0x4000/0x8000)에 매핑된
+-- ROM 뱅크. Z80 버스는 16비트라 주소만으론 어느 뱅크인지 모른다 — call_stack/get_trace/BP pc에 뱅크를 붙여
+-- 모호성을 없앤다. read_banks는 0-keyed 테이블(bank_of가 슬롯으로 ±1 없이 인덱싱, 항상 완전 채움).
+-- 가정: Sega 매퍼. Codemasters/한국 매퍼·슬롯2 카트RAM은 범위 밖(잘못된-그러나-경계내 뱅크 보고, 크래시 없음).
+SYS.read_banks = function(st)
+  return { [0] = st["cart.prgBanks0"], [1] = st["cart.prgBanks1"], [2] = st["cart.prgBanks2"] }
+end
+SYS.bank_of = function(addr, banks)
+  if addr < 0x0400 then return 0 end          -- 고정 벡터 영역(첫 1KB)은 항상 뱅크0
+  local slot = math.floor(addr / 0x4000)      -- 0x4000 = 16KB
+  if slot <= 2 then return banks[slot] end     -- 슬롯0~2
+  return nil                                    -- 0xC000+ RAM
+end
+-- get_trace 뱅크 섀도용: ROM 뱅킹을 바꾸는 write 범위. Sega 매퍼 레지스터 0xFFFC-0xFFFF(RAM 미러라
+-- write 콜백이 확실히 발화). 여기 write 시 코어가 다음 명령에서 cur_banks를 refresh한다.
+SYS.bank_write_ranges = { { 0xFFFC, 0xFFFF } }
+-- 이 카트가 뱅크 태깅되는가(status.bank_tagging): Sega 매퍼 뱅크 필드가 실제로 노출될 때만. Codemasters/한국
+-- 등 다른 매퍼가 cart.prgBanks*를 안 내면 false(→ read_banks도 nil이라 bank_of가 nil을 냄).
+SYS.bank_tagging_active = function(st) return st["cart.prgBanks0"] ~= nil end
+
 -- SMS/GG VDP VRAM은 CPU 버스에 없다 — Z80은 VDP 데이터포트(0xBE) OUT으로만 쓰고, Mesen memory 콜백은 CPU
 -- 버스 접근만 잡으므로 smsVideoRam write는 절대 발화하지 않는다(실측: 같은 구간 WRAM write 32k회 ↔ VRAM 0회).
 -- 그래서 write BP를 exec 콜백에서 재구성한다(코어 setup_vram_recon_bp): 이 훅이 명령을 보고 VRAM 쓰기면

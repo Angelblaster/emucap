@@ -211,6 +211,14 @@ identical to SNES — only the ISA, memory types, and button names differ:
   budget + auto-disarm, so pair it with `pause_on_hit` and clear it when done. Write BPs on other
   non-bus memtypes (`smsPaletteRam` / CRAM) return an `unsupported` error rather than silently
   never firing (CRAM reconstruction is a TODO).
+- **ROM bank tagging**: the Z80 bus is 16-bit and ROM is paged into three 16 KB slots by the Sega
+  mapper, so a bare pc does not say which bank ran. `call_stack` frames (`{pc, bank}`), `get_trace`
+  entries, and breakpoint-hit events carry the ROM `bank` — the slot bank from `get_state`'s
+  `cart.prgBanks0/1/2` (slot = `addr >> 14`; the fixed first 1 KB is bank 0). The bank is captured when
+  the code ran, and `status.bank_tagging` reports it per cart (true only when the cart exposes those
+  fields). A `null`/absent `bank` means undetermined. Only the standard Sega mapper is covered —
+  non-Sega mappers (Codemasters / Korean) and code executing from slot-2 cart RAM may report a wrong or
+  absent bank, so trust `bank` on standard-mapper carts.
 
 ### Game Boy / Game Boy Color — SM83
 
@@ -223,6 +231,11 @@ tool set is identical to SNES — only the ISA, memory types, and button names d
 - **Buttons** (`status.input_buttons`): `a` / `b` / `start` / `select` / `up` / `down` / `left` / `right`.
 - **memory_types**: `gameboyMemory` (full SM83 bus), `gbWorkRam`, `gbVideoRam`, `gbCartRam`,
   `gbHighRam`, `gbPrgRom`, `gbSpriteRam`, `gbBootRom`. `status.memory_types` is authoritative.
+- **ROM bank tagging**: the SM83 bus is 16-bit; 0x4000-0x7FFF is a switchable MBC bank
+  (`get_state`'s `cart.prgBank`) and 0x0000-0x3FFF is bank 0. `call_stack` frames (`{pc, bank}`),
+  `get_trace` entries, and breakpoint-hit events carry the `bank`, captured when the code ran;
+  `status.bank_tagging` reports it per cart. MBC1 mode-1 / MBC1M remap the low region and Mesen exposes
+  no resolved low bank, so those report `bank: null` (undetermined) rather than a wrong bank 0.
 
 ### Game Boy Advance — ARM7
 

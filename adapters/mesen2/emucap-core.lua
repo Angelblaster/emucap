@@ -88,14 +88,24 @@ local dropped = 0              -- 큐 상한 초과로 버린 이벤트 수
 local CPU = nil                -- emu.cpuType.snes (로드 시 설정)
 
 -- 실행추적(콜스택 + 트레이스): set_trace로 켜면 매 명령 exec 콜백이 (a) 콜스택을 shadow-track
--- (JSR/JSL push, RTS/RTL/RTI pop — 스택 손상에도 robust), (b) 최근 명령 링버퍼를 채운다. 매 명령이라 느리니
--- 크래시 추적 hunting 전용. Mesen Lua엔 네이티브 콜스택 API가 없어 직접 추적한다.
+-- (call push, pop은 SP 되돌아옴으로 감지 — 스택 손상에도 robust), (b) 최근 명령 링버퍼를 채운다. 매 명령이라
+-- 느리니 크래시 추적 hunting 전용. Mesen Lua엔 네이티브 콜스택 API가 없어 직접 추적한다.
+-- pop을 opcode(op_is_return)로 하지 않고 SP로 한다: 조건부 RET 미성립은 opcode가 맞아도 실제 리턴 안 하고,
+-- 하드웨어 인터럽트는 CALL opcode 없이 push한 걸 핸들러 RET가 pop해 진짜 프레임을 지운다. 둘 다 opcode-pop이면
+-- over-pop이라 depth가 0으로 고착된다(exec 콜백은 pre-execution이라 frame.sp가 push 전 SP임을 실측 확인).
 local trace_on = false
 local trace_ref = nil
 local TRACE_CAP = 256
 local trace_ring = {}          -- 링버퍼 슬롯 -> { pc, op }
 local trace_idx = 0            -- 누적 명령 수(슬롯 = (trace_idx-1)%CAP +1)
-local callstack = {}           -- shadow 콜스택: 호출지(JSR/JSL의 pc) 리스트(바깥→안)
+local callstack = {}           -- shadow 콜스택: 호출지(call의 pc) 리스트(바깥→안), 각 { pc, sp=호출 직전 SP }
+local pending_ret_check = false -- 직전 명령이 return류(op_is_return/ED prefix)면 true — 다음 명령에서 SP로 정합
+-- get_trace 뱅크 섀도: trace_ring 엔트리에 pc의 ROM 뱅크를 붙인다. 매 명령 getState는 비싸므로(리컨사일
+-- 거부 사유) SYS.bank_write_ranges write 콜백이 banks_dirty를 세우고, trace_cb가 dirty일 때만 refresh(매퍼
+-- write당 ~1회, 다음 명령에서 = write 반영 후). SYS.bank_of 없는 시스템은 cur_banks가 nil로 남아 무동작.
+local cur_banks = nil          -- 현재 매핑된 뱅크 테이블(SYS.read_banks 형식), set_trace on에서 init
+local banks_dirty = false      -- 매퍼 write 발생 → 다음 trace_cb에서 cur_banks refresh
+local bank_cb_refs = {}         -- 등록한 write 콜백들 { ref, lo, hi }(제거 시 range 필요)
 
 -- ── base64 (순수 Lua) ────────────────────────────────────────
 local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -475,6 +485,7 @@ function handlers.get_rom_info()
   return true, { name = info.name, path = info.path, sha1 = info.fileSha1Hash }
 end
 
+local bank_tag_active = nil    -- status.bank_tagging 캐시(카트 상수 — 필드 존재 여부, 1회 getState로 판정)
 function handlers.status()
   local r = { connected = true, frame = frame, state = STATE }
   if STATE == "frozen" then r.reason = freeze_reason end   -- "hotkey"면 사용자가 로컬 핫키로 얼림
@@ -483,6 +494,14 @@ function handlers.status()
   r.freeze_key = FREEZE_KEY or "off"
   r.freeze_key_armed = (FREEZE_KEY ~= nil) and freeze_key_ok
   r.freeze_key_down = freeze_key_down()
+  -- 능력 광고: 이 카트가 call_stack/get_trace/BP 이벤트 pc에 ROM 뱅크(`bank`)를 붙이는가. status로 발견
+  -- (hello 아님 — Rust Capabilities는 hello에서 methods/memory_types/identity만 추출해 여분 키를 버림).
+  -- SYS.bank_of 존재만으론 불충분: 매퍼가 뱅크 필드를 실제로 노출할 때만 true(비표준 매퍼는 안 낼 수 있어
+  -- 그땐 뱅크가 nil로 나오므로 false로 광고한다). 값이 null인 항목은 "해당 주소 뱅크 미확정"을 뜻한다.
+  if bank_tag_active == nil then
+    bank_tag_active = (SYS.bank_tagging_active and SYS.bank_tagging_active(emu.getState())) or false
+  end
+  r.bank_tagging = bank_tag_active
   return true, r
 end
 
@@ -608,6 +627,14 @@ local function snum(s)
   return tonumber(s)
 end
 
+-- ROM 뱅크 태깅: pc가 페이징된 ROM 뱅크(GG/GB). SYS.bank_of 있는 시스템만, 없으면 nil(SNES는 뱅크가 pc
+-- 안, NES 등 미해당). pc는 16비트 실행주소(full_pc가 GG/GB에선 cpu.pc로 축약이라 st["cpu.pc"] 사용).
+-- 모든 breakpoint_hit 생성 사이트(record_hit + 인라인 nmi/irq/dma)가 공유해 동일 이벤트타입 내 균일 보장.
+local function bank_for_pc(st)
+  if not SYS.read_banks then return nil end
+  return SYS.bank_of(st["cpu.pc"], SYS.read_banks(st))
+end
+
 local function record_hit(bp, addr, value)
   -- 핫 BP 플러드 가드: pause_on_hit=false BP가 이벤트 버퍼(EVENT_CAP)를 채운 뒤엔 매 히트마다 비싼
   -- emu.getState()를 부르지 않고 즉시 드롭한다. 프레임당 수천 번 실행되는 핫 주소에 exec/write BP를
@@ -643,6 +670,7 @@ local function record_hit(bp, addr, value)
     -- 뱅크 없는 Z80에선 cpu.pc로 축약).
     ev.regs = SYS.snapshot_regs(st)
     ev.regs.pc = full_pc(st)
+    ev.bank = bank_for_pc(st)              -- pc의 ROM 뱅크(GG/GB), 아니면 nil. addr 아닌 pc 기준
     if bp.snapshot_specs then
       local snaps = {}
       for _, sp in ipairs(bp.snapshot_specs) do
@@ -857,7 +885,7 @@ function handlers.set_breakpoint(p)
       local st = emu.getState()
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "breakpoint_hit", breakpoint_id = id, kind = p.kind,
-          address = 0, value = 0, pc = full_pc(st), frame = frame }
+          address = 0, value = 0, pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
       else dropped = dropped + 1 end
       if bp.pause_on_hit and STATE ~= "frozen" then
         flush_deferred("interrupted", p.kind, id); STATE = "frozen"; freeze_reason = p.kind; emu.breakExecution()
@@ -909,7 +937,7 @@ function handlers.set_breakpoint(p)
       end
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "dma", breakpoint_id = id, address = addr, mdmaen = value,
-          channels = as_array(chans), pc = full_pc(st), frame = frame }
+          channels = as_array(chans), pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
       else dropped = dropped + 1 end
       if bp.pause_on_hit and STATE ~= "frozen" then
         flush_deferred("interrupted", "dma", id); STATE = "frozen"; freeze_reason = "dma"; emu.breakExecution()
@@ -1122,15 +1150,29 @@ end
 local function trace_cb(addr, value)
   local op = value
   if type(op) ~= "number" then op = emu.read(addr, emu.memType[SYS.default_memtype], false) end
-  trace_ring[(trace_idx % TRACE_CAP) + 1] = { pc = addr, op = op }
+  -- 뱅크 섀도 refresh: dirty일 때만(매퍼 write 후 다음 명령 = write 반영 후). 링 엔트리 태그보다 먼저여야
+  -- 스위치 직후 첫 명령이 옛 뱅크로 안 틀린다. cur_banks nil(비-뱅크 시스템)이면 bank=nil, getState 없음.
+  if banks_dirty then banks_dirty = false; cur_banks = SYS.read_banks(emu.getState()) end
+  trace_ring[(trace_idx % TRACE_CAP) + 1] =
+    { pc = addr, op = op, bank = cur_banks and SYS.bank_of(addr, cur_banks) or nil }
   trace_idx = trace_idx + 1
   -- 콜스택 shadow-track은 op_is_call/op_is_return이 있는 ISA만 갱신한다(GBA엔 없어 트레이스 링만 채운다).
-  if HAS_CALLSTACK and SYS.op_is_call(op) then         -- 호출 명령: 호출지 push(SP 정합 후)
-    local sp = emu.getState()["cpu.sp"]
-    reconcile_callstack(sp)                            -- 이미 리턴한 프레임(JMP-리턴 포함) 정리
-    callstack[#callstack + 1] = { pc = addr, sp = sp }
-  elseif HAS_CALLSTACK and SYS.op_is_return(op) then   -- 리턴 명령: pop
-    if #callstack > 0 then table.remove(callstack) end
+  if not HAS_CALLSTACK then return end
+  -- 지연 prompt-pop: 직전 명령이 return류였다 → 이제 그 return이 실행돼 SP가 (taken이면) 올라와 있다.
+  -- 복원된 SP로 reconcile: 미성립 조건부 RET는 SP 불변이라 pop 안 되고, taken이면 호출자가 아직 push하기 전
+  -- 리턴 지점에서 pop돼 masking을 막고, 인터럽트 리턴은 유저 프레임보다 낮은 SP라 유저 프레임을 안 건드린다.
+  if pending_ret_check then
+    pending_ret_check = false
+    reconcile_callstack(emu.getState()["cpu.sp"])
+  end
+  if SYS.op_is_call(op) then                            -- 호출 명령: 호출지 push(SP 정합 후)
+    local st = emu.getState()                            -- SP + 뱅크를 한 번에(추가 getState 없음)
+    local sp = st["cpu.sp"]
+    reconcile_callstack(sp)                             -- 이미 리턴한 프레임(JMP-리턴 포함) 정리
+    local bank = SYS.read_banks and SYS.bank_of(addr, SYS.read_banks(st)) or nil  -- addr = 호출지 pc
+    callstack[#callstack + 1] = { pc = addr, sp = sp, bank = bank }
+  elseif SYS.op_is_return(op) or op == 0xED then        -- return류(RET/조건부 RET) 또는 ED 프리픽스(RETI/RETN)
+    pending_ret_check = true                             -- opcode로 pop하지 않고 다음 명령에서 SP로 정합
   end
 end
 
@@ -1138,17 +1180,33 @@ end
 function handlers.set_trace(p)
   local on = p.enabled and true or false
   if on and not trace_on then
-    trace_ring = {}; trace_idx = 0; callstack = {}
+    trace_ring = {}; trace_idx = 0; callstack = {}; pending_ret_check = false
     trace_ref = emu.addMemoryCallback(trace_cb, emu.callbackType.exec, 0, EXEC_MAX, CPU)
+    -- 뱅크 섀도(GG/GB): 초기 뱅크를 읽고, 매퍼 write 범위에 write 콜백을 걸어 banks_dirty를 세운다.
+    if SYS.bank_write_ranges and SYS.read_banks then
+      cur_banks = SYS.read_banks(emu.getState()); banks_dirty = false
+      for _, r in ipairs(SYS.bank_write_ranges) do
+        local lo, hi = r[1], r[2]
+        bank_cb_refs[#bank_cb_refs + 1] = {
+          ref = emu.addMemoryCallback(function() banks_dirty = true end, emu.callbackType.write, lo, hi, CPU),
+          lo = lo, hi = hi,
+        }
+      end
+    end
     trace_on = true
   elseif not on and trace_on then
     emu.removeMemoryCallback(trace_ref, emu.callbackType.exec, 0, EXEC_MAX, CPU)
     trace_ref = nil; trace_on = false
+    for _, c in ipairs(bank_cb_refs) do
+      emu.removeMemoryCallback(c.ref, emu.callbackType.write, c.lo, c.hi, CPU)
+    end
+    bank_cb_refs = {}; cur_banks = nil; banks_dirty = false
   end
   return true, { tracing = trace_on }
 end
 
--- 최근 count개 명령을 시간순(오래된→최신). pc는 24비트 실행주소, op는 opcode 바이트.
+-- 최근 count개 명령을 시간순(오래된→최신). 엔트리 { pc, op, bank? }. pc는 실행주소(SNES 24비트, GG/GB 등
+-- 16비트), op는 opcode 바이트, bank은 pc가 페이징된 ROM 뱅크(GG/GB만; 없으면 생략).
 function handlers.get_trace(p)
   local count = math.min(p.count or TRACE_CAP, TRACE_CAP)
   local total = math.min(trace_idx, TRACE_CAP)
@@ -1160,15 +1218,17 @@ function handlers.get_trace(p)
   return true, { trace = as_array(out), tracing = trace_on, total = trace_idx }
 end
 
--- 콜스택: 호출지(JSR/JSL의 pc) 리스트, 바깥→안(안쪽이 마지막). "어떻게 여기 왔나" 즉답.
--- 조회 시 현재 SP로 한 번 더 정합(마지막 호출 이후 JMP로 리턴한 프레임 정리).
+-- 콜스택: 호출지 프레임 { pc, bank } 리스트, 바깥→안(안쪽이 마지막). "어떻게 여기 왔나" 즉답. bank은 pc가
+-- 페이징된 ROM 뱅크(GG/GB), 아니면 nil(SNES는 뱅크가 pc 안). 모든 Mesen 시스템이 균일하게 { pc, bank } 객체.
+-- 조회 시 SP로 한 번 더 정합(마지막 호출 이후 리턴한 프레임 정리). frozen이면 freeze 시점 스냅샷 SP를 쓴다
+-- (live getState는 트레드밀로 드리프트해 depth를 틀리게 함 — get_state와 같은 frozen_state 경로).
 function handlers.call_stack()
   if not HAS_CALLSTACK then
     return false, "unsupported", "call_stack not supported for " .. SYS.system .. " (no SP-based call-stack model for this ISA)"
   end
-  reconcile_callstack(emu.getState()["cpu.sp"])
+  reconcile_callstack(frozen_state()["cpu.sp"])
   local out = {}
-  for _, f in ipairs(callstack) do out[#out + 1] = f.pc end
+  for _, f in ipairs(callstack) do out[#out + 1] = { pc = f.pc, bank = f.bank } end
   return true, { call_stack = as_array(out), depth = #callstack, tracing = trace_on }
 end
 

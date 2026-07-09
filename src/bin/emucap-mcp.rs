@@ -591,7 +591,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "최근 N개 실행 명령을 시간순으로 반환한다(pc·opcode; set_trace(true) 선행)."
+        description = "최근 N개 실행 명령을 시간순으로 반환한다(`[{pc, op, bank?}]`; set_trace(true) 선행). `bank`은 pc가 페이징된 ROM 뱅크(Mesen GG/GB만). 없거나 null이면 뱅크 미확정(MBC1 mode-1 저역·비표준 매퍼 등). 카트가 태깅하는지는 `status.bank_tagging`."
     )]
     async fn get_trace(&self, Parameters(a): Parameters<GetTraceArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -609,7 +609,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "현재 콜스택(호출지 pc 체인, 바깥→안)을 반환한다 — \"어떻게 여기 왔나\" 즉답(set_trace(true) 선행)."
+        description = "현재 콜스택(호출지 프레임 체인 `[{pc, bank}]`, 바깥→안)을 반환한다 — \"어떻게 여기 왔나\" 즉답(set_trace(true) 선행). `bank`은 pc가 페이징된 ROM 뱅크(Mesen GG/GB만). `bank`이 없거나 null이면 그 주소의 뱅크 미확정(SNES는 24비트 pc 안, 또는 MBC1 mode-1 저역·비표준 매퍼라 추정불가). 카트가 뱅크를 태깅하는지는 `status.bank_tagging`. `.pc`가 유일 보장 필드."
     )]
     async fn call_stack(&self) -> CallToolResult {
         let mut l = self.link();

@@ -82,6 +82,29 @@ end
 -- GB VDP(포트 $FF40~)는 SNES식 데이터-포트→VRAM 워드주소 매핑을 런타임 상태로 노출하지 않는다 → nil(누수 방지).
 SYS.port_semantics = nil
 
+-- ROM 뱅크 태깅: 0x0000-0x3FFF는 뱅크0, 0x4000-0x7FFF는 스위처블 MBC 뱅크(getState cart.prgBank).
+-- SM83 버스는 16비트라 주소만으론 어느 뱅크인지 모른다 — pc에 뱅크를 붙인다.
+-- 범위 밖: MBC1 mode-1 / MBC1M(저역이 0x20/40/60로 페이징) → 저역을 0으로 보고(문서화된 한계).
+SYS.read_banks = function(st)
+  return { switch = st["cart.prgBank"], mode = st["cart.mode"] }
+end
+SYS.bank_of = function(addr, banks)
+  if addr < 0x4000 then
+    -- MBC1 mode-1(대형 ROM·MBC1M)은 저역을 0x20/40/60로 리매핑한다. Mesen이 그 resolved 저역 뱅크를
+    -- 노출하지 않아(cart.mode만 있고 저역-뱅크 필드 없음) 틀린 0 대신 nil(미확정)을 낸다.
+    if banks.mode then return nil end
+    return 0                                    -- mode-0/비-MBC1: 저역은 뱅크0
+  end
+  if addr < 0x8000 then return banks.switch end -- 스위처블 뱅크(모든 표준 MBC에서 Mesen이 resolve)
+  return nil                                    -- 0x8000+ VRAM/RAM 등
+end
+-- 이 카트가 뱅크 태깅되는가(status.bank_tagging): 뱅크 필드가 실제로 노출될 때만. 필드를 안 내는 매퍼는 false.
+SYS.bank_tagging_active = function(st) return st["cart.prgBank"] ~= nil end
+-- get_trace 뱅크 섀도용: MBC 제어 write 범위. 0x0000-0x7FFF 전체(모든 MBC 뱅크셀렉트 포함) — ROM 영역
+-- write지만 Mesen이 write 콜백을 발화함(실측 확인: 0x3000 뱅크셀렉트 write 256회 잡힘). 여기 write 시
+-- 다음 명령에서 cur_banks를 refresh(MBC를 직접 디코드하지 않고 Mesen이 resolve한 cart.prgBank 재읽기).
+SYS.bank_write_ranges = { { 0x0000, 0x7FFF } }
+
 local function s8(v) return (v >= 0x80) and (v - 0x100) or v end
 
 -- 8비트 레지스터 순서(opcode 3비트 필드). 6=(HL) 메모리 간접.
