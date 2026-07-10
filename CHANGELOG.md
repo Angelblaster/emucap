@@ -2,6 +2,24 @@
 
 Beta software — interfaces may still change.
 
+## 0.7.0
+
+### Added
+- Runtime continuity is now observable through `status.continuity` and `status.runtime_instance`. The Control MCP keeps bounded last-good and failure evidence across transport loss, exposes it through `get_failure_context`, and refuses duplicate or ambiguous launches unless an owned live generation is explicitly replaced.
+- Flycast captures the exact SH-4 state and a fixed-size pre-failure PC ring before a blocked fatal exception mutates CPU state. It publishes bounded durable evidence, keeps read-only diagnostics available in a quarantine window, and exposes `dismiss_failure` as an explicit end to that window.
+
+### Changed
+- Adapters and bridges reconnect to a replacement Control MCP session without restarting their emulator or debugger backend. Request IDs and unfinished work remain scoped to the disconnected session; execution state, breakpoints, and explicit `set_input` holds remain emulator state.
+- Timed NDS button/touch and PC-98 button operations acknowledge only after the requested frame effect and input release. A breakpoint or stop returns `status: "interrupted"` after releasing transient input. NDS synchronous timed input is capped at 120 frames.
+- An empty `set_input` explicitly returns input ownership to native keyboard/controller handling on Flycast and Mednafen. PPSSPP timed input accepts one button only; unsupported atomic multi-button pulses are rejected before mutation, while persistent combinations remain available through `set_input`.
+
+### Fixed
+- Mesen2, Mednafen, and Flycast socket writes are bounded and preserve partial NDJSON writes, so a slow or disconnected peer cannot block the emulator thread indefinitely or corrupt the next response.
+- Mesen2 `pause` and breakpoint freezes no longer auto-resume after 30 seconds of inactivity or 10 minutes without an MCP connection by default. Both escape timers are explicit opt-ins and their effective values, together with the unavoidable Lua watchdog instruction drift, are exposed in `status.freeze_policy`.
+- Mednafen transient button presses release their override on completion, interruption, reset, and disconnect, preventing a zero-mask override from continuing to suppress native input.
+- Mesen2 GBA launches create the portable-data marker needed for the staged BIOS to be discovered without modifying the user's normal settings; other Mesen systems continue to inherit native key mappings.
+- Flycast frame-running and input handoff report their actual terminal state, and NDS/PC-98 timed-input stop races no longer report success before release or leave stale input active.
+
 ## 0.6.0
 
 ### Added
