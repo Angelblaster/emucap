@@ -1,10 +1,15 @@
 Copyright (C) 2026 emucap contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 
-The Mesen2 adapter's runtime Lua (emucap-core.lua plus the per-system entry
-scripts emucap-snes.lua / emucap-sms.lua) is loaded at runtime by Mesen2 via a
-command-line argument, not compiled or linked into the Mesen2 binary. It is
-licensed GPL-2.0-or-later, the project default. Mesen2 itself is GPL-3.0-or-later;
-see ../../NOTICE.
+The Mesen adapter has two license boundaries:
+
+- Runtime Lua (`emucap-core.lua` and the per-system entry scripts) is loaded as
+  a separate script and is licensed GPL-2.0-or-later, the project default.
+- `patches/*.patch` modifies and is compiled into MesenCE. That patch stack is a
+  derivative of MesenCE and is licensed GPL-3.0-or-later.
+
+The repository distributes pinned source patches and build recipes, not Mesen
+binaries. See ../../NOTICE.
 
 Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)
+Full GPL-3.0 text: ../../licenses/GPL-3.0.txt (https://www.gnu.org/licenses/gpl-3.0.txt)

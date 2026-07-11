@@ -1,0 +1,34 @@
+diff --git i/Core/Debugger/Debugger.cpp w/Core/Debugger/Debugger.cpp
+index 906d1ff..e78a5be 100644
+--- i/Core/Debugger/Debugger.cpp
++++ w/Core/Debugger/Debugger.cpp
+@@ -518,6 +518,15 @@ void Debugger::SleepUntilResume(CpuType sourceCpu, BreakSource source, MemoryOpe
+ 	}
+ 
+ 	while((_waitForBreakResume && !_suspendRequestCount) || _breakRequestCount) {
++		if(_waitForBreakResume && !_suspendRequestCount && !_breakRequestCount) {
++			// Scripts normally receive CodeBreak once, immediately before this native halt loop. An
++			// opt-in CodeBreakIdle callback lets a bounded control script service external commands
++			// while the guest remains stopped, without holding one Lua callback past the watchdog.
++			ProcessEvent(EventType::CodeBreakIdle, sourceCpu);
++		}
++		if((!_waitForBreakResume || _suspendRequestCount) && !_breakRequestCount) {
++			break;
++		}
+ 		std::this_thread::sleep_for(std::chrono::duration<int, std::milli>(_breakRequestCount ? 1 : 10));
+ 	}
+ 
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+index d5d0149..e3f2058 100644
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -12,6 +12,7 @@ enum class EventType
+ 	StateLoaded,
+ 	StateSaved,
+ 	CodeBreak,
++	CodeBreakIdle,
+ 
+ 	LastValue
+-};
+\ No newline at end of file
++};

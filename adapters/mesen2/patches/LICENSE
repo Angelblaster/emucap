@@ -1,0 +1,9 @@
+MesenCE patch stack
+Copyright (C) 2026 emucap contributors
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+The patches in this directory modify MesenCE, which is licensed under the GNU
+General Public License version 3 or, at your option, any later version. The
+patches are distributed under the same terms. The full license text is in
+../../../licenses/GPL-3.0.txt.

@@ -25,10 +25,15 @@ MAME
   Used by:  adapters/mame-pc98 (patches + Lua plugin + GDB bridge; PC-98)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
 
-Mesen2
-  Upstream: https://github.com/SourMesen/Mesen2
+MesenCE
+  Upstream: https://github.com/nesdev-org/MesenCE
+  Pinned source: 2.2.1 (20ba206cef5ba207c21203176d02cb9f43dda9fb)
   License:  GPL-3.0-or-later
-  Used by:  adapters/mesen2 (runtime Lua script; SNES/NES/GB/GBC/GBA/Game Gear)
+  Used by:  adapters/mesen2 (GPL-3.0-or-later local patch stack and build recipe,
+            plus separately loaded GPL-2.0-or-later runtime Lua; SNES/NES/GB/
+            GBC/GBA/Game Gear)
+  Distribution: emucap does not ship Mesen binaries. Each user builds the pinned
+                source plus the complete patch stack on their own machine.
 
 DeSmuME
   Upstream: https://github.com/TASEmulators/desmume
