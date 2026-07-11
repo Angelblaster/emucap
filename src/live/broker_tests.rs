@@ -52,6 +52,48 @@ fn fake_emu(addr: String, name: Option<String>) -> std::thread::JoinHandle<()> {
     })
 }
 
+fn fake_mesen_emu(
+    addr: String,
+    name: &str,
+    host_features: &[&str],
+    hold_ms: u64,
+) -> std::thread::JoinHandle<()> {
+    let name = name.to_string();
+    let host_features: Vec<String> = host_features
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": 0,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "methods": ["status"],
+                    "name": name,
+                    "adapter": "mesen2-live",
+                    "mesen_host_api": 1,
+                    "host_features": host_features,
+                    "host_build": {
+                        "upstream_commit": "0123456789abcdef0123456789abcdef01234567",
+                        "patchset_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    }
+                }
+            })
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(hold_ms));
+    })
+}
+
 #[test]
 fn broker_routes_and_pumps_keepalive() {
     let (ea, sa) = start_broker();
@@ -76,6 +118,46 @@ fn broker_routes_and_pumps_keepalive() {
     assert!(l1.contains("working"), "첫 줄 working: {l1}");
     assert!(l2.contains("connected"), "둘째 줄 completed: {l2}");
     h.join().unwrap();
+}
+
+#[test]
+fn broker_rejects_mesen_without_native_halt_features() {
+    let (emu_addr, session_addr) = start_broker();
+    let emulator = fake_mesen_emu(emu_addr, "unpatched", &["code_break_idle"], 200);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach(&session_addr, Some("unpatched"));
+    assert!(
+        response.contains("no_such_emulator"),
+        "incompatible Mesen must not enter the broker registry: {response}"
+    );
+    emulator.join().unwrap();
+}
+
+#[test]
+fn broker_forwards_mesen_native_halt_identity() {
+    let (emu_addr, session_addr) = start_broker();
+    let emulator = fake_mesen_emu(
+        emu_addr,
+        "patched",
+        &["code_break_idle", "native_halt_service"],
+        500,
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach(&session_addr, Some("patched"));
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    let result = &response["result"];
+    assert_eq!(result["mesen_host_api"], 1);
+    assert_eq!(
+        result["host_features"],
+        serde_json::json!(["code_break_idle", "native_halt_service"])
+    );
+    assert_eq!(
+        result["host_build"]["upstream_commit"],
+        "0123456789abcdef0123456789abcdef01234567"
+    );
+    emulator.join().unwrap();
 }
 
 #[test]

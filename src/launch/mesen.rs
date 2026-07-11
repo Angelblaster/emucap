@@ -9,11 +9,152 @@
 //! to the copied app, so that launch gets a minimal settings.json. Required values are still passed
 //! as CLI overrides with `--donotSaveSettings` and never persist to the user's file.
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Resolve the Mesen executable: the `MESEN_BIN` override if it points at an existing file, else the
-/// per-OS default install location, else the first `Mesen`/`Mesen.exe` found on `PATH`.
-pub fn resolve_binary() -> Option<PathBuf> {
+pub const REQUIRED_HOST_API: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildMetadata {
+    pub upstream: String,
+    pub tag: String,
+    pub commit: String,
+    pub host_api: u32,
+    pub patchset_sha256: String,
+}
+
+fn patch_required(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("mesen-patch-required: {}", message.into()),
+    )
+}
+
+pub fn build_metadata_path(binary: &Path) -> PathBuf {
+    binary
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("emucap-mesen-build.json")
+}
+
+pub fn read_build_metadata(binary: &Path) -> std::io::Result<BuildMetadata> {
+    let path = build_metadata_path(binary);
+    let raw = std::fs::read_to_string(&path).map_err(|e| {
+        patch_required(format!(
+            "compatible build metadata is missing at {} ({e}); run adapters/mesen2/build.sh or build.ps1",
+            path.display()
+        ))
+    })?;
+    let metadata: BuildMetadata = serde_json::from_str(&raw).map_err(|e| {
+        patch_required(format!("invalid build metadata at {}: {e}", path.display()))
+    })?;
+    if metadata.host_api != REQUIRED_HOST_API {
+        return Err(patch_required(format!(
+            "host API {} is incompatible; expected {}",
+            metadata.host_api, REQUIRED_HOST_API
+        )));
+    }
+    if metadata.commit.len() != 40 || !metadata.commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(patch_required(
+            "metadata commit is not a full git object id",
+        ));
+    }
+    if metadata.patchset_sha256.len() != 64
+        || !metadata
+            .patchset_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(patch_required("metadata patchset_sha256 is invalid"));
+    }
+    Ok(metadata)
+}
+
+fn lock_value(lock: &str, key: &str) -> Option<String> {
+    lock.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")).map(str::to_owned))
+}
+
+/// Validate the sidecar against the repository's pinned source lock. The sidecar is a fast
+/// preflight; the Lua hello feature remains the authoritative runtime check after launch.
+pub fn require_compatible_build(root: &Path, binary: &Path) -> std::io::Result<BuildMetadata> {
+    let metadata = read_build_metadata(binary)?;
+    let lock_path = root.join("adapters/mesen2/upstream.lock");
+    let lock = std::fs::read_to_string(&lock_path)?;
+    let expected_repo = lock_value(&lock, "MESEN_REPO")
+        .ok_or_else(|| patch_required("MESEN_REPO missing from upstream.lock"))?;
+    let expected_tag = lock_value(&lock, "MESEN_TAG")
+        .ok_or_else(|| patch_required("MESEN_TAG missing from upstream.lock"))?;
+    let expected_commit = lock_value(&lock, "MESEN_COMMIT")
+        .ok_or_else(|| patch_required("MESEN_COMMIT missing from upstream.lock"))?;
+    let expected_api = lock_value(&lock, "MESEN_HOST_API")
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or_else(|| patch_required("MESEN_HOST_API invalid in upstream.lock"))?;
+    let expected_patchset = lock_value(&lock, "MESEN_PATCHSET_SHA256")
+        .ok_or_else(|| patch_required("MESEN_PATCHSET_SHA256 missing from upstream.lock"))?;
+    if metadata.upstream != expected_repo
+        || metadata.tag != expected_tag
+        || metadata.commit != expected_commit
+        || metadata.host_api != expected_api
+        || metadata.patchset_sha256 != expected_patchset
+    {
+        return Err(patch_required(format!(
+            "build sidecar does not match {}",
+            lock_path.display()
+        )));
+    }
+    Ok(metadata)
+}
+
+pub fn local_build_candidates(root: &Path) -> Vec<PathBuf> {
+    let source = root.join("adapters/mesen2/work/mesen/bin");
+    #[cfg(target_os = "macos")]
+    let rid = if cfg!(target_arch = "aarch64") {
+        "osx-arm64"
+    } else {
+        "osx-x64"
+    };
+    #[cfg(target_os = "linux")]
+    let rid = if cfg!(target_arch = "aarch64") {
+        "linux-arm64"
+    } else {
+        "linux-x64"
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let publish = source.join(rid).join("Release").join(rid).join("publish");
+        vec![
+            publish.join("Mesen.app/Contents/MacOS/Mesen"),
+            publish.join("Mesen"),
+            source.join(rid).join("Release/Mesen"),
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            source
+                .join(rid)
+                .join("Release")
+                .join(rid)
+                .join("publish/Mesen"),
+            source.join(rid).join("Release/Mesen"),
+        ]
+    }
+    #[cfg(windows)]
+    {
+        vec![source.join("win-x64").join("Release/Mesen.exe")]
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = source;
+        Vec::new()
+    }
+}
+
+/// Resolve the Mesen executable: explicit override, repository build, OS install, then PATH.
+/// Compatibility is checked separately so an incompatible binary can be reported as patch-required rather
+/// than being confused with a missing executable.
+pub fn resolve_binary(root: &Path) -> Option<PathBuf> {
     if let Some(explicit) = std::env::var_os("MESEN_BIN") {
         let p = PathBuf::from(explicit);
         if super::is_runnable_file(&p) {
@@ -24,6 +165,9 @@ pub fn resolve_binary() -> Option<PathBuf> {
                 return Some(binary);
             }
         }
+    }
+    if let Some(local) = super::first_existing_file(local_build_candidates(root)) {
+        return Some(local);
     }
     if let Some(default) = super::first_existing_file(default_install_candidates()) {
         return Some(default);
@@ -126,6 +270,36 @@ pub fn prepare_portable_binary(
         let binary = dst_root.join(rel);
         let settings = binary.parent().unwrap_or(&dst_root).join("settings.json");
         (binary, settings)
+    } else if build_metadata_path(source_binary).is_file() {
+        let exe_name = source_binary.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid Mesen binary path: {}", source_binary.display()),
+            )
+        })?;
+        let source_dir = source_binary.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid Mesen publish directory: {}",
+                    source_binary.display()
+                ),
+            )
+        })?;
+        let dst_dir = home.join("portable");
+        if dst_dir.starts_with(source_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "portable Mesen destination must not be inside its source publish directory: {}",
+                    dst_dir.display()
+                ),
+            ));
+        }
+        super::copy_dir_replace(source_dir, &dst_dir)?;
+        let binary = dst_dir.join(exe_name);
+        let settings = dst_dir.join("settings.json");
+        (binary, settings)
     } else {
         let exe_name = source_binary.file_name().ok_or_else(|| {
             std::io::Error::new(
@@ -167,6 +341,7 @@ pub struct Launch<'a> {
 /// Prepare an emucap-owned portable Mesen copy and launch it detached with the ROM + adapter Lua and
 /// the emucap environment. Returns the child pid.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
+    let host_build = read_build_metadata(l.binary)?;
     let portable = prepare_portable_binary(l.binary, l.port)?;
     ensure_gba_portable_settings(l, &portable)?;
     provision_gba_bios(l, &portable)?;
@@ -178,7 +353,9 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
         runtime: l.runtime,
         headless: false, // Mesen renders a GUI window; there is no headless mode.
     };
-    let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts);
+    let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts)
+        .env("EMUCAP_MESEN_UPSTREAM_COMMIT", &host_build.commit)
+        .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256);
     let pid = crate::launch::spawn_detached(&spec)?;
     // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
     crate::launch::spawn_display_caffeinate(pid);
@@ -199,15 +376,20 @@ const GBA_PORTABLE_SETTINGS: &str = r#"{
 }
 "#;
 
+fn is_gba_launch(l: &Launch) -> bool {
+    l.lua.file_name().and_then(|name| name.to_str()) == Some("emucap-gba.lua")
+        || Path::new(l.content)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gba"))
+}
+
 /// A settings.json beside the executable is Mesen's portable-data marker. GBA needs that marker so
 /// its `Firmware/gba_bios.bin` staging path and Mesen's lookup path are the same. Other systems keep
 /// the file absent and continue inheriting the user's native key bindings. An existing regular file
 /// copied from the source app is preserved verbatim.
-fn ensure_gba_portable_settings(
-    l: &Launch,
-    portable: &PreparedPortable,
-) -> std::io::Result<()> {
-    if l.lua.file_name().and_then(|n| n.to_str()) != Some("emucap-gba.lua") {
+fn ensure_gba_portable_settings(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
+    if !is_gba_launch(l) {
         return Ok(());
     }
     if super::has_symlink_component_under(&portable.home, &portable.settings) {
@@ -259,7 +441,7 @@ fn default_gba_bios_source() -> PathBuf {
 /// A missing *explicitly-configured* source fails fast with a clear precondition instead of hanging
 /// on the prompt.
 fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
-    if l.lua.file_name().and_then(|n| n.to_str()) != Some("emucap-gba.lua") {
+    if !is_gba_launch(l) {
         return Ok(());
     }
     let firmware = portable
@@ -274,7 +456,11 @@ fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Resul
     let explicit = std::env::var_os("EMUCAP_GBA_BIOS");
     // No explicit source + an already-staged BIOS: honour the staged copy so a launch does not fail
     // when the shared firmware source has been moved/removed since the first run.
-    if explicit.is_none() && dst.is_file() {
+    if explicit.is_none()
+        && dst
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() == 0x4000)
+    {
         return Ok(());
     }
     let src = match explicit {
@@ -291,6 +477,16 @@ fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Resul
             ),
         ));
     }
+    let size = std::fs::metadata(&src)?.len();
+    if size != 0x4000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "GBA BIOS must be exactly 16384 bytes, but {} is {size} bytes",
+                src.display()
+            ),
+        ));
+    }
     std::fs::create_dir_all(&firmware)?;
     super::copy_file_replace(&src, &dst)
 }
@@ -298,10 +494,8 @@ fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch::test_env::{lock_env, EnvGuard};
     use serde_json::{json, Value};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -316,15 +510,10 @@ mod tests {
     }
 
     fn with_emu_home<T>(base: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os("EMUCAP_EMU_HOME");
+        let _guard = lock_env();
+        let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
         std::env::set_var("EMUCAP_EMU_HOME", base);
-        let out = f();
-        match old {
-            Some(v) => std::env::set_var("EMUCAP_EMU_HOME", v),
-            None => std::env::remove_var("EMUCAP_EMU_HOME"),
-        }
-        out
+        f()
     }
 
     #[test]
@@ -351,7 +540,8 @@ mod tests {
 
     #[test]
     fn resolve_binary_accepts_explicit_app_bundle_path() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = lock_env();
+        let _env = EnvGuard::new(&["MESEN_BIN"]);
         let dir = tempfile::tempdir().unwrap();
         let app = dir.path().join("Mesen.app");
         let binary = app.join("Contents/MacOS/Mesen");
@@ -360,13 +550,8 @@ mod tests {
         #[cfg(unix)]
         make_executable(&binary);
 
-        let old = std::env::var_os("MESEN_BIN");
         std::env::set_var("MESEN_BIN", &app);
-        let resolved = resolve_binary();
-        match old {
-            Some(v) => std::env::set_var("MESEN_BIN", v),
-            None => std::env::remove_var("MESEN_BIN"),
-        }
+        let resolved = resolve_binary(dir.path());
 
         assert_eq!(resolved, Some(binary));
     }
@@ -374,17 +559,13 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn default_install_candidates_include_windows_user_installs() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old = std::env::var_os("LOCALAPPDATA");
+        let _guard = lock_env();
+        let _env = EnvGuard::new(&["LOCALAPPDATA"]);
         let base = PathBuf::from(r"C:\Users\alice\AppData\Local");
         std::env::set_var("LOCALAPPDATA", &base);
 
         let candidates = default_install_candidates();
 
-        match old {
-            Some(v) => std::env::set_var("LOCALAPPDATA", v),
-            None => std::env::remove_var("LOCALAPPDATA"),
-        }
         assert!(candidates.contains(&base.join("Programs/Mesen/Mesen.exe")));
     }
 
@@ -420,6 +601,76 @@ mod tests {
         // plain 바이너리 copy는 binary만 옮기고 settings.json은 만들지 않는다(우리가 주입하지
         // 않음 — Mesen이 사용자 기본 settings를 로드하고 필수값은 CLI override로 들어간다).
         assert!(!portable.settings.exists());
+    }
+
+    fn test_build_metadata() -> BuildMetadata {
+        BuildMetadata {
+            upstream: "https://example.invalid/MesenCE.git".into(),
+            tag: "2.2.1".into(),
+            commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            host_api: REQUIRED_HOST_API,
+            patchset_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        }
+    }
+
+    #[test]
+    fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
+        let src = tempfile::tempdir().unwrap();
+        let emu_home = tempfile::tempdir().unwrap();
+        let source_bin = src.path().join("Mesen");
+        std::fs::write(&source_bin, "fake mesen").unwrap();
+        std::fs::write(src.path().join("Mesen.dll"), "dependency").unwrap();
+        std::fs::write(
+            src.path().join("emucap-mesen-build.json"),
+            serde_json::to_vec(&test_build_metadata()).unwrap(),
+        )
+        .unwrap();
+
+        let portable = with_emu_home(emu_home.path(), || {
+            prepare_portable_binary(&source_bin, 47915).unwrap()
+        });
+
+        assert_eq!(portable.binary, portable.home.join("portable/Mesen"));
+        assert_eq!(
+            std::fs::read_to_string(portable.home.join("portable/Mesen.dll")).unwrap(),
+            "dependency"
+        );
+        assert!(portable
+            .home
+            .join("portable/emucap-mesen-build.json")
+            .is_file());
+    }
+
+    #[test]
+    fn repository_lock_rejects_sidecar_from_another_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let publish = tempfile::tempdir().unwrap();
+        let binary = publish.path().join("Mesen");
+        std::fs::write(&binary, "fake").unwrap();
+        let metadata = test_build_metadata();
+        std::fs::write(
+            publish.path().join("emucap-mesen-build.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let adapter = root.path().join("adapters/mesen2");
+        std::fs::create_dir_all(&adapter).unwrap();
+        std::fs::write(
+            adapter.join("upstream.lock"),
+            format!(
+                "MESEN_REPO={}\nMESEN_TAG={}\nMESEN_COMMIT={}\nMESEN_HOST_API={}\nMESEN_PATCHSET_SHA256={}\n",
+                metadata.upstream,
+                metadata.tag,
+                "ffffffffffffffffffffffffffffffffffffffff",
+                metadata.host_api,
+                metadata.patchset_sha256
+            ),
+        )
+        .unwrap();
+
+        let error = require_compatible_build(root.path(), &binary).unwrap_err();
+        assert!(error.to_string().contains("mesen-patch-required"));
     }
 
     #[cfg(unix)]
@@ -531,24 +782,14 @@ mod tests {
     /// Run `f` with `EMUCAP_EMU_HOME` and `EMUCAP_GBA_BIOS` set as given (both restored after),
     /// under the shared env lock so it does not race other env-touching tests.
     fn with_gba_env<T>(emu_home: &Path, gba_bios: Option<&Path>, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let old_home = std::env::var_os("EMUCAP_EMU_HOME");
-        let old_bios = std::env::var_os("EMUCAP_GBA_BIOS");
+        let _guard = lock_env();
+        let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_GBA_BIOS"]);
         std::env::set_var("EMUCAP_EMU_HOME", emu_home);
         match gba_bios {
             Some(p) => std::env::set_var("EMUCAP_GBA_BIOS", p),
             None => std::env::remove_var("EMUCAP_GBA_BIOS"),
         }
-        let out = f();
-        match old_home {
-            Some(v) => std::env::set_var("EMUCAP_EMU_HOME", v),
-            None => std::env::remove_var("EMUCAP_EMU_HOME"),
-        }
-        match old_bios {
-            Some(v) => std::env::set_var("EMUCAP_GBA_BIOS", v),
-            None => std::env::remove_var("EMUCAP_GBA_BIOS"),
-        }
-        out
+        f()
     }
 
     /// Build the (`Launch`, `PreparedPortable`) inputs `provision_gba_bios` needs. `portable.binary`
@@ -588,7 +829,10 @@ mod tests {
 
         let settings = read(&portable.settings);
         assert_eq!(settings["Debug"]["ScriptWindow"]["AllowIoOsAccess"], true);
-        assert_eq!(settings["Debug"]["ScriptWindow"]["AllowNetworkAccess"], true);
+        assert_eq!(
+            settings["Debug"]["ScriptWindow"]["AllowNetworkAccess"],
+            true
+        );
         assert_eq!(settings["Debug"]["ScriptWindow"]["ScriptTimeout"], 60);
         assert_eq!(settings["Preferences"]["SingleInstance"], false);
         assert_eq!(
@@ -617,7 +861,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lua = dir.path().join("emucap-snes.lua");
         let log = dir.path().join("launch.log");
-        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        let (mut l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        l.content = "/unused/rom.sfc";
 
         ensure_gba_portable_settings(&l, &portable).unwrap();
 
@@ -661,7 +906,8 @@ mod tests {
         // BIOS at the documented shared location, EMUCAP_GBA_BIOS unset.
         let src = dir.path().join("firmware/gba_bios.bin");
         std::fs::create_dir_all(src.parent().unwrap()).unwrap();
-        std::fs::write(&src, b"BIOSBYTES").unwrap();
+        let bios = vec![0xA5; 0x4000];
+        std::fs::write(&src, &bios).unwrap();
         let lua = dir.path().join("emucap-gba.lua");
         let log = dir.path().join("launch.log");
         let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
@@ -674,7 +920,7 @@ mod tests {
             .parent()
             .unwrap()
             .join("Firmware/gba_bios.bin");
-        assert_eq!(std::fs::read(&staged).unwrap(), b"BIOSBYTES");
+        assert_eq!(std::fs::read(&staged).unwrap(), bios);
     }
 
     #[test]
@@ -690,12 +936,13 @@ mod tests {
             .unwrap()
             .join("Firmware/gba_bios.bin");
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
-        std::fs::write(&staged, b"PRIORRUN").unwrap();
+        let bios = vec![0x5A; 0x4000];
+        std::fs::write(&staged, &bios).unwrap();
 
         with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
 
         // Accepted as-is: not overwritten, not failed.
-        assert_eq!(std::fs::read(&staged).unwrap(), b"PRIORRUN");
+        assert_eq!(std::fs::read(&staged).unwrap(), bios);
     }
 
     #[test]
@@ -722,12 +969,48 @@ mod tests {
     }
 
     #[test]
+    fn provision_rejects_wrong_sized_bios_before_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        let bios = dir.path().join("wrong-size.bin");
+        std::fs::write(&bios, b"not a GBA BIOS").unwrap();
+
+        let err = with_gba_env(dir.path(), Some(&bios), || {
+            provision_gba_bios(&l, &portable)
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!portable
+            .binary
+            .parent()
+            .unwrap()
+            .join("Firmware/gba_bios.bin")
+            .exists());
+    }
+
+    #[test]
     fn provision_skips_non_gba_lua_entry() {
         let dir = tempfile::tempdir().unwrap();
         let lua = dir.path().join("emucap-snes.lua");
         let log = dir.path().join("launch.log");
-        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        let (mut l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        l.content = "/unused/rom.sfc";
         // No BIOS anywhere, but a non-GBA entry must not attempt provisioning.
         with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
+    }
+
+    #[test]
+    fn gba_content_provisions_even_when_entry_is_wrapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("idle-error-once.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+
+        ensure_gba_portable_settings(&l, &portable).unwrap();
+
+        assert!(portable.settings.is_file());
     }
 }

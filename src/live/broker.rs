@@ -176,6 +176,10 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         Err(_) => return,
     };
     let result = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    let identity = super::link::EmulatorIdentity::from_hello(&result);
+    if identity.adapter.as_deref() == Some("mesen2-live") && !identity.has_mesen_native_halt() {
+        return;
+    }
     let methods: Vec<String> = result
         .get("methods")
         .and_then(|m| m.as_array())
@@ -376,7 +380,19 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
     );
     result.insert("methods".into(), serde_json::json!(methods));
     if let Some(obj) = identity.as_object() {
-        for key in ["system", "adapter", "name", "session_token", "content"] {
+        for key in [
+            "system",
+            "adapter",
+            "build",
+            "name",
+            "session_token",
+            "content",
+            "launch_id",
+            "memory_types",
+            "host_features",
+            "mesen_host_api",
+            "host_build",
+        ] {
             if let Some(v) = obj.get(key) {
                 result.insert(key.into(), v.clone());
             }

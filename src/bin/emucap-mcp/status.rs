@@ -365,6 +365,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
         "adapters": {
             "mesen2": {
                 "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "mesen2", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
                 "launch": abs_path_json(&root, &["adapters", "mesen2", "launch.sh"]),
                 "windows_script": abs_path_json(&root, &["adapters", "mesen2", "launch.ps1"]),
                 "platform_launch": mesen_launcher.display().to_string(),

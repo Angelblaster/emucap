@@ -11,7 +11,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$lua  = Join-Path $here "emucap-snes.lua"
+$lua  = if ($env:EMUCAP_MESEN_LUA) { $env:EMUCAP_MESEN_LUA } else { Join-Path $here "emucap-snes.lua" }
 
 function Get-LocalTcpConnections([int]$LocalPort) {
   if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
@@ -80,10 +80,37 @@ function Replace-PortableFile([string]$Source, [string]$Destination) {
   }
 }
 
+function Replace-PortableDirectory([string]$Source, [string]$Destination) {
+  $parent = Split-Path -Parent $Destination
+  New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  $suffix = [System.Guid]::NewGuid().ToString("N")
+  $tmp = "$Destination.tmp.$suffix"
+  $backup = "$Destination.old.$suffix"
+  $hadExisting = Test-Path -LiteralPath $Destination
+  try {
+    Copy-Item -LiteralPath $Source -Destination $tmp -Recurse
+    if ($hadExisting) { Move-Item -LiteralPath $Destination -Destination $backup }
+    Move-Item -LiteralPath $tmp -Destination $Destination
+    if ($hadExisting -and (Test-Path -LiteralPath $backup)) {
+      Remove-Item -LiteralPath $backup -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  } catch {
+    if ((Test-Path -LiteralPath $backup) -and -not (Test-Path -LiteralPath $Destination)) {
+      Move-Item -LiteralPath $backup -Destination $Destination -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $tmp) {
+      Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    throw
+  }
+}
+
 function Get-MesenCandidatePaths {
   if ($env:MESEN_BIN) {
     $env:MESEN_BIN
   }
+
+  Join-Path $here "work\mesen\bin\win-x64\Release\Mesen.exe"
 
   foreach ($key in @("LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)", "USERPROFILE")) {
     $base = [Environment]::GetEnvironmentVariable($key)
@@ -114,7 +141,25 @@ foreach ($candidate in @(Get-MesenCandidatePaths)) {
   }
 }
 if (-not $sourceMesen -or -not (Test-Path -LiteralPath $sourceMesen -PathType Leaf)) {
-  throw "Mesen.exe not found; install Mesen in a common user/program-files path, add it to PATH, or set MESEN_BIN to the full path"
+  throw "compatible Mesen.exe not found; run adapters/mesen2/build.ps1 or set MESEN_BIN"
+}
+
+$metadataPath = Join-Path (Split-Path -Parent $sourceMesen) "emucap-mesen-build.json"
+if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+  throw "mesen-patch-required: compatible sidecar missing at $metadataPath; run adapters/mesen2/build.ps1"
+}
+$metadata = Get-Content -Raw -LiteralPath $metadataPath | ConvertFrom-Json
+$lockValues = @{}
+foreach ($line in Get-Content -LiteralPath (Join-Path $here "upstream.lock")) {
+  if ($line -match '^([^=]+)=(.*)$') { $lockValues[$Matches[1]] = $Matches[2] }
+}
+if ($metadata.upstream -ne $lockValues.MESEN_REPO -or
+    $metadata.tag -ne $lockValues.MESEN_TAG -or
+    $metadata.commit -ne $lockValues.MESEN_COMMIT -or
+    [int]$metadata.host_api -ne [int]$lockValues.MESEN_HOST_API -or
+    $metadata.patchset_sha256 -ne $lockValues.MESEN_PATCHSET_SHA256 -or
+    $metadata.patchset_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+  throw "mesen-patch-required: $metadataPath does not match upstream.lock"
 }
 
 if ($env:EMUCAP_EMU_HOME) {
@@ -153,10 +198,18 @@ if ($busy.Count -gt 0) {
 
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 $mesen = Join-Path $portableDir (Split-Path -Leaf $sourceMesen)
-Replace-PortableFile $sourceMesen $mesen
+$sourceDir = (Resolve-Path -LiteralPath (Split-Path -Parent $sourceMesen)).Path
+$portableFull = [System.IO.Path]::GetFullPath($portableDir)
+if ($portableFull.Equals($sourceDir, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $portableFull.StartsWith($sourceDir + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+  throw "portable destination must not be inside source publish directory: $portableFull"
+}
+Replace-PortableDirectory $sourceDir $portableDir
 
 $settings = Join-Path $portableDir "settings.json"
-@'
+$isGba = ((Split-Path -Leaf $lua) -eq "emucap-gba.lua") -or ([System.IO.Path]::GetExtension($Rom) -ieq ".gba")
+if ($isGba) {
+  @'
 {
   "Debug": {
     "ScriptWindow": {
@@ -171,10 +224,31 @@ $settings = Join-Path $portableDir "settings.json"
 }
 '@ | Set-Content $settings -Encoding UTF8
 
+  $firmwareDir = Join-Path $portableDir "Firmware"
+  $firmwareDestination = Join-Path $firmwareDir "gba_bios.bin"
+  $explicitBios = $env:EMUCAP_GBA_BIOS
+  $biosSource = if ($explicitBios) { $explicitBios } else { Join-Path $emuBase "firmware\gba_bios.bin" }
+  $stagedIsValid = (Test-Path -LiteralPath $firmwareDestination -PathType Leaf) -and
+    ((Get-Item -LiteralPath $firmwareDestination).Length -eq 16384)
+  if ($explicitBios -or -not $stagedIsValid) {
+    if (-not (Test-Path -LiteralPath $biosSource -PathType Leaf)) {
+      throw "GBA needs gba_bios.bin: set EMUCAP_GBA_BIOS or place it at $biosSource"
+    }
+    $biosSize = (Get-Item -LiteralPath $biosSource).Length
+    if ($biosSize -ne 16384) {
+      throw "GBA BIOS must be exactly 16384 bytes: $biosSource ($biosSize bytes)"
+    }
+    New-Item -ItemType Directory -Force -Path $firmwareDir | Out-Null
+    Replace-PortableFile $biosSource $firmwareDestination
+  }
+}
+
 # Launch Mesen with the ROM + Lua; the Lua reads EMUCAP_PORT (and the rest) from the environment.
 $env:EMUCAP_ADAPTER_DIR = $here
-  $env:EMUCAP_PORT    = "$Port"
+$env:EMUCAP_PORT = "$Port"
 $env:EMUCAP_CONTENT = $Rom
+$env:EMUCAP_MESEN_UPSTREAM_COMMIT = [string]$metadata.commit
+$env:EMUCAP_MESEN_PATCHSET_SHA256 = [string]$metadata.patchset_sha256
 if ($Name) { $env:EMUCAP_NAME = $Name }
 $buildHash = "unknown"
 try {
@@ -206,7 +280,17 @@ if (-not $env:EMUCAP_SESSION_TOKEN -and (Test-Path -LiteralPath $tokenFile -Path
   "  wait=${waitSeconds}s",
   "  post_connect_grace=${postConnectGraceSeconds}s"
 ) | Set-Content -LiteralPath $log -Encoding UTF8
-$started = Start-Process -FilePath $mesen -ArgumentList @($Rom, $lua) -WorkingDirectory $portableDir -PassThru
+$mesenArgs = @(
+  $Rom,
+  $lua,
+  "--debug.scriptWindow.allowIoOsAccess=true",
+  "--debug.scriptWindow.allowNetworkAccess=true",
+  "--debug.scriptWindow.scriptTimeout=60",
+  "--preferences.singleInstance=false",
+  "--snes.port1.type=SnesController",
+  "--donotSaveSettings"
+)
+$started = Start-Process -FilePath $mesen -ArgumentList $mesenArgs -WorkingDirectory $portableDir -PassThru
 Set-Content -LiteralPath $pidFile -Value "$($started.Id)" -Encoding ASCII
 
 $connectedPid = $null

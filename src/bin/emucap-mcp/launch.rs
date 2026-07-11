@@ -163,20 +163,44 @@ fn env_path_or_app_matches(key: &str, path: &Path, exe_name: &str) -> bool {
     })
 }
 
-fn mesen_binary_precondition_from(resolved: Option<PathBuf>) -> serde_json::Value {
-    simple_binary_precondition(resolved, |path| {
-        if env_path_or_app_matches("MESEN_BIN", path, "Mesen") {
-            "MESEN_BIN"
-        } else if path_matches_candidates(path, mesen_launch::default_install_candidates()) {
-            "default_install"
-        } else {
-            "PATH"
-        }
-    })
+fn mesen_binary_precondition_from(root: &Path, resolved: Option<PathBuf>) -> serde_json::Value {
+    let Some(path) = resolved else {
+        return serde_json::json!({
+            "available": false,
+            "source": null,
+            "kind": "binary-not-found",
+        });
+    };
+    let source = if env_path_or_app_matches("MESEN_BIN", &path, "Mesen") {
+        "MESEN_BIN"
+    } else if path_matches_candidates(&path, mesen_launch::local_build_candidates(root)) {
+        "repo_build"
+    } else if path_matches_candidates(&path, mesen_launch::default_install_candidates()) {
+        "default_install"
+    } else {
+        "PATH"
+    };
+    match mesen_launch::require_compatible_build(root, &path) {
+        Ok(build) => serde_json::json!({
+            "available": true,
+            "path": path.display().to_string(),
+            "source": source,
+            "host_api": build.host_api,
+            "upstream_commit": build.commit,
+            "patchset_sha256": build.patchset_sha256,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "path": path.display().to_string(),
+            "source": source,
+            "kind": "mesen-patch-required",
+            "error": error.to_string(),
+        }),
+    }
 }
 
-fn mesen_binary_precondition() -> serde_json::Value {
-    mesen_binary_precondition_from(mesen_launch::resolve_binary())
+fn mesen_binary_precondition(root: &Path) -> serde_json::Value {
+    mesen_binary_precondition_from(root, mesen_launch::resolve_binary(root))
 }
 
 fn flycast_binary_precondition_from(resolved: Option<PathBuf>) -> serde_json::Value {
@@ -294,7 +318,7 @@ fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
 
 fn adapter_binary_precondition(adapter: &str, root: &Path) -> serde_json::Value {
     match adapter {
-        "mesen2" => mesen_binary_precondition(),
+        "mesen2" => mesen_binary_precondition(root),
         "mednafen" => mednafen_binary_precondition(root),
         "flycast" => flycast_binary_precondition(),
         "mame_pc98" => mame_binary_precondition(root),
@@ -314,10 +338,10 @@ fn build_required_precondition(
     }
     match adapter {
         "mesen2" => serde_json::json!(format!(
-            "{} 또는 MESEN_BIN/default install/PATH의 Mesen 실행파일 필요(macOS는 Mesen.app도 가능) — 미충족이면 launcher가 binary-not-found로 실패",
-            paths["adapters"][adapter]["launch"]
+            "{}로 pinned compatible Mesen을 먼저 빌드해야 함(MESEN_BIN override도 matching sidecar + runtime codeBreakIdle 필요)",
+            paths["adapters"][adapter]["build"]
                 .as_str()
-                .unwrap_or("adapter launcher")
+                .unwrap_or("adapters/mesen2/build.sh")
         )),
         "mednafen" => serde_json::json!(format!(
             "{} 선행 빌드 또는 MEDNAFEN_BIN/default install/PATH의 Mednafen 바이너리 필요 — 미충족이면 launcher가 binary-not-found로 실패",
@@ -1423,8 +1447,23 @@ fn launch_mesen(
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
-    let Some(binary) = emucap::launch::mesen::resolve_binary() else {
-        return serde_json::json!({ "launched": false, "reason": "Mesen 바이너리 미발견 — MESEN_BIN을 Mesen 실행파일 또는 macOS Mesen.app 경로로 설정하라" });
+    let Some(binary) = emucap::launch::mesen::resolve_binary(&root) else {
+        return serde_json::json!({
+            "launched": false,
+            "kind": "mesen-patch-required",
+            "reason": "compatible Mesen 바이너리 미발견 — adapters/mesen2/build.sh(Windows: build.ps1)를 실행하라"
+        });
+    };
+    let host_build = match emucap::launch::mesen::require_compatible_build(&root, &binary) {
+        Ok(build) => build,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "kind": "mesen-patch-required",
+                "error": error.to_string(),
+                "next_action": if cfg!(windows) { "adapters/mesen2/build.ps1" } else { "adapters/mesen2/build.sh" },
+            });
+        }
     };
     // 시스템별 얇은 엔트리 스크립트(SYS config 설정 후 emucap-core.lua를 require). Mesen은 SNES/GG/GB(+GBC)/GBA/NES 처리.
     let entry = match system {
@@ -1453,6 +1492,7 @@ fn launch_mesen(
             "pid": pid,
             "port": port,
             "binary": binary.display().to_string(),
+            "host_build": host_build,
             "log": log.display().to_string(),
             "emucap_home": emucap::launch::emu_home_dir("mesen2", port).display().to_string(),
             "isolation": "Mesen runs from an emucap-owned portable copy; user settings.json is not edited.",

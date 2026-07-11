@@ -36,6 +36,22 @@ fn link_helper_recovers_from_poison() {
 }
 
 #[test]
+fn server_instructions_publish_the_mesen_runtime_contract() {
+    for required in [
+        "host API 1",
+        "code_break_idle",
+        "native_halt_service",
+        "native halt 중 save/load_state를 현재 거부",
+        "breakpoint `snapshot`",
+    ] {
+        assert!(
+            SERVER_INSTRUCTIONS.contains(required),
+            "server instructions omit required Mesen contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn verify_determinism_returns_result_without_ledger() {
     // 단일-writer: 제어 MCP는 원장에 쓰지 않고 결과만 반환한다(원장 바인딩·gate 기록 없음).
     let link: SharedLink = Arc::new(Mutex::new(

@@ -119,6 +119,27 @@ fn write_hello_response_with_token(w: &mut TcpStream, line: &str, methods: &[&st
     .unwrap();
 }
 
+fn write_mesen_hello_response(w: &mut TcpStream, line: &str, host_features: &[&str]) {
+    let (id, token) = hello_parts(line);
+    writeln!(
+        w,
+        "{}",
+        serde_json::json!({
+            "id": id,
+            "ok": true,
+            "result": {
+                "protocol_version": 1,
+                "methods": ["status"],
+                "session_token": token,
+                "adapter": "mesen2-live",
+                "mesen_host_api": 1,
+                "host_features": host_features,
+            }
+        })
+    )
+    .unwrap();
+}
+
 /// Lua 역할: 접속해서 hello에 답하고, 이어 read_memory 요청에 응답한다.
 fn fake_lua(addr: String, ready: std::sync::mpsc::Sender<()>) {
     let stream = TcpStream::connect(addr).unwrap();
@@ -156,6 +177,27 @@ fn tcp_link_does_hello_and_call() {
         .unwrap();
     assert_eq!(out["hex"], "00ff");
     assert_eq!(link.capabilities().methods, vec!["read_memory".to_string()]);
+    h.join().unwrap();
+}
+
+#[test]
+fn tcp_link_rejects_mesen_without_native_halt_features() {
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let h = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_mesen_hello_response(&mut writer, &hello, &["code_break_idle"]);
+    });
+
+    let error = link.call("status", serde_json::json!({})).unwrap_err();
+    assert!(
+        matches!(error, LinkError::Protocol(ref message) if message.contains("mesen-patch-required")),
+        "incompatible Mesen must fail the runtime feature gate: {error:?}"
+    );
     h.join().unwrap();
 }
 

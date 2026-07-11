@@ -15,22 +15,30 @@ local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
 -- 먼저 emucap-mcp 서버가 떠 있어야 한다(기본 포트 47800).
 --
--- freeze는 breakExecution + codeBreak로 건다(spin 무한대기는 1초 워치독으로 불가).
+-- freeze는 breakExecution + compatible Mesen host의 native debugger halt로 건다. codeBreak/codeBreakIdle
+-- callback은 매번 bounded service 한 번만 수행해 Lua watchdog을 유지하면서 guest는 전진시키지 않는다.
 -- 이 파일은 상태기계·freeze-step·읽기·쓰기·입력을 다룬다. 지연명령·세이브스테이트·
 -- 브레이크포인트는 별도로 얹는다.
 
 local socket = require("socket.core")
 local Tx = require("emucap_tx")
 
+assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil,
+  "emucap-core: codeBreakIdle이 없는 Mesen host는 live control 미지원 — adapters/mesen2/build.sh로 호환 host를 빌드하라")
+
 local HOST = "127.0.0.1"
 -- 포트: 교차-ROM 2-인스턴스를 위해 EMUCAP_PORT로 덮어쓸 수 있다(없으면 47800).
 local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
+local MESEN_HOST_API = 1
+local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
+local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
 -- 데드맨은 operator opt-in이다. pause/BP 성공 뒤 agent 왕복 지연만으로 실행을 재개하면 frozen
 -- persistence 계약을 깨므로 기본은 0(비활성). 양수를 명시한 launch만 그 비활동 시간 뒤 자동 resume한다.
 -- hotkey freeze는 값과 무관하게 항상 데드맨 면제.
 local MAX_FREEZE_MS = tonumber(os.getenv("EMUCAP_DEADMAN_MS") or "") or 0
-local FREEZE_BUDGET_MS = 800  -- 워치독(1초) 마진: 이 안에서 codeBreak 재무장
+local HALT_SERVICE_INTERVAL_MS = 10  -- native SleepUntilResume의 idle callback 최소 대기 간격
+local function wall_ms() return socket.gettime() * 1000 end
 -- freeze 중 연결끊김(서버 재시작//mcp 재연결) 시 freeze를 유지한 채 재접속을 시도해 장면을 보존한다.
 -- transport loss만으로 guest 실행을 바꾸지 않는 것이 기본이다. 양수를 명시한 launch만 그 시간 뒤
 -- auto-resume하고, 0은 재접속까지 무기한 freeze 유지다.
@@ -53,10 +61,9 @@ local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, froz
 local STATE = "running"       -- "running" | "frozen"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
 local freeze_reason = "paused"
--- frozen 중 get_state를 서빙하는 freeze 시점 스냅샷. freeze 진입 첫 codeBreak에서(트레드밀 step(1) 재무장 전)
--- 한 번 캡처한다 — lazy(첫 get_state)로 잡으면 그 사이 재무장 step(1) 드리프트가 섞인다. live emu.getState()는
--- 비싸 매 서빙마다 부르면 codeBreak 예산(FREEZE_BUDGET)을 넘겨 step(1) 드리프트를 유발하므로, frozen에선 이
--- 스냅샷에서 서빙한다. 명시적 step/resume에서만 무효화 → baseline 트레드밀 step(1)엔 유지돼 안정 레퍼런스가 된다.
+-- frozen 중 get_state를 서빙하는 freeze 시점 스냅샷. freeze 진입 첫 codeBreak에서 한 번 캡처해
+-- 정지 진입의 linearization point를 고정하고, 비싼 emu.getState() 직렬화를 요청마다 반복하지 않는다.
+-- native halt 중 guest time은 불변이므로 명시적 step/resume에서만 이 스냅샷을 무효화한다.
 local freeze_snapshot = nil
 local pending_step_id = nil   -- step(n) 완료 응답 대기
 local step_remaining = 0       -- step(n)의 남은 단위(청크로 나눠 진행)
@@ -405,8 +412,16 @@ function handlers.hello()
     system = SYS.system,
     adapter = "mesen2-live",
     build = os.getenv("EMUCAP_BUILD_HASH") or "unknown",  -- launch가 넘긴 emucap git hash(status.emulator_build)
+    mesen_host_api = MESEN_HOST_API,
+    host_features = { "code_break_idle", "native_halt_service" },
     methods = method_list,
   }
+  if MESEN_UPSTREAM_COMMIT then
+    result.host_build = {
+      upstream_commit = MESEN_UPSTREAM_COMMIT,
+      patchset_sha256 = MESEN_PATCHSET_SHA256 or "unknown",
+    }
+  end
   -- memory_types: read_memory가 받는 memory_type = emu.memType의 키 전체. 정적 추측이 아니라 Mesen
   -- API의 실제 메모리 타입을 런타임 열거해 advertise한다(능력 발견). MCP가
   -- status.memory_types로 표면화. emu.memType이 없으면 생략(graceful — MCP가 빈 목록 처리).
@@ -477,7 +492,7 @@ function handlers.screenshot()
 end
 
 -- frozen이면 freeze 시점 스냅샷에서, running이면 live로 상태를 준다. 스냅샷은 freeze 진입 첫 codeBreak에서
--- 잡히므로(위 freeze_snapshot 주석) 드리프트 없는 freeze 지점 상태다. 아래 `if not freeze_snapshot`은 방어적
+-- 잡히므로(위 freeze_snapshot 주석) 정지 진입 지점 상태다. 아래 `if not freeze_snapshot`은 방어적
 -- fallback(어떤 이유로 codeBreak 전에 get_state가 오면) — 정상 경로에선 이미 채워져 있다.
 local function frozen_state()
   if STATE == "frozen" then
@@ -489,7 +504,7 @@ end
 
 -- get_state는 전 상태(레지스터·DMA·PPU·SPC 등 수백 필드)를 돌려준다. groups를 주면 키의
 -- 그룹 prefix(첫 "." 앞)로 걸러 토큰 비용을 줄인다. 예: groups=["cpu","ppu"]. frozen이면 freeze 시점
--- 스냅샷을 서빙해 get_state發 드리프트를 없앤다(baseline 트레드밀 드리프트는 남음 — 진짜 0-드리프트는 fork 필요).
+-- 스냅샷을 서빙한다. native halt 중에는 요청 사이 instruction/frame drift가 없다.
 function handlers.get_state(p)
   local st = frozen_state()
   if not (p.groups and #p.groups > 0) then
@@ -515,12 +530,20 @@ function handlers.status()
   local r = { connected = true, frame = frame, state = STATE }
   if STATE == "frozen" then r.reason = freeze_reason end   -- "hotkey"면 사용자가 로컬 핫키로 얼림
   r.freeze_policy = {
-    mode = "treadmill",
-    watchdog_rearm_ms = FREEZE_BUDGET_MS,
-    instruction_drift_per_rearm = 1,
+    mode = "native_halt_service",
+    service_event = "codeBreakIdle",
+    service_interval_ms = HALT_SERVICE_INTERVAL_MS,
+    instruction_drift = 0,
     idle_auto_resume_ms = MAX_FREEZE_MS,
     disconnect_auto_resume_ms = RECONNECT_GIVEUP_MS,
   }
+  if MESEN_UPSTREAM_COMMIT then
+    r.host_build = {
+      upstream_commit = MESEN_UPSTREAM_COMMIT,
+      patchset_sha256 = MESEN_PATCHSET_SHA256 or "unknown",
+      host_api = MESEN_HOST_API,
+    }
+  end
   -- 핫키 진단(Home "가끔 안 됨" 분간): freeze_key=키명, armed=무장여부, down=지금 눌림 감지중.
   -- Home을 눌렀는데 down=false면 창 포커스/키명 문제(로직 아님), down=true인데 freeze 안 되면 로직 버그.
   r.freeze_key = FREEZE_KEY or "off"
@@ -914,12 +937,12 @@ function handlers.set_breakpoint(p)
   -- 일어나는데 emu.createSavestate는 exec 콜백 컨텍스트 전용이고 이벤트·codeBreak 컨텍스트에선
   -- 실패하므로 히트 순간 세이브스테이트를 원자적으로 못 뜬다. 조용히 받아 no-op하면
   -- 호출자가 상태가 캡처된 줄 오인하므로 명시적으로 거부한다. 히트 순간 원자 캡처는 `snapshot` 스펙
-  -- (record_hit이 read로 이벤트에 담음), 전체 세이브스테이트는 poll_events로 히트를 받은 뒤 `save_state`
-  -- verb(전용 exec 콜백 on_io_exec로 안전하게 뜸)를 쓴다.
+  -- (record_hit이 read로 이벤트에 담음). 전체 세이브스테이트는 실행 중 `save_state`로 만들 수 있지만
+  -- breakpoint 히트 시점과 원자적이지 않다.
   if p.auto_savestate then
     return false, "unsupported",
       "auto_savestate는 BP 히트에서 미지원 — createSavestate는 exec 콜백 전용이라 read/write/이벤트/codeBreak 콜백에선 실패한다. "
-      .. "히트 순간 원자 캡처는 snapshot= 스펙을, 전체 상태는 poll_events로 히트 확인 후 save_state verb를 써라."
+      .. "히트 순간 원자 캡처는 snapshot= 스펙을 써라. 실행 중 save_state는 히트 시점과 원자적이지 않다."
   end
   local id = next_bp_id; next_bp_id = next_bp_id + 1
   -- NMI/IRQ: 메모리 접근이 아니라 이벤트(인터럽트 진입). exec BP가 못 잡는 NMI/VBlank 컨텍스트를
@@ -1270,7 +1293,7 @@ end
 -- 콜스택: 호출지 프레임 { pc, bank } 리스트, 바깥→안(안쪽이 마지막). "어떻게 여기 왔나" 즉답. bank은 pc가
 -- 페이징된 ROM 뱅크(GG/GB), 아니면 nil(SNES는 뱅크가 pc 안). 모든 Mesen 시스템이 균일하게 { pc, bank } 객체.
 -- 조회 시 SP로 한 번 더 정합(마지막 호출 이후 리턴한 프레임 정리). frozen이면 freeze 시점 스냅샷 SP를 쓴다
--- (live getState는 트레드밀로 드리프트해 depth를 틀리게 함 — get_state와 같은 frozen_state 경로).
+-- (live getState를 다시 호출하지 않아도 freeze 진입 시점과 같은 SP를 쓰도록 get_state와 frozen_state를 공유).
 function handlers.call_stack()
   if not HAS_CALLSTACK then
     return false, "unsupported", "call_stack not supported for " .. SYS.system .. " (no SP-based call-stack model for this ISA)"
@@ -1477,105 +1500,90 @@ local function do_step_chunk()
   end
 end
 
--- codeBreak: 멈춘 채 명령 서비스. 1초 워치독 내로 반드시 리턴.
-emu.addEventCallback(function()
+local function resume_from_freeze()
+  STATE = "running"
+  freeze_start_ms = nil
+  freeze_disc_ms = nil
+  freeze_snapshot = nil
+  emu.resume()
+end
+
+-- Native halt callback 한 번의 작업량은 항상 bounded다. TX flush, request, reconnect, deadman을
+-- 각각 최대 한 번만 처리하고 즉시 반환한다. 다음 기회는 Mesen의 SleepUntilResume가 guest 실행 없이
+-- codeBreakIdle을 다시 발생시킨다.
+local function service_frozen_once()
   if STATE ~= "frozen" then return end
 
-  -- callback 진입마다 미완성 응답을 먼저 한 번 진전시킨다. would-block이면 이 callback에서는
-  -- 더 send하지 않고 기존 FREEZE_BUDGET 안에서 service loop만 유지해 busy retry를 막는다.
-  local tx_blocked = false
-  if conn and Tx.pending(tx) then
-    tx_blocked = flush_tx() == "pending"
-  end
+  local now = wall_ms()
+  if not freeze_start_ms then freeze_start_ms = now end
+  if not freeze_snapshot then freeze_snapshot = emu.getState() end
 
-  -- 진행 중 step의 다음 청크 또는 완료(직전 청크의 emu.step이 끝나 재진입)
-  if pending_step_id and not Tx.pending(tx) then
+  -- 미완성 response cursor를 한 번만 전진시킨다. would-block이면 다음 idle event까지 기다린다.
+  if conn and Tx.pending(tx) then flush_tx() end
+
+  -- 직전 explicit step 청크가 다시 halt한 지점. response가 막혀 있으면 guest를 더 진행하지 않는다.
+  if pending_step_id then
+    if Tx.pending(tx) then return end
     if step_remaining <= 0 then
       reply_ok(pending_step_id, { status = "completed", frame = frame })
       pending_step_id = nil
-      -- 아래 정상 freeze 스핀으로 진행
     else
-      -- 다음 청크: keepalive로 서버 타임아웃을 막고 이어서 진행
       send_line(string.format('{"id":%d,"ok":true,"result":{"status":"working"}}', pending_step_id))
-      flush_tx()
       do_step_chunk()
-      return
     end
+    return
   end
 
-  -- 데드맨은 "마지막 명령 이후" 경과로 잰다. start_ms를 콜백 진입마다 새로 잡으면
-  -- 워치독 회피(FREEZE_BUDGET_MS)가 매번 codeBreak를 재무장하며 카운터를 리셋해 데드맨이
-  -- 영영 발동하지 않는다. freeze 진입 시 한 번 잡고, 명령을 받을 때만 갱신한다.
-  if not freeze_start_ms then
-    freeze_start_ms = os.clock() * 1000
-    -- freeze 시점 스냅샷을 이 첫 codeBreak에서 잡는다 — 트레드밀 step(1) 재무장(아래 FREEZE_BUDGET 분기)과
-    -- 이번 콜백의 예산 타이머(cb_start_ms) 시작 전이라, CPU가 아직 freeze 지점에 있다. lazy(첫 get_state) 캡처면
-    -- freeze~첫 get_state 사이에 재무장 step(1)이 끼어 드리프트가 섞이므로 여기서 선캡처한다. getState는 한 번뿐이라
-    -- 예산에도 안 걸린다. step/resume에서만 무효화(freeze_snapshot=nil)해 baseline 트레드밀엔 유지된다.
-    if not freeze_snapshot then freeze_snapshot = emu.getState() end
+  -- 로컬 resume 핫키(frozen→running 토글). native idle 간격이 poll throttle 역할을 한다.
+  if FREEZE_KEY and freeze_key_ok then
+    local fk = freeze_key_down()
+    if fk and not prev_freeze_key then
+      prev_freeze_key = fk
+      if #events < EVENT_CAP then events[#events + 1] = { type = "user_resume", reason = "hotkey", frame = frame }
+      else dropped = dropped + 1 end
+      resume_from_freeze()
+      return
+    end
+    prev_freeze_key = fk
   end
-  local cb_start_ms = os.clock() * 1000  -- 이번 콜백 진입(워치독 회피용 — 매 진입 리셋)
-  local last_key_ms = 0                   -- freeze 핫키 폴 throttle(스핀이 빨라 매 반복 폴은 과함)
-  while true do
-    -- 워치독 회피(명령 버스트): poll_line이 명령을 연속으로 반환하면 아래 `if line` 분기만 반복돼 예산
-    -- 재무장 검사(elseif)에 도달하지 못한 채 누적 실행이 1초 워치독을 넘겨 스크립트가 죽는다(poll_line에서
-    -- "Maximum execution time exceeded"). 최상단에서 명령 유무와 무관하게 예산 초과면 codeBreak를 재무장하고
-    -- 반환한다 — 큐에 남은 명령은 다음 codeBreak 진입에서 이어 서비스한다(스텝 1 드리프트는 기존 재무장과 동일).
-    if (os.clock() * 1000 - cb_start_ms) >= FREEZE_BUDGET_MS then
-      emu.step(1, emu.stepType.step); return
-    end
-    -- 로컬 resume 핫키(frozen→running 토글). 스핀이 매우 빠르니 ~16ms마다만 폴(라이징 에지 1회).
-    if FREEZE_KEY and freeze_key_ok then
-      local now = os.clock() * 1000
-      if now - last_key_ms >= 16 then
-        last_key_ms = now
-        local fk = freeze_key_down()
-        if fk and not prev_freeze_key then
-          prev_freeze_key = fk
-          if #events < EVENT_CAP then events[#events + 1] = { type = "user_resume", reason = "hotkey", frame = frame }
-          else dropped = dropped + 1 end
-          STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
-        end
-        prev_freeze_key = fk
-      end
-    end
-    if conn and Tx.pending(tx) and not tx_blocked then
-      tx_blocked = flush_tx() == "pending"
-    end
-    local line = poll_line()
-    if line then
-      freeze_start_ms = os.clock() * 1000                     -- 활동 — 비활동 타이머 리셋
-      freeze_disc_ms = nil                                    -- 응답 수신 = 재접속됨 → giveup 타이머 리셋
-      local act = handle_in_freeze(line)
-      if act == "resume" then STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return end
-      if act == "step" then do_step_chunk(); return end       -- 첫 청크 시작
-    elseif not conn then
-      -- 연결끊김(/mcp 재연결=서버 재시작 등)이면 freeze를 유지한 채 재접속을 시도한다(장면 보존 —
-      -- 즉시 resume하면 공들인 장면을 흘려버린다). 포트영속 서버는 같은 포트로 돌아오므로 connect가
-      -- 성공하고 다음 poll_line이 hello를 받아 정상화된다.
-      local now = os.clock() * 1000
-      freeze_disc_ms = freeze_disc_ms or now
-      -- operator가 giveup을 명시했으면 그 경계에서 resume. 0이면 transport loss와 무관하게 유지.
-      if RECONNECT_GIVEUP_MS > 0 and now - freeze_disc_ms >= RECONNECT_GIVEUP_MS then
-        freeze_disc_ms = nil; STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
-      end
-      -- 재접속은 0.5s마다만 시도(throttle) — 매 codeBreak connect 폭주 방지.
-      if now - last_reconnect_ms >= 500 then last_reconnect_ms = now; connect() end
-      -- 워치독: step(1)은 1명령 드리프트라, 매번이 아니라 FREEZE_BUDGET_MS 마진에서만 재무장(드리프트 1/800ms로
-      -- 최소화 — 장면 보존이 목적). 그 전엔 return하지 않고 스핀을 계속(다음 반복서 poll_line이 hello를 받음).
-      if now - cb_start_ms >= FREEZE_BUDGET_MS then emu.step(1, emu.stepType.step); return end
-    elseif freeze_reason ~= "hotkey" and MAX_FREEZE_MS > 0 and (os.clock() * 1000 - freeze_start_ms) >= MAX_FREEZE_MS then
-      -- operator opt-in 데드맨(명령 없이 경과 → 자동 resume). hotkey freeze는 제외한다.
-      -- `EMUCAP_DEADMAN_MS<=0`이면 pause/BP도 명시적 resume/step/reset 전까지 유지한다.
-      STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
-    elseif (os.clock() * 1000 - cb_start_ms) >= FREEZE_BUDGET_MS then
-      -- 워치독 회피: codeBreak 재무장. step(1)은 1명령 전진(드리프트). breakExecution 재무장도
-      -- 0드리프트가 아니라(서비스하려면 CPU가 조금 돌아야 함) step(1) 유지. 히트 순간의 정확한
-      -- 상태가 필요하면 set_breakpoint의 snapshot으로 atomic 캡처하라(드리프트·데드맨 면역).
-      emu.step(1, emu.stepType.step); return
-    end
+
+  -- 호스트는 request를 직렬화한다. idle callback 하나는 완성된 NDJSON request 한 건만 소비한다.
+  local line = poll_line()
+  if line then
+    freeze_start_ms = wall_ms()
+    freeze_disc_ms = nil
+    local act = handle_in_freeze(line)
+    if act == "resume" then resume_from_freeze(); return end
+    if act == "step" then do_step_chunk(); return end
   end
+
+  now = wall_ms()
+  if not conn then
+    -- transport loss는 freeze ownership을 해제하지 않는다. operator가 명시한 giveup만 release event다.
+    freeze_disc_ms = freeze_disc_ms or now
+    if RECONNECT_GIVEUP_MS > 0 and now - freeze_disc_ms >= RECONNECT_GIVEUP_MS then
+      resume_from_freeze()
+      return
+    end
+    if now - last_reconnect_ms >= 500 then
+      last_reconnect_ms = now
+      connect()
+    end
+  elseif freeze_reason ~= "hotkey" and MAX_FREEZE_MS > 0 and now - freeze_start_ms >= MAX_FREEZE_MS then
+    -- operator opt-in deadman. hotkey freeze와 기본값(0)은 명시적 release까지 영속한다.
+    resume_from_freeze()
+  end
+end
+
+-- 최초 codeBreak는 freeze 진입 또는 explicit step 청크 완료의 linearization point다.
+emu.addEventCallback(function()
+  service_frozen_once()
 end, emu.eventType.codeBreak)
+
+-- compatible host의 native debugger wait loop가 guest를 전진시키지 않고 반복 호출한다.
+emu.addEventCallback(function()
+  service_frozen_once()
+end, emu.eventType.codeBreakIdle)
 
 -- 입력 적용: ROM이 읽기 직전인 inputPolled에서 주입한 입력을 덮어쓴다.
 emu.addEventCallback(function()

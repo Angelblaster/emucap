@@ -382,6 +382,12 @@ fn handshake_stream(
         )));
     }
     let identity = super::link::EmulatorIdentity::from_hello(&caps_val);
+    if identity.adapter.as_deref() == Some("mesen2-live") && !identity.has_mesen_native_halt() {
+        return Err(LinkError::Protocol(
+            "mesen-patch-required: Mesen hello lacks code_break_idle/native_halt_service"
+                .to_string(),
+        ));
+    }
     if let Some(expected) = expected_session_token {
         if identity.session_token.as_deref() != Some(expected) {
             return Err(LinkError::IdentityMismatch {

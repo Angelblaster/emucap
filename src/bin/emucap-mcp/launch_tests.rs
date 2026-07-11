@@ -46,6 +46,29 @@ fn make_executable(path: &Path) {
     }
 }
 
+fn write_mesen_sidecar(binary: &Path) {
+    let root = find_repo_root().expect("repo root");
+    let lock = std::fs::read_to_string(root.join("adapters/mesen2/upstream.lock")).unwrap();
+    let value = |key: &str| {
+        lock.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .to_string()
+    };
+    let sidecar = serde_json::json!({
+        "upstream": value("MESEN_REPO"),
+        "tag": value("MESEN_TAG"),
+        "commit": value("MESEN_COMMIT"),
+        "host_api": value("MESEN_HOST_API").parse::<u32>().unwrap(),
+        "patchset_sha256": value("MESEN_PATCHSET_SHA256"),
+    });
+    std::fs::write(
+        mesen_launch::build_metadata_path(binary),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
 fn path_ends_with_parts(path: &str, parts: &[&str]) -> bool {
     let mut suffix = PathBuf::new();
     for part in parts {
@@ -127,7 +150,7 @@ fn build_required_respects_existing_flycast_and_mame_binaries() {
     let paths = serde_json::json!({
         "adapters": {
             "mesen2": {
-                "launch": "/repo/adapters/mesen2/launch.sh"
+                "build": "/repo/adapters/mesen2/build.sh"
             },
             "flycast": {
                 "build": "/repo/adapters/flycast/build.sh"
@@ -148,7 +171,7 @@ fn build_required_respects_existing_flycast_and_mame_binaries() {
         build_required_precondition("mesen2", &paths, &serde_json::json!({"available": false}));
     assert!(mesen_missing
         .as_str()
-        .is_some_and(|s| s.contains("MESEN_BIN/default install/PATH")));
+        .is_some_and(|s| s.contains("pinned compatible Mesen")));
 
     let flycast_missing =
         build_required_precondition("flycast", &paths, &serde_json::json!({"available": false}));
@@ -172,7 +195,7 @@ fn default_install_preconditions_report_default_source() {
         .into_iter()
         .next()
     {
-        let precondition = mesen_binary_precondition_from(Some(path));
+        let precondition = mesen_binary_precondition_from(Path::new("/repo"), Some(path));
         assert_eq!(precondition["source"], "default_install");
     }
 
@@ -206,7 +229,7 @@ fn app_bundle_env_preconditions_report_env_source() {
     std::env::set_var("MESEN_BIN", &mesen_app);
     std::env::set_var("FLYCAST_APP", &flycast_app);
 
-    let mesen = mesen_binary_precondition_from(Some(mesen_bin));
+    let mesen = mesen_binary_precondition_from(dir.path(), Some(mesen_bin));
     let flycast = flycast_binary_precondition_from(Some(flycast_bin));
 
     match old_mesen {
@@ -481,6 +504,7 @@ fn launch_plan_blocks_missing_content_even_with_binary() {
         .join(if cfg!(windows) { "Mesen.exe" } else { "Mesen" });
     std::fs::write(&fake_mesen, b"fake").unwrap();
     make_executable(&fake_mesen);
+    write_mesen_sidecar(&fake_mesen);
     let old = std::env::var_os("MESEN_BIN");
     std::env::set_var("MESEN_BIN", &fake_mesen);
 
@@ -518,6 +542,7 @@ fn launch_plan_ready_when_content_and_binary_exist() {
     let rom = tmp.path().join("game.sfc");
     std::fs::write(&fake_mesen, b"fake").unwrap();
     make_executable(&fake_mesen);
+    write_mesen_sidecar(&fake_mesen);
     std::fs::write(&rom, b"fake snes rom").unwrap();
     let old = std::env::var_os("MESEN_BIN");
     std::env::set_var("MESEN_BIN", &fake_mesen);
@@ -537,7 +562,10 @@ fn launch_plan_ready_when_content_and_binary_exist() {
 
     assert_eq!(plan["ok"], true);
     assert_eq!(plan["content_exists"], true);
-    assert_eq!(plan["preconditions"]["adapter_binary"]["available"], true);
+    assert_eq!(
+        plan["preconditions"]["adapter_binary"]["available"], true,
+        "{plan}"
+    );
     assert_eq!(plan["ready_to_launch"], true);
     assert!(plan["launch_blockers"].as_array().unwrap().is_empty());
 }
@@ -919,7 +947,9 @@ impl EmulatorLink for RuntimeLaunchLink {
 fn successful_launch_publishes_generation_and_refuses_duplicate() {
     let _guard = env_lock();
     let tmp = tempfile::tempdir().unwrap();
-    let binary = tmp.path().join("fake-mesen");
+    let publish = tmp.path().join("publish");
+    std::fs::create_dir_all(&publish).unwrap();
+    let binary = publish.join("fake-mesen");
     let content = tmp.path().join("game.sfc");
     let capture = PathBuf::from(format!("{}.token", content.display()));
     let runtime_capture = PathBuf::from(format!("{}.runtime", content.display()));
@@ -929,6 +959,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     )
     .unwrap();
     make_executable(&binary);
+    write_mesen_sidecar(&binary);
     std::fs::write(&content, b"rom").unwrap();
 
     let _env = EnvRestore::new(&["MESEN_BIN", "EMUCAP_EMU_HOME"]);

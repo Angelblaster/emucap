@@ -7,7 +7,7 @@
 #   포트에 끼어들어 그 세션 에뮬레이터를 정리해버릴 수 있다(아래 안전장치가 막지만 포트는 맞게 줄 것).
 # 사용: launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME]
 # 환경변수:
-#   MESEN_BIN=/path/to/Mesen                  기본: OS별 일반 설치 경로 또는 PATH의 Mesen
+#   MESEN_BIN=/path/to/Mesen                  기본: local compatible build; override도 matching sidecar 필수
 #   EMUCAP_MESEN_LAUNCH_MODE=auto|open|direct 기본: auto(격리 copy를 direct 실행)
 #   EMUCAP_EMU_HOME=/path/to/emucap/home      기본: OS별 사용자 데이터 아래 emucap/
 #   EMUCAP_LAUNCH_WAIT=<seconds>              기본: 20
@@ -84,6 +84,16 @@ resolve_default_mesen() {
   local candidates=()
   case "$(uname -s 2>/dev/null || echo unknown)" in
     Darwin)
+      case "$(uname -m 2>/dev/null || echo unknown)" in
+        arm64|aarch64)
+          candidates+=("$HERE/work/mesen/bin/osx-arm64/Release/osx-arm64/publish/Mesen.app/Contents/MacOS/Mesen")
+          candidates+=("$HERE/work/mesen/bin/osx-arm64/Release/osx-arm64/publish/Mesen")
+          ;;
+        *)
+          candidates+=("$HERE/work/mesen/bin/osx-x64/Release/osx-x64/publish/Mesen.app/Contents/MacOS/Mesen")
+          candidates+=("$HERE/work/mesen/bin/osx-x64/Release/osx-x64/publish/Mesen")
+          ;;
+      esac
       candidates+=("/Applications/Mesen.app/Contents/MacOS/Mesen")
       ;;
     MINGW*|MSYS*|CYGWIN*)
@@ -99,6 +109,17 @@ resolve_default_mesen() {
   for candidate in "${candidates[@]}"; do
     [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
   done
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Linux)
+      case "$(uname -m 2>/dev/null || echo unknown)" in
+        arm64|aarch64) candidates+=("$HERE/work/mesen/bin/linux-arm64/Release/linux-arm64/publish/Mesen") ;;
+        *) candidates+=("$HERE/work/mesen/bin/linux-x64/Release/linux-x64/publish/Mesen") ;;
+      esac
+      ;;
+  esac
+  for candidate in "${candidates[@]}"; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
   for candidate in Mesen Mesen.exe mesen; do
     if command -v "$candidate" >/dev/null 2>&1; then
       command -v "$candidate"
@@ -110,6 +131,7 @@ resolve_default_mesen() {
 
 EMUCAP_MESEN_BASE="${EMUCAP_EMU_HOME:-$(default_emu_home_base)}"
 RUN_DIR="$EMUCAP_MESEN_BASE/mesen2/$PORT"
+PORTABLE_SAFE_ROOT="$RUN_DIR"
 PIDFILE="$RUN_DIR/mesen.pid"
 LOG="${EMUCAP_LOG:-$RUN_DIR/mesen.log}"
 WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
@@ -128,7 +150,43 @@ fi
 
 [ -f "$ROM" ] || { echo "ERROR: ROM 없음: $ROM" >&2; exit 1; }
 [ -f "$LUA" ] || { echo "ERROR: Lua 어댑터 없음: $LUA" >&2; exit 1; }
-[ -n "$MESEN_BIN" ] && [ -x "$MESEN_BIN" ] || { echo "ERROR: Mesen 바이너리 없음 — MESEN_BIN을 설정하거나 일반 설치 경로/PATH에 Mesen을 준비하라" >&2; exit 1; }
+[ -n "$MESEN_BIN" ] && [ -x "$MESEN_BIN" ] || { echo "ERROR: compatible Mesen 바이너리 없음 — $HERE/build.sh를 먼저 실행하라" >&2; exit 1; }
+
+MESEN_METADATA="$(dirname "$MESEN_BIN")/emucap-mesen-build.json"
+[ -f "$MESEN_METADATA" ] || {
+  echo "ERROR: mesen-patch-required — compatible sidecar 없음: $MESEN_METADATA" >&2
+  echo "  $HERE/build.sh를 실행하거나 그 산출물을 MESEN_BIN으로 지정하라." >&2
+  exit 1
+}
+json_string() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$MESEN_METADATA" | head -1
+}
+json_number() {
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$MESEN_METADATA" | head -1
+}
+lock_value() { sed -n "s/^$1=//p" "$HERE/upstream.lock"; }
+MESEN_UPSTREAM_COMMIT="$(json_string commit)"
+MESEN_PATCHSET_SHA256="$(json_string patchset_sha256)"
+MESEN_HOST_API="$(json_number host_api)"
+if [ "$MESEN_UPSTREAM_COMMIT" != "$(lock_value MESEN_COMMIT)" ] ||
+   [ "$MESEN_HOST_API" != "$(lock_value MESEN_HOST_API)" ] ||
+   [ "$MESEN_PATCHSET_SHA256" != "$(lock_value MESEN_PATCHSET_SHA256)" ] ||
+   [ "$(json_string upstream)" != "$(lock_value MESEN_REPO)" ] ||
+   [ "$(json_string tag)" != "$(lock_value MESEN_TAG)" ] ||
+   ! printf '%s' "$MESEN_PATCHSET_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+  echo "ERROR: mesen-patch-required — sidecar가 upstream.lock과 맞지 않음: $MESEN_METADATA" >&2
+  exit 1
+fi
+export EMUCAP_MESEN_UPSTREAM_COMMIT="$MESEN_UPSTREAM_COMMIT"
+export EMUCAP_MESEN_PATCHSET_SHA256="$MESEN_PATCHSET_SHA256"
+MESEN_CLI_ARGS=(
+  --debug.scriptWindow.allowIoOsAccess=true
+  --debug.scriptWindow.allowNetworkAccess=true
+  --debug.scriptWindow.scriptTimeout=60
+  --preferences.singleInstance=false
+  --snes.port1.type=SnesController
+  --donotSaveSettings
+)
 
 find_app_bundle() {
   local p="$1"
@@ -158,6 +216,14 @@ write_portable_settings() {
   }
 }
 JSON
+}
+
+is_gba_launch() {
+  [ "$(basename "$LUA")" = "emucap-gba.lua" ] && return 0
+  case "$ROM" in
+    *.[gG][bB][aA]) return 0 ;;
+  esac
+  return 1
 }
 
 unique_runtime_path() {
@@ -199,6 +265,7 @@ copy_app_bundle_replace() {
   local had_dst=0
   case "$dst_app" in
     "$RUN_DIR"/*) ;;
+    "$PORTABLE_SAFE_ROOT"/*) ;;
     *) echo "ERROR: unsafe portable app path: $dst_app" >&2; return 1 ;;
   esac
   tmp_app="$(unique_runtime_path "$dst_app" "tmp")"
@@ -246,6 +313,8 @@ prepare_portable_mesen() {
   local source_bin="$1"
   local emu_home="$RUN_DIR"
   mkdir -p "$emu_home"
+  emu_home="$(cd "$emu_home" && pwd -P)"
+  PORTABLE_SAFE_ROOT="$emu_home"
 
   local source_app
   source_app="$(find_app_bundle "$source_bin" 2>/dev/null || true)"
@@ -260,21 +329,29 @@ prepare_portable_mesen() {
     }
     MESEN_BIN="$portable_app/$rel"
     MESEN_APP_BUNDLE="$portable_app"
-  else
-    local portable_dir
+  elif [ -f "$(dirname "$source_bin")/emucap-mesen-build.json" ]; then
+    local portable_dir source_dir
     portable_dir="$emu_home/portable"
-    mkdir -p "$portable_dir"
-    MESEN_BIN="$portable_dir/$(basename "$source_bin")"
-    copy_file_replace "$source_bin" "$MESEN_BIN" || {
-      echo "ERROR: portable Mesen 바이너리 복사 실패: $source_bin → $MESEN_BIN" >&2
+    source_dir="$(cd "$(dirname "$source_bin")" && pwd -P)"
+    case "$portable_dir/" in
+      "$source_dir/"*) echo "ERROR: portable destination이 source publish directory 내부임: $portable_dir" >&2; exit 1 ;;
+    esac
+    copy_app_bundle_replace "$source_dir" "$portable_dir" || {
+      echo "ERROR: portable Mesen publish directory 복사 실패: $source_dir → $portable_dir" >&2
       exit 1
     }
+    MESEN_BIN="$portable_dir/$(basename "$source_bin")"
     chmod +x "$MESEN_BIN" 2>/dev/null || true
     MESEN_APP_BUNDLE="$(find_app_bundle "$MESEN_BIN" 2>/dev/null || true)"
+  else
+    echo "ERROR: mesen-patch-required — publish directory metadata가 없다: $source_bin" >&2
+    exit 1
   fi
 
   MESEN_SETTINGS="$(dirname "$MESEN_BIN")/settings.json"
-  write_portable_settings "$MESEN_SETTINGS"
+  if is_gba_launch; then
+    write_portable_settings "$MESEN_SETTINGS"
+  fi
   [ -x "$MESEN_BIN" ] || { echo "ERROR: portable Mesen 바이너리 실행 불가: $MESEN_BIN" >&2; exit 1; }
   export EMUCAP_MESEN_HOME="$emu_home"
 }
@@ -385,15 +462,26 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
 # GBA는 Mesen이 실 BIOS(gba_bios.bin)를 데이터폴더의 Firmware에서 찾는다. 없으면 GUI 창을 띄워 사람에게
 # 물어 헤드리스·에이전트-주도 모델을 깬다. 포터블 .app 재생성이 Firmware를 비우므로 재생성 후·launch 전에
 # 여기서 provision한다. 출처는 설정 계약(하드코딩된 사용자 경로 없음): EMUCAP_GBA_BIOS(명시) →
-# emucap 소유 firmware 디렉터리(비커밋). PSX BIOS와 같은 방식. BIOS가 없으면 로그로 경고만 한다.
-if [ "$(basename "$LUA")" = "emucap-gba.lua" ] && [ -n "${MESEN_APP_BUNDLE:-}" ]; then
+# emucap 소유 firmware 디렉터리(비커밋). BIOS가 없거나 크기가 잘못되면 launch 전에 실패한다.
+if is_gba_launch; then
   GBA_BIOS="${EMUCAP_GBA_BIOS:-$EMUCAP_MESEN_BASE/firmware/gba_bios.bin}"
-  FW_DIR="$MESEN_APP_BUNDLE/Contents/MacOS/Firmware"
+  FW_DIR="$(dirname "$MESEN_BIN")/Firmware"
   if [ -f "$GBA_BIOS" ]; then
+    GBA_BIOS_SIZE="$(wc -c <"$GBA_BIOS" | tr -d '[:space:]')"
+    [ "$GBA_BIOS_SIZE" = "16384" ] || {
+      echo "ERROR: GBA BIOS must be exactly 16384 bytes: $GBA_BIOS ($GBA_BIOS_SIZE bytes)" >&2
+      exit 1
+    }
     mkdir -p "$FW_DIR" && cp "$GBA_BIOS" "$FW_DIR/gba_bios.bin"
+    cmp -s "$GBA_BIOS" "$FW_DIR/gba_bios.bin" || {
+      echo "ERROR: staged GBA BIOS does not match its source" >&2
+      exit 1
+    }
     echo "  gba_bios=$GBA_BIOS → Firmware/gba_bios.bin" >>"$LOG"
   else
-    echo "  gba_bios=<없음: $GBA_BIOS — Mesen이 펌웨어 창을 띄운다. EMUCAP_GBA_BIOS로 지정하거나 그 경로에 두라>" >>"$LOG"
+    echo "ERROR: GBA BIOS 없음: $GBA_BIOS" >&2
+    echo "  EMUCAP_GBA_BIOS로 지정하거나 emucap firmware 디렉터리에 gba_bios.bin을 두라." >&2
+    exit 1
   fi
 fi
 
@@ -413,6 +501,7 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   # 신규 창이 안 뜨거나 연결 직후 사라지는 사례가 있다. LaunchServices로 새 인스턴스를 요청하되,
   # EMUCAP_* 환경변수는 open --env로 명시 전달한다. 실제 PID는 포트 연결 후 lsof로 역추적한다.
   OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH" --env "EMUCAP_ADAPTER_DIR=$HERE")
+  OPEN_ENV+=(--env "EMUCAP_MESEN_UPSTREAM_COMMIT=$MESEN_UPSTREAM_COMMIT" --env "EMUCAP_MESEN_PATCHSET_SHA256=$MESEN_PATCHSET_SHA256")
   [ -n "$NAME" ] && OPEN_ENV+=(--env "EMUCAP_NAME=$NAME")
   [ -n "$SESSION_TOKEN" ] && OPEN_ENV+=(--env "EMUCAP_SESSION_TOKEN=$SESSION_TOKEN")
   OPEN_ENV+=(--env "EMUCAP_CONTENT=$ROM")
@@ -420,19 +509,20 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   [ -n "${EMUCAP_FREEZE_KEY:-}" ] && OPEN_ENV+=(--env "EMUCAP_FREEZE_KEY=$EMUCAP_FREEZE_KEY")
   [ -n "${EMUCAP_DEADMAN_MS:-}" ] && OPEN_ENV+=(--env "EMUCAP_DEADMAN_MS=$EMUCAP_DEADMAN_MS")
   [ -n "${EMUCAP_RECONNECT_GIVEUP_MS:-}" ] && OPEN_ENV+=(--env "EMUCAP_RECONNECT_GIVEUP_MS=$EMUCAP_RECONNECT_GIVEUP_MS")
-  open -n -g "$MESEN_APP_BUNDLE" --stdout "$LOG" --stderr "$LOG" "${OPEN_ENV[@]}" --args "$ROM" "$LUA"
+  open -n -g "$MESEN_APP_BUNDLE" --stdout "$LOG" --stderr "$LOG" "${OPEN_ENV[@]}" --args "$ROM" "$LUA" "${MESEN_CLI_ARGS[@]}"
 else
   # transient PTY에서 direct exec를 쓰면 부모 shell 종료나 PTY 정리가
   # GUI 프로세스에 영향을 줄 수 있다. Mednafen launcher와 같은 방식으로 가능한 경우
   # 새 세션(start_new_session)에 띄우고 stdio를 /dev/null + log로 분리한다.
   if command -v python3 >/dev/null 2>&1; then
     NEWPID="$(
-      python3 - "$LOG" "$PIDFILE" "$MESEN_BIN" "$PORT" "$NAME" "$ROM" "$LUA" <<'PY'
+      python3 - "$LOG" "$PIDFILE" "$MESEN_BIN" "$PORT" "$NAME" "$ROM" "$LUA" "${MESEN_CLI_ARGS[@]}" <<'PY'
 import os
 import subprocess
 import sys
 
-log_path, pidfile, exe, port, name, rom, lua = sys.argv[1:]
+log_path, pidfile, exe, port, name, rom, lua = sys.argv[1:8]
+extra_args = sys.argv[8:]
 env = os.environ.copy()
 env["EMUCAP_PORT"] = port
 env["EMUCAP_CONTENT"] = rom
@@ -446,7 +536,7 @@ devnull = open(os.devnull, "rb")
 log = open(log_path, "ab", buffering=0)
 try:
     proc = subprocess.Popen(
-        [exe, rom, lua],
+        [exe, rom, lua, *extra_args],
         stdin=devnull,
         stdout=log,
         stderr=subprocess.STDOUT,
@@ -468,7 +558,7 @@ PY
       trap '' HUP
       env EMUCAP_PORT="$PORT" EMUCAP_CONTENT="$ROM" ${NAME:+EMUCAP_NAME="$NAME"} ${SESSION_TOKEN:+EMUCAP_SESSION_TOKEN="$SESSION_TOKEN"} ${EMUCAP_PREARM:+EMUCAP_PREARM="$EMUCAP_PREARM"} \
         ${EMUCAP_FREEZE_KEY:+EMUCAP_FREEZE_KEY="$EMUCAP_FREEZE_KEY"} \
-        nohup "$MESEN_BIN" "$ROM" "$LUA" >>"$LOG" 2>&1 &
+        nohup "$MESEN_BIN" "$ROM" "$LUA" "${MESEN_CLI_ARGS[@]}" >>"$LOG" 2>&1 &
       echo "$!" > "$PIDFILE"
     }
     NEWPID="$(cat "$PIDFILE")"

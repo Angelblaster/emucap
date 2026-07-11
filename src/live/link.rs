@@ -67,6 +67,14 @@ pub struct EmulatorIdentity {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<String>,
+    /// Native emulator-host capabilities carried by hello. For Mesen this is the authoritative
+    /// runtime capability check; the build sidecar is only a preflight check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_features: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesen_host_api: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_build: Option<Value>,
 }
 
 impl EmulatorIdentity {
@@ -82,7 +90,32 @@ impl EmulatorIdentity {
                 .map(String::from),
             content: v.get("content").and_then(Value::as_str).map(String::from),
             launch_id: v.get("launch_id").and_then(Value::as_str).map(String::from),
+            host_features: v
+                .get("host_features")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            mesen_host_api: v
+                .get("mesen_host_api")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
+            host_build: v.get("host_build").cloned(),
         }
+    }
+
+    pub fn has_mesen_native_halt(&self) -> bool {
+        self.mesen_host_api == Some(1)
+            && self.host_features.iter().any(|v| v == "code_break_idle")
+            && self
+                .host_features
+                .iter()
+                .any(|v| v == "native_halt_service")
     }
 }
 
