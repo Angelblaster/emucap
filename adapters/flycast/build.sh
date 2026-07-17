@@ -224,11 +224,11 @@ perl -0777 -pi -e 's{(stbi_write_png_to_func\(appendVectorData, &data, width, he
 inject_check 'emucap_capture_raw' "$SRC/core/ui/gui.cpp"
 echo "→ gui.cpp screenshot 헬퍼 주입(emucap_capture_raw + emucap_encode_png)"
 
-# 2d. mainui.cpp 캡처 훅: 매 렌더(UI/GL 스레드)마다 emucap_capture_latest()로 최신 프레임 raw를 버퍼에 떠둔다.
-#    os_UpdateInputState() 직후에 건다(렌더 스레드 진입점). emucap.h include도 주입.
+# 2d. mainui.cpp 캡처 훅: 렌더가 끝난 뒤(UI/GL 스레드) 최신 프레임 raw를 버퍼에 떠둔다.
+#    MainFrameCount 증가 직전에 건다. emucap.h include도 주입.
 perl -0777 -pi -e 's/(#include [^\n]*\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
   "$SRC/core/ui/mainui.cpp"
-perl -0777 -pi -e 's/(os_UpdateInputState\(\);)/${1}\n\temucap_capture_latest();/ unless m{emucap_capture_latest}' \
+perl -0777 -pi -e 's/(\n\tMainFrameCount\+\+;)/\n\temucap_capture_latest();${1}/ unless m{emucap_capture_latest}' \
   "$SRC/core/ui/mainui.cpp"
 inject_check 'emucap_capture_latest' "$SRC/core/ui/mainui.cpp"
 inject_check 'emucap.h' "$SRC/core/ui/mainui.cpp"

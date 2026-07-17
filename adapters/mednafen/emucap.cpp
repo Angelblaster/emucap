@@ -386,6 +386,23 @@ bool json_bool(const std::string& s, const char* key, bool& out) {
   return false;
 }
 
+enum JsonArrayState { JSON_ARRAY_ABSENT, JSON_ARRAY_EMPTY, JSON_ARRAY_NONEMPTY, JSON_ARRAY_INVALID };
+
+JsonArrayState json_array_state(const std::string& s, const char* key) {
+  std::string pat = std::string("\"") + key + "\"";
+  size_t k = s.find(pat);
+  if (k == std::string::npos) return JSON_ARRAY_ABSENT;
+  size_t c = s.find(':', k + pat.size());
+  if (c == std::string::npos) return JSON_ARRAY_INVALID;
+  size_t p = c + 1;
+  while (p < s.size() && isspace((unsigned char)s[p])) p++;
+  if (p >= s.size() || s[p] != '[') return JSON_ARRAY_INVALID;
+  p++;
+  while (p < s.size() && isspace((unsigned char)s[p])) p++;
+  if (p >= s.size()) return JSON_ARRAY_INVALID;
+  return s[p] == ']' ? JSON_ARRAY_EMPTY : JSON_ARRAY_NONEMPTY;
+}
+
 // JSON 문자열 값 이스케이프(따옴표·역슬래시·제어문자). EMUCAP_NAME 등 외부 입력을 JSON에
 // 그대로 박으면 깨진 JSON이 될 수 있어 안전하게 변환한다.
 std::string json_escape(const std::string& s) {
@@ -984,7 +1001,7 @@ bool mkdir_p(const std::string& path) {
 
 // 벌크 메모리 덤프(emucap diff·교차-ROM 키-값 디프 입력). 각 debugger AddressSpace를 <dir>/<name>.bin으로
 // 64KB 청크로 직접 기록하고, regions.json([{name,memory_type,base_address,size}])을 같은 디렉터리에 쓴다 —
-// Mesen(emucap-core.lua)·PC-98(emucap-gdb-bridge.py) dump_memory 출력 형태와 일치해 Rust analysis::dump이
+// Mesen(emucap-core.lua)·PC-98(Rust bridge) dump_memory 출력 형태와 일치해 Rust analysis::dump이
 // 그대로 읽고 `emucap diff`가 동작한다. state.json은 MCP(tools::dump_memory)가 get_state로 따로 기록하므로
 // (Mesen/PC-98 어댑터도 안 쓴다) 여기서 쓰지 않는다. 거대 hex 와이어 전송 없이 어댑터가 파일에 직접 써서
 // 512KB+ VRAM 등 벌크를 한 번에 export한다(read_memory 인라인 hex 한계 우회). base_address는 명명 공간 내
@@ -1099,7 +1116,17 @@ bool read_sp(uint32& out) {
 }
 
 // 레지스터 그룹(SH-2/SCU/VDP 등)을 평탄한 "그룹.레지스터": 값 맵으로. 구분자(bsize 0xFFFF) 제외.
-void handle_get_state(long id) {
+void handle_get_state(long id, const std::string& line) {
+  const JsonArrayState groups = json_array_state(line, "groups");
+  if (groups == JSON_ARRAY_INVALID) {
+    reply_err(id, "bad_params", "groups must be a list");
+    return;
+  }
+  if (groups == JSON_ARRAY_NONEMPTY) {
+    reply_err(id, "bad_params",
+              "Mednafen get_state does not support group filtering; omit groups or pass []");
+    return;
+  }
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->RegGroups) {
     reply_err(id, "no_debugger", "디버거 미초기화");
     return;
@@ -1385,8 +1412,8 @@ void decode_nbg_layout(int n, NbgLayout& L) {
   }
 }
 
-// VDP2 상태를 per-NBG(0..3)로 디코드해 노출(SS 전용 메서드). get_state엔 안 붙인다 — Mednafen이
-// group 필터를 무시해 *항상* 계산되면 context 위생과 충돌하므로 별도 메서드다. 디코드 공식은
+// VDP2 상태를 per-NBG(0..3)로 디코드해 노출(SS 전용 메서드). get_state엔 안 붙인다 — Mednafen은
+// group 필터를 지원하지 않아 별도 메서드가 아니면 항상 계산돼 context 위생과 충돌한다. 디코드 공식은
 // vdp2_render.cpp에서 복제한다.
 // RawRegs는 렌더러 입력과 비트동일이라 공식만 정확히 복제하면 drift 0. 각 디코드 필드에
 // {decoded, raw, reg_offset}를 동봉해 소비자가 raw로 자가검증한다. 게임별 보정상수
@@ -2071,13 +2098,37 @@ void handle(const std::string& line) {
         mtypes += "\"" + json_escape(as.name) + "\"";
       }
     }
+    std::string exception_ids;
+    auto add_exception = [&](const char* value) {
+      if (!exception_ids.empty()) exception_ids += ",";
+      exception_ids += "\"" + std::string(value) + "\"";
+    };
+    add_exception("mednafen.input-hold.port-zero-only");
+    add_exception("mednafen.input-pulse.port-zero-only");
+    if (has_debugger) {
+      add_exception("mednafen.call-stack.best-effort");
+      add_exception("mednafen.state.groups-absent");
+      if (is_md()) {
+        add_exception("mednafen.md.cpu-write-absent");
+      }
+      if (is_ss()) {
+        add_exception("mednafen.ss.physical-read-absent");
+        add_exception("mednafen.ss.physical-write-absent");
+      }
+    } else if (is_pce()) {
+      add_exception("mednafen.pce-fast.debugger-absent");
+    }
+    std::string contracts =
+        "{\"catalog\":\"emucap-feature-contracts/v2\",\"active_exceptions\":[" +
+        exception_ids + "]}";
     char head[224];
     snprintf(head, sizeof(head),
              "{\"protocol_version\":%d,\"system\":\"%s\",\"adapter\":\"mednafen\",\"build\":\"%s\","
              "\"debugger\":%s,",
              PROTOCOL_VERSION, sys, EMUCAP_BUILD_HASH, has_debugger ? "true" : "false");
     std::string hello_resp = std::string(head) + "\"methods\":[" + methods +
-                             "],\"memory_types\":[" + mtypes + "]}";
+                             "],\"memory_types\":[" + mtypes + "],\"contracts\":" +
+                             contracts + "}";
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).
     const char* emu_name = getenv("EMUCAP_NAME");
     const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
@@ -2121,10 +2172,15 @@ void handle(const std::string& line) {
     char buf[512];
     snprintf(buf, sizeof(buf),
              "{\"connected\":true,\"system\":\"%s\",\"debugger\":%s,\"frame\":%llu,\"state\":\"%s\","
-             "\"last_game_input\":\"0x%04x\",\"last_game_buttons\":%s}",
+             "\"last_game_input\":\"0x%04x\",\"last_game_buttons\":%s,"
+             "\"input_override\":{\"observable\":true,\"engaged\":%s,\"mode\":\"%s\","
+             "\"pressed_mask\":%u}}",
              sys, has_debugger ? "true" : "false",
              (unsigned long long)g_frame, g_frozen ? "frozen" : "running",
-             (unsigned)g, mask_to_buttons(g).c_str());
+             (unsigned)g, mask_to_buttons(g).c_str(),
+             g_input_override.engaged() ? "true" : "false",
+             g_def_is_press ? "timed" : (g_input_override.engaged() ? "persistent" : "native"),
+             (unsigned)g_input_override.mask());
     std::string resp(buf);
     if (is_ss()) {
       uint32_t a = g_last_smpc_read_addr.load();
@@ -2157,7 +2213,7 @@ void handle(const std::string& line) {
   } else if (method == "write_memory") {
     handle_write_memory(id, line);
   } else if (method == "get_state") {
-    handle_get_state(id);
+    handle_get_state(id, line);
   } else if (method == "get_video_state") {
     handle_get_video_state(id);
   } else if (method == "resolve_tile") {
@@ -2181,6 +2237,11 @@ void handle(const std::string& line) {
     g_def_age = 0;
     g_def_is_press = false;
   } else if (method == "set_input") {
+    long port = 0;
+    if (json_num(line, "port", port) && port != 0) {
+      reply_err(id, "bad_params", "Mednafen input supports only controller port 0");
+      return;
+    }
     uint16_t m = 0;
     std::string input_err;
     if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
@@ -2193,6 +2254,11 @@ void handle(const std::string& line) {
              (unsigned)m, mask_to_buttons(m).c_str());
     reply_ok(id, rbuf);
   } else if (method == "press_buttons") {
+    long port = 0;
+    if (json_num(line, "port", port) && port != 0) {
+      reply_err(id, "bad_params", "Mednafen input supports only controller port 0");
+      return;
+    }
     long frames = 1;
     json_num(line, "frames", frames);
     if (frames < 1) frames = 1;

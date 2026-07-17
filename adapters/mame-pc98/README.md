@@ -211,8 +211,11 @@ The launcher starts:
 
 1. MAME with `-debug -debugger none` and repo-local Lua plugin
    `emucap_gdbstub`.
-2. `emucap-gdb-bridge.py`, which connects to MAME's GDB port and then to
-   emucap's TCP listener.
+2. The installed `emucap-mame-pc98-bridge` Rust binary, which connects to
+   MAME's GDB port and then to emucap's TCP listener.
+
+The Python bridge is not part of the installed runtime. A missing Rust bridge
+fails launch explicitly instead of switching implementations.
 
 It refuses to launch if the emucap listener is missing or if the port already
 has an established emulator/bridge connection after cleaning its own pidfiles.
@@ -301,13 +304,14 @@ the target memory before returning to MCP.  This closes the old load/read
 network gap for bisect-style memory predicates, but it does not make
 `load_state` use MAME's native `.sta` machinery.
 
-Use `scripts/make_atomic_restore_sled.py` as the promotion gate before marking
-PC-98 state restore as deterministic.  The workflow is:
+The repository's public development tests include an atomic-restore fixture
+generator at `_tests/adapters/pc98/make_atomic_restore_sled.py`. It is a
+validation aid, not an installed runtime dependency. The workflow is:
 
 ```sh
 # 1. In MCP, save a PC-98 state bundle while frozen:
 #    save_state("/tmp/pc98_base.state.zip")
-adapters/mame-pc98/scripts/make_atomic_restore_sled.py \
+_tests/adapters/pc98/make_atomic_restore_sled.py \
   /tmp/pc98_base.state.zip /tmp/pc98_atomic_restore_sled.state.zip
 # 2. In MCP, load the generated state and immediately read RAM 0x9000:
 #    load_state("/tmp/pc98_atomic_restore_sled.state.zip")

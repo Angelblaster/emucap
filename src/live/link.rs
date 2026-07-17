@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::contracts::ContractAdvertisement;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LinkError {
     #[error("emulator not connected")]
@@ -126,6 +128,7 @@ pub struct Capabilities {
     /// read/write_memory에 유효한 memory_type 이름들 — 어댑터가 hello로 advertise(에뮬레이터의
     /// debugger address space에서; 없으면 빈 vec). MCP는 status에 표면화만 한다(정적 맵 금지).
     pub memory_types: Vec<String>,
+    pub contracts: ContractAdvertisement,
     pub identity: EmulatorIdentity,
 }
 
@@ -135,6 +138,7 @@ impl Capabilities {
             protocol_version: 0,
             methods: vec![],
             memory_types: vec![],
+            contracts: ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         }
     }
@@ -143,6 +147,9 @@ impl Capabilities {
 pub trait EmulatorLink {
     fn capabilities(&self) -> &Capabilities;
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError>;
+    /// Discard the current front-side session after an adapter has acknowledged an operation that
+    /// recreates its transport. The emulator process and launch generation remain intact.
+    fn prepare_reconnect(&mut self) {}
     /// 직접 모드에서 에뮬레이터가 접속해야 하는 포트(자동 선택 결과). status가 에이전트에게
     /// 알려주려 쓴다. broker 모드 등 포트 개념이 없으면 None.
     fn endpoint_port(&self) -> Option<u16> {
@@ -191,6 +198,7 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec!["read_memory".into()],
                 memory_types: vec![],
+                contracts: ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
             response: Ok(result),
@@ -205,6 +213,7 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec![],
                 memory_types: vec![],
+                contracts: ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
             response: Err(e),

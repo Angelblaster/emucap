@@ -408,6 +408,7 @@ fn handshake_stream(
             protocol_version,
             methods,
             memory_types,
+            contracts: crate::contracts::advertisement_from_hello(&caps_val),
             identity,
         },
     ))
@@ -865,6 +866,10 @@ impl EmulatorLink for TcpLink {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
         self.ensure_connected()?;
         self.raw_call(method, params)
+    }
+
+    fn prepare_reconnect(&mut self) {
+        self.drop_conn();
     }
 
     fn endpoint_port(&self) -> Option<u16> {

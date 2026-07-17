@@ -658,6 +658,10 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         result
     }
 
+    fn prepare_reconnect(&mut self) {
+        self.inner.prepare_reconnect();
+    }
+
     fn endpoint_port(&self) -> Option<u16> {
         self.inner.endpoint_port()
     }

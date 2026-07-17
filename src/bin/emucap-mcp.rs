@@ -8,7 +8,7 @@ use emucap::live::link::{EmulatorLink, LinkError};
 use emucap::live::tcp;
 use emucap::live::tools::{self, ToolOutput};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 #[path = "emucap-mcp/args.rs"]
@@ -254,7 +254,9 @@ impl Emucap {
                 let identity = link.capabilities().identity.clone();
                 let methods = link.capabilities().methods.clone();
                 let memory_types = link.capabilities().memory_types.clone();
+                let contracts = link.capabilities().contracts.clone();
                 enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
+                status::enrich_contract_status(&mut v, &identity, &contracts);
                 enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
                 status::enrich_continuity(&mut v, &*link);
                 v["request_succeeded"] = serde_json::json!(true);
@@ -515,7 +517,9 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "게임을 리셋한다(처음부터 재시작; 로드된 ROM 바이트는 그대로).")]
+    #[tool(
+        description = "게임을 리셋한다(처음부터 재시작; 로드된 ROM 바이트는 그대로). reset 중 제어 연결을 다시 만드는 어댑터에서는 새 연결의 상태 확인까지 마친 뒤 반환한다."
+    )]
     async fn reset(&self) -> CallToolResult {
         let mut l = self.link();
         match tools::reset(&mut *l) {
@@ -811,10 +815,9 @@ impl Emucap {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Emucap {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some(SERVER_INSTRUCTIONS.into());
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("emucap-mcp", env!("CARGO_PKG_VERSION")))
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 

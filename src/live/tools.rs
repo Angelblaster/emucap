@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorLink, LinkError};
+use super::temporal::finish_with_cleanup;
 
 #[derive(Debug, PartialEq)]
 pub enum ToolOutput {
@@ -135,9 +136,7 @@ pub fn status(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
 }
 
 pub fn dismiss_failure(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(
-        link.call("dismiss_failure", json!({}))?,
-    ))
+    Ok(ToolOutput::Json(link.call("dismiss_failure", json!({}))?))
 }
 
 pub fn write_memory(
@@ -209,15 +208,28 @@ fn one_tap(
 ) -> Result<(), LinkError> {
     let empty: [String; 0] = [];
     link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
-    // press step이 실패(timeout 등)하면 `?`로 바로 반환돼 버튼이 눌린 채 남는다 — 에러를 전파하기 전에
-    // best-effort로 입력을 해제한다(에뮬 상태가 눌린 채 계속 진행하는 것 방지).
-    if let Err(e) = link.call("step", json!({ "frames": press_frames.max(1) })) {
-        let _ = link.call("set_input", json!({ "port": port, "buttons": empty }));
-        return Err(e);
-    }
-    link.call("set_input", json!({ "port": port, "buttons": empty }))?; // 해제
+    let outcome = link
+        .call("step", json!({ "frames": press_frames.max(1) }))
+        .map(|_| ());
+    let cleanup = link
+        .call("set_input", json!({ "port": port, "buttons": empty }))
+        .map(|_| ());
+    finish_with_cleanup(outcome, cleanup, combine_input_cleanup_error)?;
     link.call("step", json!({ "frames": 1 }))?; // 해제 에지
     Ok(())
+}
+
+fn combine_input_cleanup_error(primary: Option<LinkError>, cleanup: LinkError) -> LinkError {
+    let message = match primary {
+        Some(primary) => {
+            format!("{primary}; transient input cleanup also failed: {cleanup}")
+        }
+        None => format!("transient input cleanup failed: {cleanup}"),
+    };
+    LinkError::Emulator {
+        kind: "cleanup_failed".into(),
+        message,
+    }
 }
 
 /// 프레임 단위 정밀 탭: freeze에서 정확히 press_frames만 입력을 주고 떼어, auto-repeat 없이
@@ -299,8 +311,7 @@ pub fn hold_until(
     };
     link.call("pause", json!({}))?; // 멱등
     link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
-    // 코어 루프를 돌리되 성패 무관하게 입력을 해제한다 — step/read 에러로 중간 종료해도 버튼이 눌린 채
-    // 남지 않게(에뮬 상태가 입력받은 채 진행 방지).
+    // 코어 루프를 돌리되 성패 무관하게 입력을 해제한다.
     let outcome: Result<(bool, u64, String, String), LinkError> = (|| {
         let before = read(link)?;
         let mut frames = 0u64;
@@ -318,8 +329,11 @@ pub fn hold_until(
         Ok((changed, frames, before, after))
     })();
     let empty: [String; 0] = [];
-    let _ = link.call("set_input", json!({ "port": port, "buttons": empty })); // best-effort 해제
-    let (changed, frames, before, after) = outcome?;
+    let cleanup = link
+        .call("set_input", json!({ "port": port, "buttons": empty }))
+        .map(|_| ());
+    let (changed, frames, before, after) =
+        finish_with_cleanup(outcome, cleanup, combine_input_cleanup_error)?;
     link.call("step", json!({ "frames": 1 }))?; // 해제 에지
     Ok(ToolOutput::Json(json!({
         "changed": changed, "frames": frames, "before": before, "after": after, "state": "frozen"
@@ -382,7 +396,37 @@ pub fn resume(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutp
 }
 
 pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call("reset", json!({}))?))
+    let mut result = link.call("reset", json!({}))?;
+    if result.get("reconnect").and_then(Value::as_bool) == Some(true) {
+        link.prepare_reconnect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let status = loop {
+            match link.call("status", json!({})) {
+                Ok(status) if status.get("connected").and_then(Value::as_bool) == Some(true) => {
+                    break status;
+                }
+                Ok(_) | Err(LinkError::NotConnected | LinkError::Timeout | LinkError::Busy)
+                    if std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(LinkError::NoSuchEmulator { .. }) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(_) => return Err(LinkError::Timeout),
+                Err(error) => return Err(error),
+            }
+        };
+        if let Some(object) = result.as_object_mut() {
+            object.remove("reconnect");
+            object.insert("reconnected".into(), Value::Bool(true));
+            if let Some(state) = status.get("state") {
+                object.insert("state".into(), state.clone());
+            }
+        }
+    }
+    Ok(ToolOutput::Json(result))
 }
 
 /// 메모리 접근 브레이크포인트(kind=exec/read/write). pc_min/pc_max를 주면 그 접근을 일으킨 명령의
@@ -763,205 +807,5 @@ pub fn screenshot(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{tap_sequence, watch_register, LinkError};
-    use crate::live::link::FakeLink;
-    use serde_json::json;
-
-    #[test]
-    fn watch_register_rejects_over_budget() {
-        // 과대 max_instructions는 매 명령 getState 플러드를 오래 돌려 emu 스레드를 굶긴다 — 실행 전 거부.
-        let mut link = FakeLink::ok(json!({ "id": 1 }));
-        let r = watch_register(&mut link, "sp", 0, 0xffff, true, Some(u64::MAX));
-        assert!(
-            matches!(r, Err(LinkError::Emulator { ref kind, .. }) if kind == "bad_params"),
-            "과대 max_instructions는 bad_params로 거부해야: {r:?}"
-        );
-        let mut link2 = FakeLink::ok(json!({ "id": 1 }));
-        assert!(
-            watch_register(&mut link2, "sp", 0, 0xffff, true, Some(1000)).is_ok(),
-            "상한 이내 예산은 통과해야"
-        );
-    }
-
-    #[test]
-    fn tap_sequence_rejects_over_aggregate_budget() {
-        // per-field cap을 통과해도(steps ≤ 4096, press_frames ≤ 1M) 곱이 상한(1M)을 넘으면 실행 전에
-        // 거부해야 한다 — 유효 요청이 뮤텍스를 쥔 채 수십억 프레임으로 팽창하는 것 방지.
-        let mut link = FakeLink::ok(json!({}));
-        let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 4000];
-        let r = tap_sequence(&mut link, 0, &steps, 1000); // 4000 × 1002 ≈ 4M > 1M
-        assert!(
-            matches!(r, Err(LinkError::Emulator { ref kind, .. }) if kind == "bad_params"),
-            "집계 예산 초과는 bad_params로 거부해야: {r:?}"
-        );
-        assert!(
-            link.last_method.is_none(),
-            "예산 초과는 어떤 링크 호출(pause 포함)도 하기 전에 거부해야"
-        );
-    }
-
-    #[test]
-    fn tap_sequence_accepts_within_budget() {
-        let mut link = FakeLink::ok(json!({}));
-        let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 10];
-        assert!(
-            tap_sequence(&mut link, 0, &steps, 2).is_ok(),
-            "예산 이내는 통과해야"
-        );
-    }
-
-    fn dir_with(path: &std::path::Path, marker: &[u8]) {
-        std::fs::create_dir_all(path).unwrap();
-        std::fs::write(path.join("marker"), marker).unwrap();
-    }
-
-    #[test]
-    fn replace_dir_into_absent_dst_is_single_rename() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dump");
-        let staging = tmp.path().join(".dump.staging");
-        dir_with(&staging, b"new");
-        super::replace_dir(&staging, &dst).unwrap();
-        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
-        assert!(!staging.exists(), "이동 후 staging은 사라져야");
-    }
-
-    #[test]
-    fn replace_dir_publishes_new_dump_over_existing() {
-        // end-to-end(교환 또는 폴백): 기존 덤프 위에 새 스테이징 배치 → dst엔 신본, staging 제거.
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dump");
-        dir_with(&dst, b"old");
-        let staging = tmp.path().join(".dump.staging");
-        dir_with(&staging, b"new");
-        super::replace_dir(&staging, &dst).unwrap();
-        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
-        assert!(!staging.exists(), "스왑/이동 후 staging은 제거되어야");
-        // 백업 잔재(.dump.dump-old.*)가 남지 않아야.
-        let leftovers = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains("dump-old"));
-        assert!(!leftovers, "성공 시 백업/구덤프 잔재가 없어야");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn unsupported_exchange_errnos_fall_back_not_hard_fail() {
-        // 교환 프리미티브를 파일시스템/커널이 거부하는 errno 계열은 2-rename 폴백으로 강등해야 한다.
-        // macOS 아암이 ENOTSUP만 폴백하던 회귀: EINVAL을 내는 파일시스템이면 덤프 publish가 하드-실패했다.
-        use super::is_unsupported_exchange_errno as f;
-        for e in [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP] {
-            assert!(f(Some(e)), "미지원 errno {e}는 폴백해야");
-        }
-        assert!(!f(Some(libc::ENOENT)), "경로 소멸(ENOENT)은 진짜 실패");
-        assert!(!f(None), "errno 없음은 진짜 실패");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn try_exchange_swaps_contents_atomically() {
-        // 이 플랫폼의 원자 교환 프리미티브가 두 디렉토리 내용을 한 번에 맞바꾼다(교환 경로 검증).
-        let tmp = tempfile::tempdir().unwrap();
-        let a = tmp.path().join("a");
-        let b = tmp.path().join("b");
-        dir_with(&a, b"A");
-        dir_with(&b, b"B");
-        assert!(
-            super::try_exchange(&a, &b).unwrap(),
-            "지원 플랫폼(linux/macos)은 교환에 성공해야"
-        );
-        assert_eq!(std::fs::read(a.join("marker")).unwrap(), b"B");
-        assert_eq!(std::fs::read(b.join("marker")).unwrap(), b"A");
-    }
-
-    #[test]
-    fn replace_dir_refuses_file_destination() {
-        // 요청 경로에 사용자의 일반 파일이 있으면 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내
-        // (요청 경로에서 사라지게) 하면 안 된다 — 거부하고 파일을 바이트 그대로 둔다.
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dump");
-        std::fs::write(&dst, b"user-file").unwrap();
-        let staging = tmp.path().join(".dump.staging");
-        dir_with(&staging, b"new");
-        let err = super::replace_dir(&staging, &dst).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            std::fs::read(&dst).unwrap(),
-            b"user-file",
-            "거부 시 사용자 파일은 그대로여야"
-        );
-        assert!(staging.exists(), "거부 시 staging은 밀려나지 않아야");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn replace_dir_refuses_symlink_destination() {
-        // dst가 심링크면(파일이든 디렉토리든) 거부한다 — 스왑/폴백이 링크를 교체하거나 대상을 밀어내지
-        // 않게. copy_dir_replace와 같은 가드.
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        dir_with(&real, b"real");
-        let dst = tmp.path().join("dump");
-        std::os::unix::fs::symlink(&real, &dst).unwrap();
-        let staging = tmp.path().join(".dump.staging");
-        dir_with(&staging, b"new");
-        let err = super::replace_dir(&staging, &dst).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        assert!(
-            std::fs::symlink_metadata(&dst)
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "심링크는 보존되어야"
-        );
-        assert_eq!(
-            std::fs::read(real.join("marker")).unwrap(),
-            b"real",
-            "심링크 대상 디렉토리는 보존되어야"
-        );
-    }
-
-    #[test]
-    fn dump_memory_refuses_file_destination() {
-        // 요청 경로가 일반 파일이면 브리지 덤프·스테이징 전에 거부하고 파일을 보존한다(fail-fast) —
-        // 어댑터를 호출하지 않는다.
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dump");
-        std::fs::write(&dst, b"user-file").unwrap();
-        let mut link = FakeLink::ok(json!({}));
-        let err = super::dump_memory(&mut link, dst.to_str().unwrap()).unwrap_err();
-        assert!(
-            matches!(err, LinkError::Protocol(_)),
-            "가드는 Protocol 에러"
-        );
-        assert_eq!(
-            std::fs::read(&dst).unwrap(),
-            b"user-file",
-            "거부 시 사용자 파일은 그대로여야"
-        );
-        assert!(
-            link.last_method.is_none(),
-            "가드가 브리지 dump_memory 호출 전에 거부해야"
-        );
-    }
-
-    #[test]
-    fn replace_dir_fallback_swaps_over_existing() {
-        // 폴백(2-rename) 경로를 직접 검증 — 교환 미지원 플랫폼/파일시스템의 동작.
-        let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dump");
-        dir_with(&dst, b"old");
-        let staging = tmp.path().join(".dump.staging");
-        dir_with(&staging, b"new");
-        super::replace_dir_fallback(&staging, &dst).unwrap();
-        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
-        assert!(!staging.exists(), "폴백 성공 후 staging 제거");
-        let leftovers = std::fs::read_dir(tmp.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().contains("dump-old"));
-        assert!(!leftovers, "폴백 성공 시 백업이 제거되어야");
-    }
-}
+#[path = "tools_unit_tests.rs"]
+mod tests;

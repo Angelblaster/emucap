@@ -52,7 +52,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "system": "dreamcast",
             "buttons": ["a", "b", "c", "x", "y", "z", "d", "start", "up", "down", "left", "right"],
             "aliases": {"enter": "start", "return": "start"},
-            "notes": "Dreamcast pad buttons are lowercase: a/b/x/y/start + up/down/left/right are standard; c/z/d exist on some pads. Analog triggers/stick are not injectable by name. Input is injected at the maple GetInput consumer (single controller; port is ignored)."
+            "notes": "Dreamcast pad buttons are lowercase: a/b/x/y/start + up/down/left/right are standard; c/z/d exist on some pads. Analog triggers/stick are not injectable by name. Input is injected at the maple GetInput consumer; only controller port 0 is supported."
         }),
         "snes" | "sfc" => serde_json::json!({
             "system": "snes",
@@ -90,7 +90,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "system": "nds",
             "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],
             "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r"},
-            "notes": "Nintendo DS buttons via the DeSmuME bridge. Touchscreen/microphone are not injectable by name. Input injection is a planned fork hook — check status.capability_notes.input for availability."
+            "notes": "Nintendo DS buttons are injected through the DeSmuME bridge; only controller port 0 is supported. Use the dedicated touch tool for the lower screen. Microphone input is not injectable."
         }),
         // 알 수 없는 system은 어느 패드로도 위장하지 않는다 — 거짓 버튼 힌트 대신 input_buttons를 생략한다.
         _ => return None,
@@ -144,32 +144,8 @@ pub(crate) fn enrich_status_value(
             obj.insert("input_buttons".into(), hint);
         }
     }
-    // 능력 발견 표면(계약 #2): Agent가 실제 부르는 status에 어댑터 광고 메서드 + 그 위에 의존이 충족된
-    // MCP 컴포지트(tap 등 — 어댑터 메서드가 아니라 set_input+step 조합)를 합쳐, 호출 가능한 전 도구를
-    // 한 곳에서 보이게 한다. 어댑터 강등으로 의존이 빠지면 컴포지트도 자동 사라진다.
     if !obj.contains_key("methods") && !methods.is_empty() {
-        let has = |m: &str| methods.iter().any(|x| x == m);
-        let mut full: Vec<String> = methods.to_vec();
-        let push = |f: &mut Vec<String>, c: &str| {
-            if !f.iter().any(|x| x == c) {
-                f.push(c.into());
-            }
-        };
-        if has("set_input") && has("step") && has("pause") {
-            push(&mut full, "tap");
-            push(&mut full, "tap_sequence");
-            if has("read_memory") {
-                push(&mut full, "hold_until");
-            }
-        }
-        if has("probe") {
-            push(&mut full, "bisect"); // bisect는 probe 전용(load_state 폴백 없음)
-        }
-        if has("probe") || has("load_state") {
-            push(&mut full, "regression_run"); // 케이스 재생 — InputReplay는 reset|load_state로도 동작
-            push(&mut full, "verify_determinism");
-        }
-        obj.insert("methods".into(), serde_json::json!(full));
+        obj.insert("methods".into(), serde_json::json!(methods));
     }
     if !obj.contains_key("memory_types") && !memory_types.is_empty() {
         obj.insert("memory_types".into(), serde_json::json!(memory_types));
@@ -209,6 +185,80 @@ pub(crate) fn enrich_status_value(
             if !notes.is_empty() {
                 obj.insert("capability_notes".into(), serde_json::json!(notes));
             }
+        }
+    }
+}
+
+pub(crate) fn enrich_contract_status(
+    v: &mut serde_json::Value,
+    identity: &EmulatorIdentity,
+    advertisement: &emucap::contracts::ContractAdvertisement,
+) {
+    let connected = v
+        .get("connected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !connected {
+        return;
+    }
+    let methods: Vec<String> = v
+        .get("methods")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    let contracts = emucap::contracts::validate_advertisement(
+        advertisement,
+        identity.adapter.as_deref(),
+        identity.system.as_deref(),
+        &methods,
+    );
+    if contracts.state == "validated" {
+        add_composite_methods(v);
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "contracts".into(),
+            serde_json::to_value(contracts).unwrap_or_else(|_| {
+                serde_json::json!({
+                    "catalog": emucap::contracts::CATALOG_ID,
+                    "state": "unvalidated",
+                    "errors": ["failed to serialize contract validation result"],
+                })
+            }),
+        );
+    }
+}
+
+fn add_composite_methods(v: &mut serde_json::Value) {
+    let Some(methods) = v
+        .get_mut("methods")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let has = |method: &str| methods.iter().any(|value| value == method);
+    let raw_has = |method: &str| has(method);
+    let tap_ready = raw_has("set_input") && raw_has("step") && raw_has("pause");
+    let hold_until_ready = tap_ready && raw_has("read_memory");
+    let probe_ready = raw_has("probe");
+    let replay_ready = probe_ready || raw_has("load_state");
+
+    for (ready, method) in [
+        (tap_ready, "tap"),
+        (tap_ready, "tap_sequence"),
+        (hold_until_ready, "hold_until"),
+        (probe_ready, "bisect"),
+        (replay_ready, "regression_run"),
+        (replay_ready, "verify_determinism"),
+    ] {
+        if ready && !methods.iter().any(|value| value == method) {
+            methods.push(serde_json::json!(method));
         }
     }
 }
@@ -552,12 +602,14 @@ pub(crate) fn make_bootstrap_value(
     let port = link.endpoint_port();
     let token = link.session_token().map(str::to_string);
     let identity = link.capabilities().identity.clone();
+    let contracts = link.capabilities().contracts.clone();
 
     let mut status_value = match status {
         Ok(ToolOutput::Json(mut v)) => {
             let methods = link.capabilities().methods.clone();
             let memory_types = link.capabilities().memory_types.clone();
             enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
+            enrich_contract_status(&mut v, &identity, &contracts);
             enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
             enrich_continuity(&mut v, link);
             v["request_succeeded"] = serde_json::json!(true);

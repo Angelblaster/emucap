@@ -1089,6 +1089,15 @@ function emucap_gdbstub.startplugin()
         end
       end
       return true
+    elseif name == "inputstatus" then
+      if next(active_input_fields) == nil then
+        ack_packet(socket, "0")
+      elseif release_input_frame then
+        ack_packet(socket, tostring(math.max(release_input_frame - current_frame(), 0)))
+      else
+        ack_packet(socket, "-1")
+      end
+      return true
     elseif name == "setinput" then
       local buttons = hex_to_string(rest or "")
       if not buttons then

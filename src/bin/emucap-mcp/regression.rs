@@ -501,15 +501,35 @@ fn replay_movie_observe<T>(
     anchor: Option<&Predicate>,
     observe: &mut dyn FnMut(&mut dyn EmulatorLink) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
-    let to_e = |e: LinkError| e.to_string();
     validate_movie_frames(movie)?;
-    link.call("pause", serde_json::json!({})).map_err(to_e)?;
+    link.call("pause", serde_json::json!({}))
+        .map_err(|e| e.to_string())?;
+    let outcome = replay_movie_body(link, movie, anchor, observe);
+    let cleanup = cleanup_replay(link);
+    emucap::live::temporal::finish_with_cleanup(
+        outcome,
+        cleanup,
+        |primary, cleanup| match primary {
+            Some(primary) => format!("{primary}; {cleanup}"),
+            None => cleanup,
+        },
+    )
+}
+
+fn replay_movie_body<T>(
+    link: &mut dyn EmulatorLink,
+    movie: &regression::Movie,
+    anchor: Option<&Predicate>,
+    observe: &mut dyn FnMut(&mut dyn EmulatorLink) -> Result<T, String>,
+) -> Result<Option<T>, String> {
+    let to_e = |e: LinkError| e.to_string();
     if let Some(a) = anchor {
         // arming 전에 직전 활동(예: 회귀 루프의 이전 케이스·verify_determinism 반복)이 남긴 stale BP·
-        // 이벤트를 비운다 — 그러지 않으면 첫 poll_anchor_observe가 옛 이벤트를 소비해 엉뚱한 시점에
-        // false-positive(조용히 틀린 PASS)를 낸다(best-effort — 미지원 어댑터는 무해).
-        let _ = link.call("clear_all_breakpoints", serde_json::json!({}));
-        let _ = link.call("poll_events", serde_json::json!({}));
+        // 이벤트를 비운다 — 실패를 무시하면 옛 이벤트를 현재 anchor로 오인할 수 있으므로 fail-loud다.
+        link.call("clear_all_breakpoints", serde_json::json!({}))
+            .map_err(to_e)?;
+        link.call("poll_events", serde_json::json!({}))
+            .map_err(to_e)?;
         link.call(
             "set_breakpoint",
             serde_json::json!({
@@ -549,12 +569,27 @@ fn replay_movie_observe<T>(
             }
         }
     }
-    link.call("clear_all_breakpoints", serde_json::json!({}))
-        .ok();
     if anchor.is_some() {
         return Ok(None); // 앵커 미히트 = drift/측정 무효
     }
     Ok(Some(observe(link)?))
+}
+
+fn cleanup_replay(link: &mut dyn EmulatorLink) -> Result<(), String> {
+    let mut failures = Vec::new();
+    let mut attempt = |method: &str, params: serde_json::Value| {
+        if let Err(error) = link.call(method, params) {
+            failures.push(format!("{method}: {error}"));
+        }
+    };
+    attempt("set_input", serde_json::json!({"buttons": []}));
+    attempt("clear_all_breakpoints", serde_json::json!({}));
+    attempt("pause", serde_json::json!({}));
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("temporal cleanup failed ({})", failures.join("; ")))
+    }
 }
 
 fn poll_anchor_observe<T>(
@@ -571,8 +606,6 @@ fn poll_anchor_observe<T>(
         .unwrap_or(false)
     {
         let v = observe(link)?;
-        link.call("clear_all_breakpoints", serde_json::json!({}))
-            .ok();
         return Ok(Some(v));
     }
     Ok(None)

@@ -8,6 +8,7 @@ struct Rec {
     state: String,      // status가 돌려줄 state
     reads: Vec<String>, // read_memory가 차례로 돌려줄 hex(끝나면 마지막 값 반복)
     read_i: usize,
+    fail_calls: Vec<usize>,
     caps: Capabilities,
 }
 impl Rec {
@@ -17,13 +18,19 @@ impl Rec {
             state: state.into(),
             reads: reads.iter().map(|s| s.to_string()).collect(),
             read_i: 0,
+            fail_calls: vec![],
             caps: Capabilities {
                 protocol_version: 1,
                 methods: vec![],
                 memory_types: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
         }
+    }
+    fn with_fail_calls(mut self, calls: &[usize]) -> Self {
+        self.fail_calls = calls.to_vec();
+        self
     }
     fn methods(&self) -> Vec<&str> {
         self.calls.iter().map(|(m, _)| m.as_str()).collect()
@@ -35,6 +42,9 @@ impl EmulatorLink for Rec {
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
         self.calls.push((method.to_string(), params));
+        if self.fail_calls.contains(&self.calls.len()) {
+            return Err(LinkError::Timeout);
+        }
         // Mesen처럼: resume은 frozen에서만 허용(running에서 부르면 not_paused 에러).
         if method == "resume" && self.state != "frozen" {
             return Err(LinkError::Emulator {
@@ -81,6 +91,84 @@ fn tap_sequence_does_each_tap_in_one_call() {
     );
     assert_eq!(l.calls[1].1["buttons"], json!(["down"])); // 첫 탭 누름
     assert_eq!(l.calls[5].1["buttons"], json!(["a"])); // 둘째 탭 누름
+}
+
+struct ProjectionLink {
+    caps: Capabilities,
+    delay: std::time::Duration,
+    buttons: Vec<String>,
+    projection: Vec<Vec<String>>,
+}
+
+impl ProjectionLink {
+    fn new(delay: std::time::Duration) -> Self {
+        Self {
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: vec!["pause".into(), "set_input".into(), "step".into()],
+                memory_types: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                identity: EmulatorIdentity::default(),
+            },
+            delay,
+            buttons: vec![],
+            projection: vec![],
+        }
+    }
+}
+
+impl EmulatorLink for ProjectionLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        std::thread::sleep(self.delay);
+        match method {
+            "pause" => {}
+            "set_input" => {
+                self.buttons = params["buttons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect();
+            }
+            "step" => {
+                let frames = params["frames"].as_u64().unwrap();
+                for _ in 0..frames {
+                    self.projection.push(self.buttons.clone());
+                }
+            }
+            other => return Err(LinkError::Protocol(format!("unexpected call: {other}"))),
+        }
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn frozen_tap_projection_is_independent_of_host_delay() {
+    let steps = vec![vec!["down".to_string()], vec!["a".to_string()]];
+    let mut no_delay = ProjectionLink::new(std::time::Duration::ZERO);
+    let mut delayed = ProjectionLink::new(std::time::Duration::from_millis(2));
+
+    tap_sequence(&mut no_delay, 0, &steps, 2).unwrap();
+    tap_sequence(&mut delayed, 0, &steps, 2).unwrap();
+
+    assert_eq!(delayed.projection, no_delay.projection);
+    assert!(delayed.buttons.is_empty());
+    assert_eq!(
+        no_delay.projection,
+        vec![
+            vec!["down".to_string()],
+            vec!["down".to_string()],
+            vec![],
+            vec!["a".to_string()],
+            vec!["a".to_string()],
+            vec![]
+        ]
+    );
 }
 
 #[test]
@@ -143,6 +231,25 @@ fn tap_after_frames_advances_at_end() {
 }
 
 #[test]
+fn tap_step_failure_releases_input_before_returning_error() {
+    let mut l = Rec::new("frozen", &[]).with_fail_calls(&[3]);
+    let error = tap(&mut l, 0, &["a".into()], 2, 0).unwrap_err();
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(l.methods(), vec!["pause", "set_input", "step", "set_input"]);
+    assert_eq!(l.calls.last().unwrap().1["buttons"], json!([]));
+}
+
+#[test]
+fn tap_reports_cleanup_failure_without_claiming_completion() {
+    let mut l = Rec::new("frozen", &[]).with_fail_calls(&[3, 4]);
+    let error = tap(&mut l, 0, &["a".into()], 2, 0).unwrap_err();
+    assert!(
+        matches!(error, LinkError::Emulator { ref kind, .. } if kind == "cleanup_failed"),
+        "dual failure must surface cleanup_failed: {error:?}"
+    );
+}
+
+#[test]
 fn hold_until_stops_on_change() {
     // before=aa, 한 step 후 aa(불변), 또 step 후 bb(변함) → frames=2
     let mut l = Rec::new("frozen", &["aa", "aa", "bb"]);
@@ -156,6 +263,26 @@ fn hold_until_stops_on_change() {
         }
         _ => panic!("Json 기대"),
     }
+}
+
+#[test]
+fn hold_until_read_failure_releases_input() {
+    let mut l = Rec::new("frozen", &["aa"]).with_fail_calls(&[3]);
+    let error = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 3).unwrap_err();
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(l.calls.last().unwrap().0, "set_input");
+    assert_eq!(l.calls.last().unwrap().1["buttons"], json!([]));
+}
+
+#[test]
+fn hold_until_cleanup_failure_is_not_completed() {
+    // pause, set_input, before-read, step, after-read, release
+    let mut l = Rec::new("frozen", &["aa", "bb"]).with_fail_calls(&[6]);
+    let error = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 3).unwrap_err();
+    assert!(
+        matches!(error, LinkError::Emulator { ref kind, .. } if kind == "cleanup_failed"),
+        "release failure must replace a false successful completion: {error:?}"
+    );
 }
 
 #[test]
@@ -382,6 +509,7 @@ impl DumpLink {
                 protocol_version: 1,
                 methods: vec![],
                 memory_types: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
         }

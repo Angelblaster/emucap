@@ -121,6 +121,70 @@ fn broker_routes_and_pumps_keepalive() {
 }
 
 #[test]
+fn broker_attach_preserves_contract_advertisement() {
+    let (emulator_addr, session_addr) = start_broker();
+    let emulator = std::thread::spawn(move || {
+        let stream = TcpStream::connect(emulator_addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": 0,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "name": "nds-contracts",
+                    "adapter": "desmume-nds-rust-gdb",
+                    "system": "nds",
+                    "methods": ["status", "step_instructions", "call_stack"],
+                    "contracts": crate::contracts::advertisement_value(&[
+                        "nds.execution.frame-step-absent",
+                        "nds.call-stack.best-effort",
+                    ]),
+                }
+            })
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    std::thread::sleep(Duration::from_millis(100));
+
+    let stream = TcpStream::connect(session_addr).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut writer = stream;
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({
+            "v": 1,
+            "id": 1,
+            "method": "attach",
+            "params": {"name": "nds-contracts"},
+        })
+    )
+    .unwrap();
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let value: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(
+        value["result"]["contracts"]["catalog"],
+        crate::contracts::CATALOG_ID
+    );
+    assert_eq!(
+        value["result"]["contracts"]["active_exceptions"],
+        serde_json::json!([
+            "nds.execution.frame-step-absent",
+            "nds.call-stack.best-effort"
+        ])
+    );
+    emulator.join().unwrap();
+}
+
+#[test]
 fn broker_rejects_mesen_without_native_halt_features() {
     let (emu_addr, session_addr) = start_broker();
     let emulator = fake_mesen_emu(emu_addr, "unpatched", &["code_break_idle"], 200);

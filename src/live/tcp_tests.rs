@@ -181,6 +181,70 @@ fn tcp_link_does_hello_and_call() {
 }
 
 #[test]
+fn tcp_link_preserves_contract_advertisement_from_hello() {
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let h = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let (id, token) = hello_parts(&hello);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "adapter": "desmume-nds-rust-gdb",
+                    "system": "nds",
+                    "methods": ["status", "step_instructions", "call_stack"],
+                    "session_token": token,
+                    "contracts": crate::contracts::advertisement_value(&[
+                        "nds.execution.frame-step-absent",
+                        "nds.call-stack.best-effort",
+                    ]),
+                }
+            })
+        )
+        .unwrap();
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let request: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+        assert_eq!(request["method"], "status");
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "ok": true,
+                "result": {"connected": true},
+            })
+        )
+        .unwrap();
+    });
+
+    link.call("status", serde_json::json!({})).unwrap();
+    match &link.capabilities().contracts {
+        crate::contracts::ContractAdvertisement::Reported(value) => {
+            assert_eq!(value.catalog, crate::contracts::CATALOG_ID);
+            assert_eq!(
+                value.active_exceptions,
+                vec![
+                    "nds.execution.frame-step-absent".to_string(),
+                    "nds.call-stack.best-effort".to_string()
+                ]
+            );
+        }
+        other => panic!("reported contracts expected, got {other:?}"),
+    }
+    h.join().unwrap();
+}
+
+#[test]
 fn tcp_link_rejects_mesen_without_native_halt_features() {
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();

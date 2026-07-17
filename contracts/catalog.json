@@ -1,0 +1,532 @@
+{
+  "schema": "emucap-feature-contracts/v2",
+  "contract_version": 2,
+  "default_expectations": [
+    "CORE.AVAIL.1",
+    "CORE.REJECT.1",
+    "CORE.SUCCESS.1",
+    "CORE.PARAM.1",
+    "CORE.UNIT.1",
+    "CORE.EVIDENCE.1",
+    "CORE.BOUND.1",
+    "CORE.SESSION.1",
+    "CORE.CLEANUP.1"
+  ],
+  "expectations": [
+    {
+      "id": "CORE.AVAIL.1",
+      "category": "invariant",
+      "expression": "f in methods => callable(f)"
+    },
+    {
+      "id": "CORE.REJECT.1",
+      "category": "invariant",
+      "expression": "not P_eff => explicit_error and delta_tool = 0"
+    },
+    {
+      "id": "CORE.SUCCESS.1",
+      "category": "invariant",
+      "expression": "response.ok => Q_eff and I_f and O_eff"
+    },
+    {
+      "id": "CORE.PARAM.1",
+      "category": "invariant",
+      "expression": "accepted(parameter) => defined_effect(parameter)"
+    },
+    {
+      "id": "CORE.UNIT.1",
+      "category": "invariant",
+      "expression": "declared_unit = measured_unit"
+    },
+    {
+      "id": "CORE.EVIDENCE.1",
+      "category": "observation",
+      "expression": "authority(response) <= authority(evidence)"
+    },
+    {
+      "id": "CORE.BOUND.1",
+      "category": "invariant",
+      "expression": "work(feature,input) <= declared_bound(feature,input)"
+    },
+    {
+      "id": "CORE.SESSION.1",
+      "category": "invariant",
+      "expression": "generation(response) = generation(request)"
+    },
+    {
+      "id": "CORE.CLEANUP.1",
+      "category": "invariant",
+      "expression": "effect_terminal(feature) => released(transient_resources(feature))"
+    },
+    {
+      "id": "TIME.RESPONSE.1",
+      "category": "temporal",
+      "expression": "G(accepted(q) => F<=D_h response_terminal(q))"
+    },
+    {
+      "id": "TIME.COMPLETE.1",
+      "category": "temporal",
+      "expression": "G(response_completed(q) => effect_terminal(q))"
+    },
+    {
+      "id": "TIME.EFFECT.1",
+      "category": "temporal",
+      "expression": "G(armed(q) => F<=B_e effect_terminal(q))"
+    },
+    {
+      "id": "TIME.CLEANUP.1",
+      "category": "temporal",
+      "expression": "G(effect_terminal(q) => not owns_transient(q) or generation_terminated)"
+    },
+    {
+      "id": "TIME.CANCEL.1",
+      "category": "temporal",
+      "expression": "G(request_scoped(q) and disconnect(q) => F<=D_h ((aborted(q) and cleanup(q)) or generation_terminated))"
+    },
+    {
+      "id": "TIME.DETACHED.1",
+      "category": "temporal",
+      "expression": "G(detached(q) => operation_id(q) and cancelable(q) and (observable(q) U effect_terminal(q)))"
+    },
+    {
+      "id": "TIME.GAP.1",
+      "category": "temporal",
+      "expression": "G(host_gap and composition_open and not adapter_owned => frozen and delta_emulator_time = 0)"
+    },
+    {
+      "id": "TIME.GENERATION.1",
+      "category": "temporal",
+      "expression": "G(active(q) => same_generation(q) U effect_terminal(q))"
+    },
+    {
+      "id": "TIME.EXACT.1",
+      "category": "temporal",
+      "expression": "G(completed(advance(unit,n)) => delta_counter(unit) = n)"
+    },
+    {
+      "id": "TIME.PERSISTENT.1",
+      "category": "temporal",
+      "expression": "G(persistent_owned and status_requested => status_reports_owner) and G(persistent_owned => persistent_owned W (explicit_release or generation_terminated))"
+    },
+    {
+      "id": "MEM.READ.EXACT.1",
+      "category": "postcondition",
+      "expression": "read.ok => len(read.bytes) = request.length and read.space = request.memory_type"
+    },
+    {
+      "id": "MEM.WRITE.APPLY.1",
+      "category": "postcondition",
+      "expression": "write.ok => Applied(memory_type,address,bytes)"
+    },
+    {
+      "id": "STATE.FILTER.1",
+      "category": "postcondition",
+      "expression": "get_state.ok and groups not empty => returned_groups subset_of groups and groups_applied"
+    },
+    {
+      "id": "VIDEO.CURRENT.1",
+      "category": "observation",
+      "expression": "screenshot.ok => image.generation = current_generation and image.freshness = current"
+    },
+    {
+      "id": "INPUT.HOLD.RELEASE.1",
+      "category": "postcondition",
+      "expression": "set_input(empty).ok => override_engaged(after) = false"
+    },
+    {
+      "id": "INPUT.PULSE.SAME_WINDOW.1",
+      "category": "postcondition",
+      "expression": "press(buttons,n).completed => every button is injected in the same n-frame window"
+    },
+    {
+      "id": "INPUT.PULSE.CLEANUP.1",
+      "category": "invariant",
+      "expression": "effect_terminal(press) => transient_override_engaged(after) = false"
+    },
+    {
+      "id": "EXEC.PAUSE.HALT.1",
+      "category": "postcondition",
+      "expression": "pause.ok => frozen(after) and not free_progress(selected_execution_unit)"
+    },
+    {
+      "id": "EXEC.PAUSE.PERSIST.1",
+      "category": "temporal",
+      "expression": "G(frozen and generation_live and not release_event => X(frozen))"
+    },
+    {
+      "id": "EXEC.STEP.FRAME.1",
+      "category": "postcondition",
+      "expression": "step(n).completed => delta_frame = n and frozen(after)"
+    },
+    {
+      "id": "EXEC.STEP.INSTR.1",
+      "category": "postcondition",
+      "expression": "step_instructions(n,cpu).completed => delta_instruction(cpu) = n and frozen(after)"
+    },
+    {
+      "id": "STATE.LOAD.COHERENT.1",
+      "category": "postcondition",
+      "expression": "load.ok => one_snapshot(cpu_state,device_state) and generation = current_generation"
+    },
+    {
+      "id": "PROBE.ATOMIC.1",
+      "category": "invariant",
+      "expression": "probe.ok => no_external_mutation_between(load,advance,read)"
+    },
+    {
+      "id": "BP.ARMED.1",
+      "category": "postcondition",
+      "expression": "set_breakpoint.ok => armed(id,kind,space,range,condition)"
+    },
+    {
+      "id": "EVENT.ONCE.1",
+      "category": "invariant",
+      "expression": "drained(event) => event not_in future_poll_events"
+    },
+    {
+      "id": "TRACE.AUTHORITY.1",
+      "category": "observation",
+      "expression": "authority(result) = exact => every frame has exact evidence"
+    },
+    {
+      "id": "FAIL.TIMEOUT.NONCRASH.1",
+      "category": "invariant",
+      "expression": "timeout and not adapter_fatal_evidence => execution != crashed"
+    },
+    {
+      "id": "ANALYSIS.PROVENANCE.1",
+      "category": "observation",
+      "expression": "analysis.ok => same(content,base_state,input_lineage,contract_generation)"
+    }
+  ],
+  "features": [
+    {
+      "id": "transport.hello",
+      "surface": "wire",
+      "methods": ["hello"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["CORE.AVAIL.1"]
+    },
+    {
+      "id": "lifecycle.bootstrap",
+      "surface": "public",
+      "methods": ["bootstrap"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["FAIL.TIMEOUT.NONCRASH.1"]
+    },
+    {
+      "id": "lifecycle.launch-plan",
+      "surface": "public",
+      "methods": ["launch_plan"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "lifecycle.launch",
+      "surface": "public",
+      "methods": ["launch"],
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1", "TIME.GENERATION.1"]
+    },
+    {
+      "id": "runtime.status",
+      "surface": "public",
+      "methods": ["status"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["FAIL.TIMEOUT.NONCRASH.1"]
+    },
+    {
+      "id": "failure.context",
+      "surface": "public",
+      "methods": ["get_failure_context"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["FAIL.TIMEOUT.NONCRASH.1"]
+    },
+    {
+      "id": "failure.dismiss",
+      "surface": "public",
+      "methods": ["dismiss_failure"],
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1", "TIME.CLEANUP.1"]
+    },
+    {
+      "id": "failure.test-fatal",
+      "surface": "test",
+      "methods": ["test_fatal"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1"]
+    },
+    {
+      "id": "content.identity",
+      "surface": "public",
+      "methods": ["get_rom_info"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "memory.read",
+      "surface": "public",
+      "methods": ["read_memory"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["MEM.READ.EXACT.1"]
+    },
+    {
+      "id": "memory.write",
+      "surface": "public",
+      "methods": ["write_memory"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["MEM.WRITE.APPLY.1"]
+    },
+    {
+      "id": "memory.search",
+      "surface": "public",
+      "methods": ["find_pattern"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "memory.dump",
+      "surface": "public",
+      "methods": ["dump_memory"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "state.read",
+      "surface": "public",
+      "methods": ["get_state"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["STATE.FILTER.1"]
+    },
+    {
+      "id": "video.capture",
+      "surface": "public",
+      "methods": ["screenshot"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": ["VIDEO.CURRENT.1"]
+    },
+    {
+      "id": "video.inspect",
+      "surface": "public",
+      "methods": ["get_video_state", "resolve_tile"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "video.layer-control",
+      "surface": "public",
+      "methods": ["set_layer_enable"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "input.hold",
+      "surface": "public",
+      "methods": ["set_input"],
+      "temporal_classes": ["T0/P"],
+      "disposition": "retain",
+      "expectations": ["INPUT.HOLD.RELEASE.1", "TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "input.pulse",
+      "surface": "public",
+      "methods": ["press_buttons"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["INPUT.PULSE.SAME_WINDOW.1", "INPUT.PULSE.CLEANUP.1", "TIME.COMPLETE.1"]
+    },
+    {
+      "id": "input.touch",
+      "surface": "public",
+      "methods": ["touch"],
+      "temporal_classes": ["T0/P", "T2"],
+      "disposition": "retain",
+      "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "input.tap",
+      "surface": "public",
+      "methods": ["tap", "tap_sequence"],
+      "temporal_classes": ["T1"],
+      "disposition": "evaluate_remove",
+      "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "input.hold-until",
+      "surface": "public",
+      "methods": ["hold_until"],
+      "temporal_classes": ["T1"],
+      "disposition": "evaluate_remove",
+      "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "execution.pause",
+      "surface": "public",
+      "methods": ["pause"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["EXEC.PAUSE.HALT.1", "EXEC.PAUSE.PERSIST.1", "TIME.RESPONSE.1"]
+    },
+    {
+      "id": "execution.resume",
+      "surface": "public",
+      "methods": ["resume"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "execution.run-frames",
+      "surface": "public",
+      "methods": ["run_frames"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1", "TIME.COMPLETE.1"]
+    },
+    {
+      "id": "execution.step-frames",
+      "surface": "public",
+      "methods": ["step"],
+      "temporal_classes": ["T1"],
+      "disposition": "retain",
+      "expectations": ["EXEC.STEP.FRAME.1", "TIME.EXACT.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "execution.step-instructions",
+      "surface": "public",
+      "methods": ["step_instructions"],
+      "temporal_classes": ["T1"],
+      "disposition": "consolidate",
+      "expectations": ["EXEC.STEP.INSTR.1", "TIME.EXACT.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "execution.reset",
+      "surface": "public",
+      "methods": ["reset"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
+    },
+    {
+      "id": "state.save",
+      "surface": "public",
+      "methods": ["save_state"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "state.load",
+      "surface": "public",
+      "methods": ["load_state"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": ["STATE.LOAD.COHERENT.1"]
+    },
+    {
+      "id": "state.probe",
+      "surface": "public",
+      "methods": ["probe"],
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["PROBE.ATOMIC.1", "TIME.COMPLETE.1"]
+    },
+    {
+      "id": "debug.breakpoint",
+      "surface": "public",
+      "methods": ["set_breakpoint", "clear_breakpoint", "list_breakpoints", "clear_all_breakpoints"],
+      "temporal_classes": ["T0/P"],
+      "disposition": "retain",
+      "expectations": ["BP.ARMED.1", "TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "debug.events",
+      "surface": "public",
+      "methods": ["poll_events"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["EVENT.ONCE.1"]
+    },
+    {
+      "id": "debug.disassemble",
+      "surface": "public",
+      "methods": ["disassemble"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": []
+    },
+    {
+      "id": "debug.register-watch",
+      "surface": "public",
+      "methods": ["watch_register"],
+      "temporal_classes": ["T0/P"],
+      "disposition": "retain",
+      "expectations": ["TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "debug.trace",
+      "surface": "public",
+      "methods": ["set_trace", "get_trace"],
+      "temporal_classes": ["T0/P"],
+      "disposition": "retain",
+      "expectations": ["TRACE.AUTHORITY.1", "TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "debug.call-stack",
+      "surface": "public",
+      "methods": ["call_stack"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": ["TRACE.AUTHORITY.1"]
+    },
+    {
+      "id": "debug.break-on-reset",
+      "surface": "public",
+      "methods": ["break_on_reset"],
+      "temporal_classes": ["T0/P"],
+      "disposition": "consolidate",
+      "expectations": ["TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "analysis.bisect",
+      "surface": "public",
+      "methods": ["bisect"],
+      "temporal_classes": ["T5"],
+      "disposition": "evaluate_remove",
+      "expectations": ["ANALYSIS.PROVENANCE.1"]
+    },
+    {
+      "id": "analysis.regression",
+      "surface": "public",
+      "methods": ["regression_run"],
+      "temporal_classes": ["T5"],
+      "disposition": "migrate",
+      "expectations": ["ANALYSIS.PROVENANCE.1"]
+    },
+    {
+      "id": "analysis.determinism",
+      "surface": "public",
+      "methods": ["verify_determinism"],
+      "temporal_classes": ["T5"],
+      "disposition": "migrate",
+      "expectations": ["ANALYSIS.PROVENANCE.1"]
+    }
+  ]
+}

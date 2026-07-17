@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -180,40 +180,40 @@ fn track_err(msg: impl std::fmt::Display) -> CallToolResult {
 }
 
 /// MCP 서버 사용 가이드. 에이전트가 항상 보는 유일한 문서이므로 자기완결적이어야 한다.
-const SERVER_INSTRUCTIONS: &str = r#"emucap 실험 추적 MCP — 시도를 기록·재현·비교해 "어떤 경우 패치가 성공하나"를 쌓는 경량 FS 원장(.emucap/, gitignore)이다. **이 서버는 에뮬레이터를 모른다(emulator-less, framework-agnostic).** 메모리/상태/화면/입력 같은 라이브 제어는 별도 제어 MCP(emucap-mcp)가 한다 — 이 둘은 서로 호출하지 않고, 에이전트가 조립한다(비유: MLflow ↔ TensorFlow).
+const SERVER_INSTRUCTIONS: &str = r#"emucap 실험 추적 MCP — 시도를 기록·재현·비교해 어떤 조건에서 패치가 성공하는지 찾기 위한 `.emucap/` 기록 저장소다. **이 서버는 에뮬레이터를 제어하지 않는다.** 메모리·상태·화면·입력 제어는 별도 제어 MCP(emucap-mcp)에서 한다. 두 서버는 서로 호출하지 않으므로 에이전트가 필요한 값을 직접 전달한다.
 
-[조립 — 제어 MCP에서 받아 넘길 것]
-  • rom_sha1: 이 MCP는 ROM을 모른다. 제어 MCP `get_rom_info`의 균일 `rom_sha1` 필드로 구해 run_start/get_run/query_runs/log_finding에 넘긴다(어댑터가 어떤 해시를 쓰든 canonical로 정규화돼 나온다). `rom_sha1`이 없는 백엔드(콘텐츠 해시 미반환)만 `shasum -a1 <content>` 폴백.
+[제어 MCP에서 받을 값]
+  • rom_sha1: 이 MCP는 ROM을 읽지 않는다. 제어 MCP `get_rom_info`가 반환한 공통 `rom_sha1` 값을 run_start/get_run/query_runs/log_finding에 그대로 넘긴다. `rom_sha1`이 없는 경우에만 `shasum -a1 <content>`를 쓴다.
   • connection_ref(선택): 제어 MCP `status.emulator_identity.name`, 또는 `"port:" + status.listening_port`. run_start에 넘기면 같은 connection의 직전 미종료 run을 자동 마감(superseded)한다.
-  • 분석 verb(regression_run/verify_determinism)는 제어 MCP가 에뮬을 구동해 verdict를 *반환만* 한다(원장에 쓰지 않음). 그 결과를 받아 log_gate/log_metric으로 여기 기록한다(bisect는 프레임만 반환).
-  • 상태변경(write_memory/load_state/reset/입력)은 제어 MCP가 자동 기록하지 않는다. 재현 충실도(repro_status)를 위해 에이전트가 log_intervention으로 명시 기록한다.
+  • regression_run/verify_determinism은 제어 MCP가 에뮬레이터를 실행해 결과만 반환한다. 그 결과를 log_gate/log_metric으로 기록한다. bisect는 찾은 프레임만 반환한다.
+  • write_memory/load_state/reset/입력처럼 상태를 바꾸는 호출은 자동 기록되지 않는다. 다시 재현할 수 있도록 log_intervention으로 기록한다.
 
-[원장] EMUCAP_TRACK_ROOT(명시) > 작업 repo git root의 .emucap > ./.emucap(폴백). bootstrap이 ledger_path와 ledger_path_source(env|git_root|cwd_fallback)를 반환한다 — cwd_fallback(비-git working dir)이면 경로가 서버 cwd에 의존해 모호하니 ledger_path_warning을 함께 반환한다(EMUCAP_TRACK_ROOT 명시나 git init 권장). .emucap/의 유일 writer가 이 서버이므로 run.json 동시성은 한 프로세스 안에서 직렬화된다 — 라이브 세션 중 `emucap track import` 같은 별 프로세스 write는 피한다. ⚠ broker 다중 세션은 세션마다 추적 MCP가 떠 같은 git-root .emucap을 N-writer로 쓰니 동시 write에 주의(세션별 EMUCAP_TRACK_ROOT 분리 권장).
+[저장 위치] EMUCAP_TRACK_ROOT가 있으면 그 경로, 없으면 작업 중인 git 저장소의 `.emucap`, git 저장소가 아니면 현재 디렉터리의 `.emucap`을 쓴다. bootstrap은 실제 경로를 ledger_path로, 선택 이유를 ledger_path_source로 반환한다. 현재 디렉터리를 쓴 경우에는 ledger_path_warning도 반환하므로 EMUCAP_TRACK_ROOT를 지정하거나 git 저장소에서 실행하는 편이 안전하다. run.json은 이 서버만 쓰게 하고, 라이브 세션 중에는 `emucap track import`처럼 별도 프로세스가 쓰는 명령을 함께 실행하지 않는다. broker를 여러 세션에서 쓸 때는 세션별 EMUCAP_TRACK_ROOT를 나누는 것이 안전하다.
 
 [run 수명]
-  run_start(rom_sha1 필수, connection_ref/goal/description/tags 선택) → in-memory active run 바인딩. 반환 {run_id, rom_sha1, ledger_path}. **resume**: connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running run이 있으면 새 run을 만들지 않고 그 run을 active로 재바인딩한다(반환 resumed:true) — /mcp 재연결로 active 바인딩이 끊겨도 같은 run을 이어써 한 세션이 run 여러 개로 파편화되지 않는다. rom이 다르면 같은 connection_ref의 직전 미종료 run을 자동 마감(superseded)하고 새 run을 만든다(#56).
-  run_resume(run_id): 특정 running run을 직접 active로 재바인딩한다(반환 resumed:true). 재연결 후 bootstrap의 running_runs에서 이 세션 run을 골라 이어쓸 때. status가 running이 아니면(이미 종료) 에러.
-  log_metric/log_gate/log_artifact/set_reproduction/log_intervention은 active run이 있어야 한다(없으면 즉시 에러 — run_start 또는 run_resume 먼저). log_finding은 active run 또는 명시 rom_sha1이 있으면 기록한다.
-  run_finish(status=done|aborted|error 기본 done, run_id 선택): run_id를 주면 active 상태와 무관하게 그 run을 디스크에서 직접 종료한다(서버 재시작 등으로 고아화된 running run 복구용). 생략 시 active run을 종료한다. 이어쓸 run은 run_finish가 아니라 resume이다 — 정말 버릴 고아만 finish.
+  run_start(rom_sha1 필수, connection_ref/goal/description/tags 선택): 새 run을 현재 기록 대상으로 지정하고 {run_id, rom_sha1, ledger_path}를 반환한다. 같은 connection_ref와 rom_sha1을 가진 미종료 run이 이미 있으면 새로 만들지 않고 이어 쓰며 resumed:true를 반환한다. rom_sha1이 다르면 같은 connection_ref의 이전 run을 superseded로 끝내고 새 run을 만든다.
+  run_resume(run_id): 지정한 running run을 현재 기록 대상으로 다시 선택하고 resumed:true를 반환한다. MCP 재연결 뒤 bootstrap의 running_runs에서 이어 쓸 run을 찾았을 때 사용한다. 이미 종료된 run이면 오류다.
+  log_metric/log_gate/log_artifact/set_reproduction/log_intervention은 현재 run이 있어야 한다. 없으면 run_start 또는 run_resume을 먼저 호출한다. log_finding은 현재 run이 있거나 rom_sha1을 직접 주면 기록할 수 있다.
+  run_finish(status=done|aborted|error 기본 done, run_id 선택): run_id가 있으면 현재 선택 여부와 상관없이 그 run을 종료한다. 생략하면 현재 run을 종료한다. 이어 쓸 run에는 run_finish를 쓰지 않는다. 더 이상 쓰지 않을 미종료 run만 종료한다.
 
 [기록 도구]
-  log_metric(key, value): 정량 메트릭 1건.
-  log_gate(name, kind=machine|judgment, passed?/evidence_ref?/detail?/case_ref?): 검증 게이트(passed 생략=pending). 제어 MCP 분석 verb의 결과를 여기로 기록하는 1순위 도구.
-  log_artifact(kind, path): 이미 캡처된 파일을 등록(sha256 계산, 새 캡처 안 함). 상대경로는 작업 repo git root 기준으로 해소된다.
-  set_reproduction(base?, movie_ref?): active run의 재현 base/movie 설정(repro_status 자동 도출).
-  log_finding(claim, rom_sha1?/evidence_refs?/promoted?): 발견을 ROM 스코프로 기록(promoted=true면 승격).
-  log_intervention(op, args?/at_frame?/at_event?/frozen_context?): active run에 상태변경 lineage를 명시 기록.
+  log_metric(key, value): 이름과 숫자 한 쌍을 기록한다.
+  log_gate(name, kind=machine|judgment, passed?/evidence_ref?/detail?/case_ref?): 검증 결과를 기록한다. passed를 생략하면 pending이다. 제어 MCP 분석 도구의 결과는 주로 여기에 기록한다.
+  log_artifact(kind, path): 이미 캡처된 파일을 등록하고 sha256을 계산한다. 새 캡처를 만들지는 않는다. 상대경로는 작업 중인 git 저장소에서 찾는다.
+  set_reproduction(base?, movie_ref?): 현재 run을 다시 실행하는 데 쓸 base와 movie_ref를 설정한다. repro_status는 자동으로 계산된다.
+  log_finding(claim, rom_sha1?/evidence_refs?/promoted?): 발견을 해당 ROM에 기록한다. promoted=true는 확정된 발견으로 표시한다.
+  log_intervention(op, args?/at_frame?/at_event?/frozen_context?): 현재 run에 상태 변경 이력을 기록한다.
 
-[질의 — 순수 읽기]
+[저장된 기록 읽기]
   query_runs(rom_sha1?/goal?/status?): 필터로 run 목록(최근 우선). 손상 JSON은 skipped로 세고 죽지 않는다.
-  get_run(rom_sha1, run_id): run 상세(run.json 정본 + ledger_path). run_id는 전역 유일이나 원장이 rom 디렉터리로 샤딩돼 위치 특정에 rom_sha1이 필요하다.
-  compare_runs(run_id_a, run_id_b): 두 run의 메트릭 delta·게이트 변화·재현성·개입·산출물 diff.
-  summarize_runs(goal?/tag?/rom_sha1?): run 묶음 횡단 rollup(상태·재현성 분포·게이트 통과율·개입 op 빈도·per-run 캡슐).
-  **성공 판정은 하지 않는다 — 사실만 펼치고 "어떤 경우 성공인가" 패턴은 에이전트가 추론한다.**
+  get_run(rom_sha1, run_id): 저장된 run.json 내용과 ledger_path를 반환한다. run_id는 전체에서 고유하지만 ROM별 디렉터리에서 찾으므로 rom_sha1도 필요하다.
+  compare_runs(run_id_a, run_id_b): 두 run의 수치 변화, log_gate 결과 변화, 재현성, 상태 변경, 파일 차이를 반환한다.
+  summarize_runs(goal?/tag?/rom_sha1?): 여러 run의 상태·재현성 분포, log_gate 결과 비율, 상태 변경 종류, run별 요약을 반환한다.
+  **성공 여부를 대신 결정하지 않는다. 저장된 결과를 보고 어떤 조건에서 성공했는지는 에이전트가 판단한다.**
 
-[셸 CLI] emucap track ls|show|compare|summarize|reindex|import (같은 .emucap/ 원장을 읽는다).
+[셸 CLI] emucap track ls|show|compare|summarize|reindex|import도 같은 `.emucap/` 기록을 읽는다.
 
-[거대 결과] query_runs/summarize_runs는 output_path를 줘 파일로 받고 요약+경로만 받아라(컨텍스트 절약). 벌크 메모리 덤프는 *제어 MCP*의 dump_memory(이 추적 MCP엔 없다)."#;
+[큰 결과] query_runs/summarize_runs에는 output_path를 줘 파일로 저장하고 요약과 경로만 받는다. 메모리 전체 덤프는 제어 MCP의 dump_memory를 쓴다. 이 추적 MCP에는 dump_memory가 없다."#;
 
 // ── 도구 구현 ────────────────────────────────────────────────────────────────
 
@@ -303,7 +303,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "실험 Run을 시작한다(메타 전용, 에뮬레이터 무통신). rom_sha1은 필수 — 제어 MCP의 get_rom_info에서 읽어 전달하라(이 MCP는 에뮬레이터를 모른다). connection_ref는 선택(어느 세션 run인지 표식). **resume**: connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running run이 있으면 새 run을 만들지 않고 그 run을 active로 재바인딩한다(반환 resumed:true) — /mcp 재연결로 active가 끊겨도 같은 run을 이어써 파편화를 막는다. rom이 다르면 같은 connection_ref의 직전 미종료 run을 자동 마감하고 새 run을 만든다(#56). 이후 log_*가 이 run에 기록된다."
+        description = "실험 Run을 시작한다(메타 전용, 에뮬레이터 무통신). rom_sha1은 필수 — 제어 MCP의 get_rom_info에서 읽어 전달하라(이 MCP는 에뮬레이터를 모른다). connection_ref는 선택(어느 세션 run인지 표식). **resume**: connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running run이 있으면 새 run을 만들지 않고 그 run을 active로 재바인딩한다(반환 resumed:true) — /mcp 재연결로 active가 끊겨도 같은 run을 이어써 파편화를 막는다. rom이 다르면 같은 connection_ref의 직전 미종료 run을 자동 마감하고 새 run을 만든다. 이후 log_*가 이 run에 기록된다."
     )]
     async fn run_start(&self, Parameters(a): Parameters<TrackRunStartArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
@@ -311,7 +311,7 @@ impl EmucapTrack {
         // resume(재연결 복원): connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running
         // run이 있으면 supersede+새 run이 아니라 그 run을 active로 재바인딩한다(파편화 0). rom이 다르거나
         // 일치 running이 없으면 None → 아래 supersede 경로(start_run의 finish_stale_running)가 직전 run을
-        // 마감하고 새 run을 만든다(#56 보존). best-effort: 조회 에러는 fall-through해 start_run이 노출한다.
+        // 마감하고 새 run을 만든다. best-effort: 조회 에러는 fall-through해 start_run이 노출한다.
         if let Some(cref) = a.connection_ref.as_deref() {
             if let Ok(Some(binding)) =
                 emucap::track::mcp_ops::find_resumable_run(&root, cref, &a.rom_sha1)
@@ -324,7 +324,7 @@ impl EmucapTrack {
                 );
             }
         }
-        // 원장 위생(#56): 새 run 전 직전 in-memory 활성 run을 aborted(superseded)로 정리한다.
+        // 원장 위생: 새 run 전 직전 in-memory 활성 run을 aborted(superseded)로 정리한다.
         // 같은 connection의 디스크 고아 running 정리(서버 재시작 복구)는 mcp_ops::start_run이 맡는다.
         if let Some(ar) = self
             .active_run
@@ -393,7 +393,7 @@ impl EmucapTrack {
             };
         let root = emucap::track::store::root_from_env();
         let now = emucap::track::clock::now_rfc3339();
-        // run_id 지정: in-memory 활성 상태에 의존하지 않고 디스크에서 직접 종료(서버 재시작 등 고아 복구, #56).
+        // run_id 지정: in-memory 활성 상태에 의존하지 않고 디스크에서 직접 종료(서버 재시작 등 고아 복구).
         if let Some(rid) = a.run_id.as_deref() {
             return match emucap::track::mcp_ops::finish_run_by_id(&root, rid, status, &now) {
                 Ok(v) => {
@@ -705,10 +705,12 @@ impl EmucapTrack {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EmucapTrack {
     fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some(SERVER_INSTRUCTIONS.into());
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "emucap-track-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(SERVER_INSTRUCTIONS)
     }
 }
 
@@ -724,393 +726,5 @@ async fn main() -> anyhow::Result<()> {
 // 테스트는 프로세스 전역 env(EMUCAP_TRACK_ROOT)를 직렬화하려 ENV_LOCK 가드를 .await 너머로 든다.
 // tokio::test는 current-thread 런타임이고 추적 도구 future는 yield하지 않아 실제 경합은 없다 — 의도된 lint.
 #[allow(clippy::await_holding_lock)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex as StdMutex, MutexGuard};
-    use tempfile::TempDir;
-
-    /// EMUCAP_TRACK_ROOT를 임시 디렉터리로 둔다. 환경변수는 프로세스 전역이라 직렬화 lock으로
-    /// 테스트 간 간섭을 막는다(반환한 guard가 살아있는 동안 단독 점유). guard와 TempDir를 함께
-    /// 돌려줘 .await을 지나도 유효하다.
-    fn temp_env() -> (TempDir, MutexGuard<'static, ()>) {
-        static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = TempDir::new().unwrap();
-        std::env::set_var("EMUCAP_TRACK_ROOT", dir.path());
-        (dir, guard)
-    }
-
-    /// CallToolResult의 텍스트 본문을 추출한다(검증용).
-    fn body_text(r: &CallToolResult) -> String {
-        r.content
-            .iter()
-            .filter_map(|c| c.as_text().map(|t| t.text.clone()))
-            .collect::<Vec<_>>()
-            .join("")
-    }
-
-    #[tokio::test]
-    async fn run_start_binds_active_and_log_metric_round_trips() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        let s = EmucapTrack::new();
-        // log_metric before run_start → 활성 run 없음 에러
-        let r = s
-            .log_metric(Parameters(LogMetricArgs {
-                key: "k".into(),
-                value: 1.0,
-            }))
-            .await;
-        assert_eq!(r.is_error, Some(true));
-
-        // run_start binds active
-        let r = s
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_a".into(),
-                connection_ref: Some("port:1".into()),
-                goal: Some("font".into()),
-                description: None,
-                tags: vec!["t".into()],
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let run_id = v["run_id"].as_str().unwrap().to_string();
-        assert_eq!(v["rom_sha1"], "sha_a");
-        // active 바인딩 확인
-        assert_eq!(
-            s.active_run.lock().unwrap().as_ref().unwrap().run_id,
-            run_id
-        );
-
-        // now log_metric succeeds
-        let r = s
-            .log_metric(Parameters(LogMetricArgs {
-                key: "frames".into(),
-                value: 42.0,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-
-        // disk 정본 확인
-        let run = emucap::track::store::load_run(root, "sha_a", &run_id).unwrap();
-        assert_eq!(run.status, emucap::track::model::RunStatus::Running);
-        assert!(run
-            .metrics
-            .iter()
-            .any(|m| m.key == "frames" && m.value == 42.0));
-    }
-
-    #[tokio::test]
-    async fn run_finish_clears_active() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        let s = EmucapTrack::new();
-        let r = s
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_b".into(),
-                connection_ref: None,
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let run_id = v["run_id"].as_str().unwrap().to_string();
-
-        let r = s
-            .run_finish(Parameters(RunFinishArgs {
-                status: Some("done".into()),
-                run_id: None,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-        assert!(s.active_run.lock().unwrap().is_none());
-        let run = emucap::track::store::load_run(root, "sha_b", &run_id).unwrap();
-        assert_eq!(run.status, emucap::track::model::RunStatus::Done);
-    }
-
-    #[tokio::test]
-    async fn run_finish_by_id_recovers_orphan() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        // 디스크에 직접 running run을 만들고(고아), 새 서버 인스턴스로 id 종료
-        let now = emucap::track::clock::now_rfc3339();
-        let run = emucap::track::ops::create_run(
-            root,
-            &emucap::track::id::UlidGen,
-            &now,
-            "sha_c",
-            None,
-            None,
-            vec![],
-            None,
-        )
-        .unwrap();
-        let s = EmucapTrack::new(); // active 없음
-        let r = s
-            .run_finish(Parameters(RunFinishArgs {
-                status: Some("aborted".into()),
-                run_id: Some(run.id.clone()),
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-        let loaded = emucap::track::store::load_run(root, "sha_c", &run.id).unwrap();
-        assert_eq!(loaded.status, emucap::track::model::RunStatus::Aborted);
-    }
-
-    #[tokio::test]
-    async fn log_intervention_records_to_active_run() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        let s = EmucapTrack::new();
-        let r = s
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_d".into(),
-                connection_ref: None,
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let run_id = v["run_id"].as_str().unwrap().to_string();
-
-        let r = s
-            .log_intervention(Parameters(LogInterventionArgs {
-                op: "write_memory".into(),
-                args: Some(serde_json::json!({"memory_type": "snesWorkRam", "address": 104})),
-                at_frame: Some(7),
-                at_event: None,
-                frozen_context: true,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-        let run = emucap::track::store::load_run(root, "sha_d", &run_id).unwrap();
-        assert_eq!(run.interventions.len(), 1);
-        assert_eq!(run.interventions[0].op, "write_memory");
-        assert_eq!(run.interventions[0].at_frame, Some(7));
-    }
-
-    #[tokio::test]
-    async fn bootstrap_reports_ledger_active_and_orphans() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        // 고아 running run 하나
-        let now = emucap::track::clock::now_rfc3339();
-        emucap::track::ops::create_run(
-            root,
-            &emucap::track::id::UlidGen,
-            &now,
-            "sha_e",
-            None,
-            None,
-            vec![],
-            None,
-        )
-        .unwrap();
-        let s = EmucapTrack::new();
-        let r = s.bootstrap().await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        assert_eq!(v["server"], "emucap-track-mcp");
-        assert_eq!(v["emulator_less"], true);
-        assert_eq!(v["ledger_path"], root.display().to_string());
-        assert_eq!(v["active_run"], serde_json::Value::Null);
-        // 고아 running이 노출돼야 한다(복구 후보)
-        assert_eq!(v["running_runs"].as_array().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn run_start_resumes_same_connection_and_rom_without_new_run() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        // 세션 시작: run R1
-        let s1 = EmucapTrack::new();
-        let r = s1
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_a".into(),
-                connection_ref: Some("port:1".into()),
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let r1 = v["run_id"].as_str().unwrap().to_string();
-        assert!(v.get("resumed").is_none(), "첫 run_start은 resume 아님");
-
-        // /mcp 재연결 흉내: in-memory active가 사라진 새 서버 인스턴스(같은 원장)
-        let s2 = EmucapTrack::new();
-        let r = s2
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_a".into(),
-                connection_ref: Some("port:1".into()),
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        // 같은 run을 resume — 새 run 만들지 않음
-        assert_eq!(v["resumed"], true);
-        assert_eq!(v["run_id"], r1);
-        assert_eq!(s2.active_run.lock().unwrap().as_ref().unwrap().run_id, r1);
-        // 디스크: run 1개뿐이고 여전히 running(파편화·supersede 없음)
-        let runs = emucap::track::store::walk_runs(root).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, emucap::track::model::RunStatus::Running);
-
-        // 이어쓰기 동작 확인: resume 후 log_metric 성공
-        let r = s2
-            .log_metric(Parameters(LogMetricArgs {
-                key: "frames".into(),
-                value: 9.0,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-    }
-
-    #[tokio::test]
-    async fn run_start_supersedes_on_rom_mismatch_same_connection() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        let s1 = EmucapTrack::new();
-        let r = s1
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_a".into(),
-                connection_ref: Some("port:1".into()),
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let r1 = v["run_id"].as_str().unwrap().to_string();
-
-        // 같은 connection이지만 다른 rom → resume 아님(기존 supersede 경로 #56)
-        let s2 = EmucapTrack::new();
-        let r = s2
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_b".into(),
-                connection_ref: Some("port:1".into()),
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let r2 = v["run_id"].as_str().unwrap().to_string();
-        assert!(v.get("resumed").is_none(), "rom 다르면 resume 아님");
-        assert_ne!(r1, r2);
-        // R1은 superseded(aborted), R2는 running
-        assert_eq!(
-            emucap::track::store::load_run(root, "sha_a", &r1)
-                .unwrap()
-                .status,
-            emucap::track::model::RunStatus::Aborted
-        );
-        assert_eq!(
-            emucap::track::store::load_run(root, "sha_b", &r2)
-                .unwrap()
-                .status,
-            emucap::track::model::RunStatus::Running
-        );
-    }
-
-    #[tokio::test]
-    async fn run_resume_rebinds_running_run_and_rejects_finished() {
-        let (dir, _g) = temp_env();
-        let root = dir.path();
-        let s1 = EmucapTrack::new();
-        let r = s1
-            .run_start(Parameters(TrackRunStartArgs {
-                rom_sha1: "sha_a".into(),
-                connection_ref: Some("port:1".into()),
-                goal: None,
-                description: None,
-                tags: vec![],
-            }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        let r1 = v["run_id"].as_str().unwrap().to_string();
-
-        // 재연결: 새 서버, active 없음 → log_metric 에러
-        let s2 = EmucapTrack::new();
-        let r = s2
-            .log_metric(Parameters(LogMetricArgs {
-                key: "k".into(),
-                value: 1.0,
-            }))
-            .await;
-        assert_eq!(r.is_error, Some(true));
-
-        // run_resume로 명시 재바인딩
-        let r = s2
-            .run_resume(Parameters(RunResumeArgs { run_id: r1.clone() }))
-            .await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        assert_eq!(v["resumed"], true);
-        assert_eq!(v["run_id"], r1);
-        // 이제 log_metric 성공(이어쓰기)
-        let r = s2
-            .log_metric(Parameters(LogMetricArgs {
-                key: "frames".into(),
-                value: 5.0,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-        let run = emucap::track::store::load_run(root, "sha_a", &r1).unwrap();
-        assert!(run
-            .metrics
-            .iter()
-            .any(|m| m.key == "frames" && m.value == 5.0));
-
-        // 종료된 run은 resume 거부
-        s2.run_finish(Parameters(RunFinishArgs {
-            status: Some("done".into()),
-            run_id: None,
-        }))
-        .await;
-        let r = s2
-            .run_resume(Parameters(RunResumeArgs { run_id: r1.clone() }))
-            .await;
-        assert_eq!(r.is_error, Some(true));
-    }
-
-    #[tokio::test]
-    async fn bootstrap_reports_ledger_path_source() {
-        // temp_env는 EMUCAP_TRACK_ROOT를 설정하므로 source=env, 경고 없음
-        let (_dir, _g) = temp_env();
-        let s = EmucapTrack::new();
-        let r = s.bootstrap().await;
-        let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
-        assert_eq!(v["ledger_path_source"], "env");
-        assert!(v.get("ledger_path_warning").is_none());
-    }
-
-    #[tokio::test]
-    async fn log_finding_requires_rom_or_active() {
-        let (_dir, _g) = temp_env();
-        let s = EmucapTrack::new();
-        // active도 rom_sha1도 없으면 에러
-        let r = s
-            .log_finding(Parameters(LogFindingArgs {
-                rom_sha1: None,
-                claim: "x".into(),
-                evidence_refs: vec![],
-                promoted: false,
-            }))
-            .await;
-        assert_eq!(r.is_error, Some(true));
-        // 명시 rom_sha1이면 active 없어도 기록
-        let r = s
-            .log_finding(Parameters(LogFindingArgs {
-                rom_sha1: Some("sha_f".into()),
-                claim: "promoted claim".into(),
-                evidence_refs: vec![],
-                promoted: true,
-            }))
-            .await;
-        assert_ne!(r.is_error, Some(true));
-    }
-}
+#[path = "tests/emucap_track_mcp_tests.rs"]
+mod tests;

@@ -1,0 +1,343 @@
+{
+  "schema": "emucap-feature-exceptions/v1",
+  "contract_catalog": "emucap-feature-contracts/v2",
+  "contract_version": 2,
+  "exceptions": [
+    {
+      "id": "mesen.execution.instruction-step-absent",
+      "feature": "execution.step-instructions",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "mesen2-live"},
+      "activation": {"native_instruction_step": false},
+      "constraints": {"execution.step.units": ["frames"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mesen-step-units"]
+    },
+    {
+      "id": "mesen.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mesen2-live"},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:mesen-call-stack-authority"]
+    },
+    {
+      "id": "mednafen.pce-fast.debugger-absent",
+      "feature": "runtime.status",
+      "kind": "variation_binding",
+      "targets": ["CORE.AVAIL.1"],
+      "scope": {"adapter": "mednafen", "systems": ["pce", "pce_fast"]},
+      "activation": {"debugger": false},
+      "constraints": {
+        "debugger.available": false,
+        "execution.step.units": ["frames"]
+      },
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mednafen-debugger-downgrade"]
+    },
+    {
+      "id": "mednafen.md.cpu-write-absent",
+      "feature": "memory.write",
+      "kind": "parameter_constraint",
+      "targets": ["MEM.WRITE.APPLY.1"],
+      "scope": {"adapter": "mednafen", "systems": ["md"]},
+      "activation": {"memory_type": "cpu"},
+      "constraints": {"memory.write.excluded_types": ["cpu"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mednafen-md-noop-write-rejected"]
+    },
+    {
+      "id": "mednafen.ss.physical-read-absent",
+      "feature": "memory.read",
+      "kind": "parameter_constraint",
+      "targets": ["MEM.READ.EXACT.1"],
+      "scope": {"adapter": "mednafen", "systems": ["ss"]},
+      "activation": {"memory_type": "physical"},
+      "constraints": {"memory.read.excluded_types": ["physical"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mednafen-ss-physical-read-rejected"]
+    },
+    {
+      "id": "mednafen.ss.physical-write-absent",
+      "feature": "memory.write",
+      "kind": "parameter_constraint",
+      "targets": ["MEM.WRITE.APPLY.1"],
+      "scope": {"adapter": "mednafen", "systems": ["ss"]},
+      "activation": {"memory_type": "physical"},
+      "constraints": {"memory.write.excluded_types": ["physical"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mednafen-ss-physical-write-rejected"]
+    },
+    {
+      "id": "mednafen.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mednafen"},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:mednafen-call-stack-authority"]
+    },
+    {
+      "id": "mednafen.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mednafen"},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:mednafen-set-input-port-rejected"]
+    },
+    {
+      "id": "mednafen.input-pulse.port-zero-only",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mednafen"},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:mednafen-press-buttons-port-rejected"]
+    },
+    {
+      "id": "mednafen.state.groups-absent",
+      "feature": "state.read",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "STATE.FILTER.1"],
+      "scope": {"adapter": "mednafen"},
+      "activation": {"groups": "non_empty"},
+      "constraints": {"state.groups.supported": false},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:mednafen-state-groups-rejected"]
+    },
+    {
+      "id": "flycast.execution.instruction-step-absent",
+      "feature": "execution.step-instructions",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "flycast-native", "systems": ["dreamcast"]},
+      "activation": {"native_instruction_step": false},
+      "constraints": {"execution.step.units": ["frames"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:flycast-step-units"]
+    },
+    {
+      "id": "flycast.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "flycast-native", "systems": ["dreamcast"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:flycast-call-stack-authority"]
+    },
+    {
+      "id": "flycast.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "flycast-native", "systems": ["dreamcast"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:flycast-set-input-port-rejected"]
+    },
+    {
+      "id": "nds.execution.frame-step-absent",
+      "feature": "execution.step-frames",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
+      "activation": {"native_frame_step": false},
+      "constraints": {"execution.step.units": ["instructions"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:nds-step-units"]
+    },
+    {
+      "id": "nds.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:nds-call-stack-authority"]
+    },
+    {
+      "id": "nds.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:nds-set-input-port-rejected"]
+    },
+    {
+      "id": "nds.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 120
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:nds-press-buttons-port-rejected",
+        "contract-test:nds-press-buttons-frame-cap"
+      ]
+    },
+    {
+      "id": "nds.input-touch.constraints",
+      "feature": "input.touch",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.touch.max_frames": 120
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:nds-touch-port-rejected",
+        "contract-test:nds-touch-frame-cap"
+      ]
+    },
+    {
+      "id": "ppsspp.execution.frame-step-absent",
+      "feature": "execution.step-frames",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},
+      "activation": {"native_frame_step": false},
+      "constraints": {"execution.step.units": ["instructions"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:ppsspp-step-units"]
+    },
+    {
+      "id": "ppsspp.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:ppsspp-set-input-port-rejected"]
+    },
+    {
+      "id": "ppsspp.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "INPUT.PULSE.SAME_WINDOW.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},
+      "activation": {
+        "port": "not_zero",
+        "buttons": "more_than_one",
+        "frames": "above_240"
+      },
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 240,
+        "input.pulse.max_simultaneous_buttons": 1
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:ppsspp-press-buttons-port-rejected",
+        "contract-test:ppsspp-press-buttons-combo-rejected",
+        "contract-test:ppsspp-press-buttons-frame-cap"
+      ]
+    },
+    {
+      "id": "pc98.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mame-pc98-rust-gdb", "systems": ["pc98"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:pc98-call-stack-authority"]
+    },
+    {
+      "id": "pc98.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mame-pc98-rust-gdb", "systems": ["pc98"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:pc98-set-input-port-rejected"]
+    },
+    {
+      "id": "pc98.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "mame-pc98-rust-gdb", "systems": ["pc98"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 120
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:pc98-press-buttons-port-rejected",
+        "contract-test:pc98-press-buttons-frame-cap"
+      ]
+    },
+    {
+      "id": "pc98-legacy.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mame-pc98-gdb", "systems": ["pc98"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:pc98-legacy-call-stack-authority"]
+    },
+    {
+      "id": "pc98-legacy.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mame-pc98-gdb", "systems": ["pc98"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:pc98-legacy-set-input-port-rejected"]
+    },
+    {
+      "id": "pc98-legacy.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "mame-pc98-gdb", "systems": ["pc98"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 120
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:pc98-legacy-press-buttons-port-rejected",
+        "contract-test:pc98-legacy-press-buttons-frame-cap"
+      ]
+    }
+  ]
+}

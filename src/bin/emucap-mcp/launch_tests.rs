@@ -935,6 +935,8 @@ struct RuntimeLaunchLink {
     caps: Capabilities,
     port: u16,
     token: String,
+    calls: usize,
+    available: bool,
 }
 
 impl RuntimeLaunchLink {
@@ -943,7 +945,13 @@ impl RuntimeLaunchLink {
             caps: Capabilities::empty(),
             port,
             token: "legacy-control-token".into(),
+            calls: 0,
+            available: true,
         }
+    }
+
+    fn disconnect(&mut self) {
+        self.available = false;
     }
 }
 
@@ -957,7 +965,15 @@ impl EmulatorLink for RuntimeLaunchLink {
         _method: &str,
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, LinkError> {
-        Err(LinkError::NotConnected)
+        self.calls += 1;
+        if self.calls == 1 || !self.available {
+            Err(LinkError::NotConnected)
+        } else {
+            Ok(serde_json::json!({
+                "connected": true,
+                "state": "running"
+            }))
+        }
     }
 
     fn endpoint_port(&self) -> Option<u16> {
@@ -1014,6 +1030,8 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
 
     let first = make_launch(&mut link, &args);
     assert_eq!(first["launched"], true, "{first}");
+    assert_eq!(first["ready"], true, "{first}");
+    assert_eq!(first["connected"], true, "{first}");
     let launch_id = first["launch_id"].as_str().unwrap();
     let store = emucap::live::runtime::RuntimeStore::discover();
     let current = store.read_current(port).unwrap().unwrap();
@@ -1047,7 +1065,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     assert_eq!(duplicate["launched"], false, "{duplicate}");
     assert!(duplicate["reason"]
         .as_str()
-        .is_some_and(|reason| reason.contains("still alive")));
+        .is_some_and(|reason| reason.contains("already connected")));
     assert_eq!(
         store.read_current(port).unwrap().unwrap().launch_id,
         launch_id
@@ -1064,6 +1082,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
 
     std::fs::write(&binary, b"#!/bin/sh\nexit 7\n").unwrap();
     make_executable(&binary);
+    link.disconnect();
     let failed = make_launch(&mut link, &args);
     assert_eq!(failed["launched"], false, "{failed}");
     assert_eq!(
@@ -1071,6 +1090,16 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         replacement_id,
         "failed replacement must not publish its prepared generation"
     );
+}
+
+#[test]
+fn adapter_readiness_wait_is_bounded() {
+    let mut link = NotConnectedPortLink::new();
+    let started = std::time::Instant::now();
+    let error = wait_for_adapter_ready(&mut link, std::time::Duration::from_millis(20), || Ok(()))
+        .unwrap_err();
+    assert!(error.contains("within 20 ms"), "{error}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
 }
 
 #[test]

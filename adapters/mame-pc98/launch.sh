@@ -15,6 +15,7 @@
 #   MAME_FLOP2=/path/to/second.hdm
 #   MAME_HEADLESS=1|0                    default: 1 (-noreadconfig -video none -sound none)
 #   MAME_ALLOW_VISIBLE=1                 required with MAME_HEADLESS=0
+#   EMUCAP_PC98_BRIDGE_BIN=/path/to/emucap-mame-pc98-bridge
 #   EMUCAP_LOG=/path/to/custom.log       default: <emucap-data>/mame-pc98/<port>/mame-pc98.log
 set -euo pipefail
 
@@ -29,6 +30,7 @@ if [ "$#" -lt 2 ]; then
 fi
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$HERE/../.." && pwd)"
 . "$HERE/../_common/runtime-env.sh"
 MEDIA="$1"
 PORT="$2"
@@ -140,11 +142,17 @@ LOG="${EMUCAP_LOG:-$RUN_DIR/mame-pc98.log}"
 MAME_HOME="${MAME_HOME:-$RUN_DIR/home}"
 MAME_PIDFILE="$RUN_DIR/mame.pid"
 BRIDGE_PIDFILE="$RUN_DIR/bridge.pid"
-BRIDGE="$HERE/emucap-gdb-bridge.py"
-# 빌드 hash: 스크립트 어댑터(Python 브리지)는 로드시가 곧 버전이라 launch 시점 emucap git hash를 넘긴다
-# (hello/status.emulator_build로 노출, 사용자가 git HEAD와 대조). emucap-gdb-bridge.py가 HEAD와 다르면 -dirty.
-EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap-gdb-bridge.py 2>/dev/null || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+BRIDGE="${EMUCAP_PC98_BRIDGE_BIN:-}"
+if [ -z "$BRIDGE" ]; then
+  for candidate in "$ROOT/target/release/emucap-mame-pc98-bridge" \
+                   "$ROOT/target/debug/emucap-mame-pc98-bridge"; do
+    if [ -x "$candidate" ]; then BRIDGE="$candidate"; break; fi
+  done
+fi
+if [ -z "$BRIDGE" ] && command -v emucap-mame-pc98-bridge >/dev/null 2>&1; then
+  BRIDGE="$(command -v emucap-mame-pc98-bridge)"
+fi
+EMUCAP_BUILD_HASH="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PLUGINPATH="${MAME_PLUGINPATH:-$HERE/plugins}"
 TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
@@ -164,7 +172,10 @@ if [ -n "$LOCAL_MAME_INVALID" ]; then
   echo "WARN: $LOCAL_MAME_INVALID" >&2
 fi
 command -v "$MAME_BIN" >/dev/null 2>&1 || { echo "ERROR: MAME not found: $MAME_BIN" >&2; exit 1; }
-[ -f "$BRIDGE" ] || { echo "ERROR: bridge not found: $BRIDGE" >&2; exit 1; }
+[ -n "$BRIDGE" ] && [ -x "$BRIDGE" ] || {
+  echo "ERROR: Rust PC-98 bridge not found; build emucap-mame-pc98-bridge or set EMUCAP_PC98_BRIDGE_BIN" >&2
+  exit 1
+}
 if [ "$HEADLESS" != "1" ] && [ "${MAME_ALLOW_VISIBLE:-0}" != "1" ]; then
   echo "ERROR: visible MAME launch is disabled by default. Set MAME_ALLOW_VISIBLE=1 with MAME_HEADLESS=0 if a window is intentional." >&2
   exit 2
@@ -226,7 +237,7 @@ fi
 OLD_BRIDGE="$(cat "$BRIDGE_PIDFILE" 2>/dev/null || true)"
 OLD_MAME="$(cat "$MAME_PIDFILE" 2>/dev/null || true)"
 if [ -n "$OLD_BRIDGE" ] && kill -0 "$OLD_BRIDGE" 2>/dev/null \
-   && ps -p "$OLD_BRIDGE" -o command= 2>/dev/null | grep -qiE 'emucap-gdb-bridge|python'; then
+   && ps -p "$OLD_BRIDGE" -o command= 2>/dev/null | grep -qi 'emucap-mame-pc98-bridge'; then
   kill_ours "$OLD_BRIDGE"
 fi
 if [ -n "$OLD_MAME" ] && kill -0 "$OLD_MAME" 2>/dev/null \
@@ -312,40 +323,10 @@ if [ -n "${MAME_FLOP2:-}" ]; then
   ARGS+=(-flop2 "$MAME_FLOP2")
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  MAME_PID="$(
-    python3 - "$LOG" "$MAME_PIDFILE" "$MAME_BIN" "${ARGS[@]}" <<'PY'
-import os
-import subprocess
-import sys
-
-log_path, pidfile, exe, *args = sys.argv[1:]
-devnull = open(os.devnull, "rb")
-log = open(log_path, "ab", buffering=0)
-try:
-    proc = subprocess.Popen(
-        [exe, *args],
-        stdin=devnull,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        close_fds=True,
-        start_new_session=True,
-    )
-finally:
-    log.close()
-    devnull.close()
-
-with open(pidfile, "w", encoding="ascii") as f:
-    f.write(f"{proc.pid}\n")
-print(proc.pid)
-PY
-  )"
-else
-  nohup "$MAME_BIN" "${ARGS[@]}" </dev/null >>"$LOG" 2>&1 &
-  MAME_PID="$!"
-  echo "$MAME_PID" >"$MAME_PIDFILE"
-  disown "$MAME_PID" 2>/dev/null || true
-fi
+nohup "$MAME_BIN" "${ARGS[@]}" </dev/null >>"$LOG" 2>&1 &
+MAME_PID="$!"
+echo "$MAME_PID" >"$MAME_PIDFILE"
+disown "$MAME_PID" 2>/dev/null || true
 
 if command -v lsof >/dev/null 2>&1; then
   for ((i = 0; i < WAIT; i++)); do
@@ -367,41 +348,12 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
-if command -v python3 >/dev/null 2>&1; then
-  BRIDGE_PID="$(
-    EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$MEDIA" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" python3 - "$LOG" "$BRIDGE_PIDFILE" "$BRIDGE" "$PORT" "127.0.0.1:$GDB_PORT" <<'PY'
-import os
-import subprocess
-import sys
-
-log_path, pidfile, bridge, port, gdb = sys.argv[1:]
-devnull = open(os.devnull, "rb")
-log = open(log_path, "ab", buffering=0)
-try:
-    proc = subprocess.Popen(
-        [bridge, port, gdb],
-        stdin=devnull,
-        stdout=log,
-        stderr=subprocess.STDOUT,
-        close_fds=True,
-        start_new_session=True,
-        env=os.environ.copy(),
-    )
-finally:
-    log.close()
-    devnull.close()
-
-with open(pidfile, "w", encoding="ascii") as f:
-    f.write(f"{proc.pid}\n")
-print(proc.pid)
-PY
-  )"
-else
-  EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$MEDIA" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" nohup "$BRIDGE" "$PORT" "127.0.0.1:$GDB_PORT" </dev/null >>"$LOG" 2>&1 &
-  BRIDGE_PID="$!"
-  echo "$BRIDGE_PID" >"$BRIDGE_PIDFILE"
-  disown "$BRIDGE_PID" 2>/dev/null || true
-fi
+EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$MEDIA" \
+  EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" \
+  nohup "$BRIDGE" "$PORT" "127.0.0.1:$GDB_PORT" </dev/null >>"$LOG" 2>&1 &
+BRIDGE_PID="$!"
+echo "$BRIDGE_PID" >"$BRIDGE_PIDFILE"
+disown "$BRIDGE_PID" 2>/dev/null || true
 
 if command -v lsof >/dev/null 2>&1; then
   for ((i = 0; i < WAIT; i++)); do

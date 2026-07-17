@@ -19,6 +19,7 @@ impl DetReplayLink {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
+                contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 identity: emucap::live::link::EmulatorIdentity::default(),
             },
             obs_queue: std::collections::VecDeque::new(),
@@ -463,6 +464,7 @@ struct Pc98InputReplayLink {
     read_hex: &'static str,
     state_restore: Option<serde_json::Value>,
     poll_events: Vec<serde_json::Value>,
+    fail_call: Option<usize>,
 }
 
 impl Pc98InputReplayLink {
@@ -472,6 +474,7 @@ impl Pc98InputReplayLink {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
+                contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 identity: emucap::live::link::EmulatorIdentity {
                     system: Some("pc98".into()),
                     adapter: Some("mame-pc98-gdb".into()),
@@ -482,6 +485,7 @@ impl Pc98InputReplayLink {
             read_hex,
             state_restore: None,
             poll_events: Vec::new(),
+            fail_call: None,
         }
     }
 
@@ -492,6 +496,11 @@ impl Pc98InputReplayLink {
 
     fn with_poll_events(mut self, poll_events: Vec<serde_json::Value>) -> Self {
         self.poll_events = poll_events;
+        self
+    }
+
+    fn with_fail_call(mut self, call: usize) -> Self {
+        self.fail_call = Some(call);
         self
     }
 }
@@ -507,6 +516,9 @@ impl EmulatorLink for Pc98InputReplayLink {
         _params: serde_json::Value,
     ) -> Result<serde_json::Value, LinkError> {
         self.calls.push(method.to_string());
+        if self.fail_call == Some(self.calls.len()) {
+            return Err(LinkError::Timeout);
+        }
         match method {
             "reset"
             | "load_state"
@@ -588,8 +600,10 @@ fn pc98_input_replay_without_probe_can_pass_from_reset() {
             "pause",
             "set_input",
             "step",
+            "read_memory",
+            "set_input",
             "clear_all_breakpoints",
-            "read_memory"
+            "pause"
         ]
     );
 }
@@ -671,8 +685,10 @@ fn load_state_input_replay_can_pass_when_state_is_deterministic() {
             "pause",
             "set_input",
             "step",
+            "read_memory",
+            "set_input",
             "clear_all_breakpoints",
-            "read_memory"
+            "pause"
         ]
     );
 }
@@ -720,6 +736,103 @@ fn input_replay_anchor_hit_during_gap_is_polled_before_next_input() {
         link.calls.iter().filter(|m| m.as_str() == "step").count(),
         2,
         "anchor hit during the empty-frame gap should stop before frame 3 input"
+    );
+}
+
+#[test]
+fn input_replay_failure_boundaries_run_terminal_cleanup() {
+    let (_tmp, case_dir, mut case) = input_replay_case();
+    std::fs::write(case_dir.join("inputs.movie"), "2:enter\n").unwrap();
+    case.repro = regression::Repro::InputReplay {
+        start: "reset".into(),
+        movie: "inputs.movie".into(),
+        anchor: Some(Predicate {
+            memory_type: "cpu".into(),
+            address: 0x1234,
+            length: 1,
+            op: CmpOp::Eq,
+            value: 0,
+        }),
+    };
+    let methods = [
+        "reset",
+        "pause",
+        "set_input",
+        "step",
+        "read_memory",
+        "clear_all_breakpoints",
+        "set_breakpoint",
+        "poll_events",
+    ];
+    let poll_events = vec![
+        serde_json::json!({"events": []}),
+        serde_json::json!({"events": []}),
+        serde_json::json!({"events": []}),
+        serde_json::json!({"events": []}),
+        serde_json::json!({"events": []}),
+    ];
+
+    let mut baseline =
+        Pc98InputReplayLink::new(&methods, "01").with_poll_events(poll_events.clone());
+    assert_eq!(
+        run_one_case(&mut baseline, &case_dir, &case),
+        regression::Verdict::DriftSuspected
+    );
+    let cleanup_start = baseline.calls.len() - 3;
+    let failure_points = baseline
+        .calls
+        .iter()
+        .enumerate()
+        .filter(|(index, method)| {
+            *index < cleanup_start
+                && matches!(method.as_str(), "set_input" | "step" | "poll_events")
+        })
+        .map(|(index, _)| index + 1)
+        .collect::<Vec<_>>();
+    assert!(!failure_points.is_empty());
+
+    for failure_call in failure_points {
+        let mut link = Pc98InputReplayLink::new(&methods, "01")
+            .with_poll_events(poll_events.clone())
+            .with_fail_call(failure_call);
+        let verdict = run_one_case(&mut link, &case_dir, &case);
+        assert!(
+            matches!(verdict, regression::Verdict::ReproError(_)),
+            "call {failure_call} must fail the replay: {verdict:?}"
+        );
+        assert_eq!(
+            &link.calls[link.calls.len() - 3..],
+            &["set_input", "clear_all_breakpoints", "pause"],
+            "call {failure_call} must enter the one terminal cleanup path"
+        );
+    }
+}
+
+#[test]
+fn input_replay_cleanup_failure_is_fail_loud_and_attempts_remaining_cleanup() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    // reset, pause, body set_input, body step, read_memory, cleanup set_input(fail),
+    // clear_all_breakpoints, pause
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    )
+    .with_fail_call(6);
+    let verdict = run_one_case(&mut link, &case_dir, &case);
+    assert!(
+        matches!(verdict, regression::Verdict::ReproError(ref error) if error.contains("temporal cleanup failed")),
+        "cleanup failure must not be reported as a completed replay: {verdict:?}"
+    );
+    assert_eq!(
+        &link.calls[link.calls.len() - 3..],
+        &["set_input", "clear_all_breakpoints", "pause"]
     );
 }
 

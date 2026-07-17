@@ -6,6 +6,7 @@ pub mod protocol;
 pub mod reconnect;
 pub mod runtime;
 pub mod tcp;
+pub mod temporal;
 pub mod tools;
 
 #[cfg(test)]

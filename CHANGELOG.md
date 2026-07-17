@@ -2,6 +2,30 @@
 
 Beta software — interfaces may still change.
 
+## 0.8.0
+
+### Added
+- Runtime feature contracts now have a validated catalog and structured per-adapter exceptions. `hello`/`status` expose the active exception IDs, and composed MCP methods are admitted only when their primitive and contract requirements are satisfied.
+- Input-override ownership is observable across the supported adapter paths, so agents can distinguish native input, persistent holds, and timed pulses before composing or cleaning up operations.
+- Public source snapshots include the `_tests/` development, legacy-comparison, and live-validation assets. They remain outside Cargo targets and runtime launch paths.
+
+### Changed
+- PC-98 uses the Rust `emucap-mame-pc98-bridge` as its only supported runtime bridge. The launcher fails explicitly when that bridge is unavailable instead of installing or selecting a Python implementation.
+- Large Rust bridge and launch modules are split by responsibility, and unit-test bodies live in sibling `*_tests.rs` files. Build guards reject inline Rust test modules and production Rust source files over 1,200 lines.
+- Adapter parameter domains are fail-loud: unsupported controller ports, Mednafen state groups, and oversized or non-atomic timed-input requests are rejected before mutation and described through structured constraints.
+- Host-composed temporal operations share terminal cleanup for input release, breakpoint cleanup, and frozen-state restoration; a cleanup failure is no longer reported as successful completion.
+
+### Fixed
+- Mesen `reset` sends its terminal response before recreating the Lua session, and the Control MCP waits for the replacement session to answer `status` before reporting success.
+- Flycast refuses screenshots after `load_state` until a fresh rendered frame is captured, instead of returning a stale pre-load image.
+- Flycast returns valid `status` JSON when input ownership is reported, and captures the completed render rather than sampling before the frame is drawn.
+- `launch` waits for the adapter to report a live connection before publishing the runtime generation. Startup failure now returns an error and terminates only the processes owned by that attempted launch.
+- Mesen returns input ownership to native controls after `set_input([])` instead of continuing to apply an empty persistent override.
+- NDS and PSP report a released input override as `mode: "native"` instead of leaving its mode missing or persistent.
+- Mednafen timed input returns ownership to native input on completion, interruption, reset, and disconnect, while explicit `set_input` holds remain visible and releasable.
+- NDS, PC-98, and PPSSPP timed-input limits and terminal states are enforced before the bridge can outlive the synchronous request that owns them.
+- MCP initialization reports each emucap server's own name and package version instead of the transport library's metadata.
+
 ## 0.7.3
 
 ### Fixed

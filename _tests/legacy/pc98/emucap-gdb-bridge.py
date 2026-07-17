@@ -39,6 +39,10 @@ class BridgeError(Exception):
     pass
 
 
+class BadParamsError(BridgeError):
+    pass
+
+
 class GdbRsp:
     """Tiny GDB RSP client for MAME gdbstub.  Ack mode, packet escaping."""
 
@@ -177,6 +181,7 @@ DUMP_REGIONS = [
 
 MAX_FIND_LEN = 128 * 1024
 MAX_READ_CHUNK = 0x4000
+MAX_SYNC_TIMED_INPUT_FRAMES = 120
 TRACE_CAP = 4096
 LEGACY_STATE_FORMAT = "emucap-mame-pc98-state-v1"
 STATE_FORMAT = "emucap-mame-pc98-state-v2"
@@ -399,6 +404,14 @@ class Bridge:
             "memory_types": sorted(MEM_BASE.keys()),
             "region_sizes": REGION_SIZE,
             "state_restore": self._state_restore_info(),
+            "contracts": {
+                "catalog": "emucap-feature-contracts/v2",
+                "active_exceptions": [
+                    "pc98-legacy.call-stack.best-effort",
+                    "pc98-legacy.input-hold.port-zero-only",
+                    "pc98-legacy.input-pulse.constraints",
+                ],
+            },
             "capability_notes": self._capability_notes(),
             "input_buttons": {
                 "system": "pc98",
@@ -421,7 +434,7 @@ class Bridge:
 
     def status(self, _params: dict[str, Any]) -> dict[str, Any]:
         self._drain_stop()
-        return {
+        result = {
             "connected": True,
             "system": "pc98",
             "adapter": "mame-pc98-gdb",
@@ -431,6 +444,14 @@ class Bridge:
             "state": "frozen" if self.frozen else "running",
             "memory_types": sorted(MEM_BASE.keys()),
             "state_restore": self._state_restore_info(),
+            "contracts": {
+                "catalog": "emucap-feature-contracts/v2",
+                "active_exceptions": [
+                    "pc98-legacy.call-stack.best-effort",
+                    "pc98-legacy.input-hold.port-zero-only",
+                    "pc98-legacy.input-pulse.constraints",
+                ],
+            },
             "capability_notes": self._capability_notes(),
             "input_buttons": {
                 "system": "pc98",
@@ -439,6 +460,8 @@ class Bridge:
                 "notes": "PC-98 keyboard inputs via MAME ioport field overrides.",
             },
         }
+        result["input_override"] = self._input_override_info()
+        return result
 
     def get_rom_info(self, _params: dict[str, Any]) -> dict[str, Any]:
         content = os.environ.get("EMUCAP_CONTENT") or ""
@@ -493,14 +516,22 @@ class Bridge:
 
     def set_input(self, params: dict[str, Any]) -> dict[str, Any]:
         self._require_lua_backend("set_input")
+        self._require_input_port_zero(params)
         buttons = self._normalize_buttons(params.get("buttons") or [])
         self._lua_cmd("setinput", ",".join(buttons))
         return {"buttons": buttons}
 
     def press_buttons(self, params: dict[str, Any]) -> dict[str, Any]:
         self._require_lua_backend("press_buttons")
+        self._require_input_port_zero(params)
         buttons = self._normalize_buttons(params.get("buttons") or [])
         frames = max(_num(params.get("frames", 1)), 1)
+        if frames > MAX_SYNC_TIMED_INPUT_FRAMES:
+            raise BadParamsError(
+                "PC-98 synchronous press_buttons supports at most "
+                f"{MAX_SYNC_TIMED_INPUT_FRAMES} frames; split the pulse or use set_input "
+                "with an explicit set_input([]) release"
+            )
         stop = self._deferred_lua_op("press", f"{frames}:{','.join(buttons)}", frames)
         if stop:
             self.frozen = True
@@ -519,6 +550,28 @@ class Bridge:
             "frames": frames,
             "frame": self._current_frame(),
             "state": "running",
+        }
+
+    @staticmethod
+    def _require_input_port_zero(params: dict[str, Any]) -> None:
+        port = _num(params.get("port", 0))
+        if port != 0:
+            raise BadParamsError(f"PC-98 input supports only controller port 0 (got {port})")
+
+    def _input_override_info(self) -> dict[str, Any]:
+        try:
+            remaining = int(self._lua_cmd_reply("inputstatus"))
+        except (BridgeError, ValueError):
+            return {"observable": False}
+        if remaining == 0:
+            return {"observable": True, "engaged": False, "mode": "native"}
+        if remaining < 0:
+            return {"observable": True, "engaged": True, "mode": "persistent"}
+        return {
+            "observable": True,
+            "engaged": True,
+            "mode": "timed",
+            "remaining_frames": remaining,
         }
 
     def find_pattern(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1852,6 +1905,12 @@ def _serve_emucap_session(sock: socket.socket, bridge: Bridge) -> None:
         else:
             try:
                 resp = {"id": rid, "ok": True, "result": handler(params)}
+            except BadParamsError as err:
+                resp = {
+                    "id": rid,
+                    "ok": False,
+                    "error": {"kind": "bad_params", "message": str(err)},
+                }
             except BridgeError as err:
                 resp = {
                     "id": rid,

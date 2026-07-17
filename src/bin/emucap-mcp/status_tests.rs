@@ -4,6 +4,19 @@ fn enriched(methods: &[&str]) -> serde_json::Value {
     let m: Vec<String> = methods.iter().map(|s| s.to_string()).collect();
     let mut v = serde_json::json!({"connected": true});
     enrich_status_value(&mut v, &m, &[], None);
+    let identity = EmulatorIdentity {
+        adapter: Some("contract-test".into()),
+        system: Some("test".into()),
+        ..Default::default()
+    };
+    let hello = serde_json::json!({
+        "contracts": emucap::contracts::advertisement_value(&[])
+    });
+    enrich_contract_status(
+        &mut v,
+        &identity,
+        &emucap::contracts::advertisement_from_hello(&hello),
+    );
     v
 }
 fn has_method(v: &serde_json::Value, name: &str) -> bool {
@@ -138,11 +151,26 @@ fn dreamcast_button_hint_exposes_start_aliases() {
 
     assert_eq!(hint["aliases"]["enter"], "start");
     assert_eq!(hint["aliases"]["return"], "start");
+    assert!(hint["notes"]
+        .as_str()
+        .unwrap()
+        .contains("only controller port 0"));
+    assert!(!hint["notes"].as_str().unwrap().contains("ignored"));
     assert!(hint["buttons"]
         .as_array()
         .unwrap()
         .iter()
         .any(|b| b.as_str() == Some("start")));
+}
+
+#[test]
+fn nds_button_hint_describes_current_input_contract() {
+    let hint = button_hint_for_system(Some("nds")).unwrap();
+    let notes = hint["notes"].as_str().unwrap();
+
+    assert!(notes.contains("only controller port 0"));
+    assert!(notes.contains("dedicated touch tool"));
+    assert!(!notes.contains("planned"));
 }
 
 #[test]
@@ -328,6 +356,7 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             protocol_version: 1,
             methods: vec![],
             memory_types: vec![],
+            contracts: emucap::contracts::ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         },
     };
@@ -419,6 +448,97 @@ fn enrich_status_value_methods_reflect_downgrade() {
     );
     let methods = v["methods"].as_array().unwrap();
     assert!(!methods.iter().any(|m| m == "read_memory"));
+}
+
+#[test]
+fn contract_status_distinguishes_unreported_from_validated() {
+    let identity = EmulatorIdentity {
+        adapter: Some("desmume-nds-rust-gdb".into()),
+        system: Some("nds".into()),
+        ..Default::default()
+    };
+    let mut unreported = serde_json::json!({
+        "connected": true,
+        "methods": ["status", "step_instructions", "call_stack"]
+    });
+    enrich_contract_status(
+        &mut unreported,
+        &identity,
+        &emucap::contracts::ContractAdvertisement::Unreported,
+    );
+    assert_eq!(unreported["contracts"]["state"], "unreported");
+    assert!(
+        !has_method(&unreported, "tap"),
+        "unreported primitive set must not be promoted to a composite"
+    );
+    assert_eq!(
+        unreported["contracts"]["catalog"],
+        emucap::contracts::CATALOG_ID
+    );
+
+    let hello = serde_json::json!({
+        "contracts": emucap::contracts::advertisement_value(&[
+            "nds.execution.frame-step-absent",
+            "nds.call-stack.best-effort",
+        ])
+    });
+    let advertisement = emucap::contracts::advertisement_from_hello(&hello);
+    let mut validated = serde_json::json!({
+        "connected": true,
+        "methods": ["status", "step_instructions", "call_stack"]
+    });
+    enrich_contract_status(&mut validated, &identity, &advertisement);
+    assert_eq!(validated["contracts"]["state"], "validated");
+    assert_eq!(
+        validated["contracts"]["active_exceptions"],
+        serde_json::json!([
+            "nds.execution.frame-step-absent",
+            "nds.call-stack.best-effort"
+        ])
+    );
+    assert_eq!(
+        validated["contracts"]["constraints"]["execution.step.units"],
+        serde_json::json!(["instructions"])
+    );
+    assert_eq!(
+        validated["contracts"]["authority"]["debug.call-stack"],
+        "best_effort"
+    );
+}
+
+#[test]
+fn composite_admission_requires_a_validated_contract_generation() {
+    let identity = EmulatorIdentity {
+        adapter: Some("contract-test".into()),
+        system: Some("test".into()),
+        ..Default::default()
+    };
+    let methods = ["set_input", "step", "pause", "read_memory"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+
+    let mut unreported = serde_json::json!({"connected": true});
+    enrich_status_value(&mut unreported, &methods, &[], None);
+    enrich_contract_status(
+        &mut unreported,
+        &identity,
+        &emucap::contracts::ContractAdvertisement::Unreported,
+    );
+    assert!(!has_method(&unreported, "tap"));
+
+    let hello = serde_json::json!({
+        "contracts": emucap::contracts::advertisement_value(&[])
+    });
+    let mut validated = serde_json::json!({"connected": true});
+    enrich_status_value(&mut validated, &methods, &[], None);
+    enrich_contract_status(
+        &mut validated,
+        &identity,
+        &emucap::contracts::advertisement_from_hello(&hello),
+    );
+    assert!(has_method(&validated, "tap"));
+    assert!(has_method(&validated, "hold_until"));
 }
 
 #[test]

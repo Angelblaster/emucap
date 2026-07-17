@@ -13,6 +13,18 @@ fn body_text(r: &CallToolResult) -> String {
 }
 
 #[test]
+fn server_info_identifies_the_control_binary() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let info = Emucap::new(shared).get_info();
+    assert_eq!(info.server_info.name, "emucap-mcp");
+    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(info.instructions.as_deref(), Some(SERVER_INSTRUCTIONS));
+}
+
+#[test]
 fn image_output_publishes_screenshot_provenance() {
     let result = output_result(ToolOutput::Image {
         png_base64: "QUJD".into(),
@@ -55,64 +67,6 @@ fn link_helper_recovers_from_poison() {
     );
     // 복구 — panic하면 테스트 실패.
     let _guard = server.link();
-}
-
-#[test]
-fn server_instructions_publish_the_mesen_runtime_contract() {
-    for required in [
-        "host API 1",
-        "code_break_idle",
-        "native_halt_service",
-        "native halt 중 save/load_state를 현재 거부",
-        "breakpoint `snapshot`",
-    ] {
-        assert!(
-            SERVER_INSTRUCTIONS.contains(required),
-            "server instructions omit required Mesen contract: {required}"
-        );
-    }
-}
-
-#[test]
-fn server_instructions_publish_the_pc98_display_contract() {
-    for required in [
-        "display:true",
-        "PC-98은 실제 MAME video/keyboard provider 사용",
-    ] {
-        assert!(
-            SERVER_INSTRUCTIONS.contains(required),
-            "server instructions omit required PC-98 display contract: {required}"
-        );
-    }
-}
-
-#[test]
-fn server_instructions_publish_the_mednafen_sound_contract() {
-    for required in [
-        "Mednafen 오디오는 기본 off",
-        "sound:true",
-        "display`와 독립",
-        "다른 어댑터의 `sound:true`는 거부",
-    ] {
-        assert!(
-            SERVER_INSTRUCTIONS.contains(required),
-            "server instructions omit required Mednafen sound contract: {required}"
-        );
-    }
-}
-
-#[test]
-fn server_instructions_publish_the_pc98_screenshot_freshness_contract() {
-    for required in [
-        "PC-98은 load_state가 screen bitmap을 복원하지 않으므로",
-        "freshness:unverified",
-        "step(1)",
-    ] {
-        assert!(
-            SERVER_INSTRUCTIONS.contains(required),
-            "server instructions omit required PC-98 screenshot freshness contract: {required}"
-        );
-    }
 }
 
 #[test]

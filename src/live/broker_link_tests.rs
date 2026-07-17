@@ -37,6 +37,55 @@ fn broker_link_attaches_and_calls() {
 }
 
 #[test]
+fn broker_link_preserves_contract_advertisement_from_attach() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut attach = String::new();
+        reader.read_line(&mut attach).unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap()["id"].clone();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "result": {
+                    "attached_name": "nds",
+                    "adapter": "desmume-nds-rust-gdb",
+                    "system": "nds",
+                    "methods": ["status", "step_instructions", "call_stack"],
+                    "contracts": crate::contracts::advertisement_value(&[
+                        "nds.execution.frame-step-absent",
+                        "nds.call-stack.best-effort",
+                    ]),
+                }
+            })
+        )
+        .unwrap();
+    });
+
+    let link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    match &link.capabilities().contracts {
+        crate::contracts::ContractAdvertisement::Reported(value) => {
+            assert_eq!(value.catalog, crate::contracts::CATALOG_ID);
+            assert_eq!(
+                value.active_exceptions,
+                vec![
+                    "nds.execution.frame-step-absent".to_string(),
+                    "nds.call-stack.best-effort".to_string()
+                ]
+            );
+        }
+        other => panic!("reported contracts expected, got {other:?}"),
+    }
+    h.join().unwrap();
+}
+
+#[test]
 fn broker_link_connect_returns_busy_on_busy_error() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();

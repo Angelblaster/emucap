@@ -105,6 +105,7 @@ EmucapFlycastInputOverride g_input_override;
 std::mutex g_fb_mtx;
 std::vector<u8> g_fb_raw;     // 최신 프레임 raw RGB(UI 스레드가 채움)
 int g_fb_w = 0, g_fb_h = 0;
+bool g_fb_fresh = false;      // load_state 뒤 새 render capture가 오기 전 stale 성공을 막는다
 // exec breakpoint: PC가 BP 주소에 닿으면 인터프리터 Run() 루프(주입 훅)가 그 명령 실행 전에
 // emucap_bp_spin으로 정지(명령-정밀)하고 소켓을 서비스한다. g_bp_addrs는 빠른 조회용 집합.
 struct EmuBp { long id; uint32_t addr; };
@@ -624,6 +625,10 @@ void handle_load_state(long id, const std::string& line) {
 		Deserializer deser(buf.data(), (size_t)sz);
 		emu.loadstate(deser);
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
+	{
+		std::lock_guard<std::mutex> lk(g_fb_mtx);
+		g_fb_fresh = false;
+	}
 	reply_ok(id, "{\"status\":\"completed\"}");
 }
 
@@ -947,8 +952,11 @@ void handle(const std::string& line) {
 			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\",\"dismiss_failure\"";
 			if (env_enabled("EMUCAP_ENABLE_TEST_FATAL")) r += ",\"test_fatal\"";
 			r += "],"
-			     // read/write_memory/find_pattern의 유효 memory_type 정본 → status.memory_types로 표면화(균일 인터페이스).
-			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"]}";
+			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
+			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
+			     "\"contracts\":{\"catalog\":\"emucap-feature-contracts/v2\","
+			     "\"active_exceptions\":[\"flycast.execution.instruction-step-absent\","
+			     "\"flycast.call-stack.best-effort\",\"flycast.input-hold.port-zero-only\"]}}";
 			const char* tok = getenv("EMUCAP_SESSION_TOKEN");
 			if (tok && tok[0] && !r.empty() && r.back() == '}') {
 				std::string s(tok);
@@ -975,9 +983,14 @@ void handle(const std::string& line) {
 			std::string state = g_failure_captured ? "crashed" : (g_frozen ? "frozen" : "running");
 			std::string result = "{\"connected\":true,\"frame\":" + std::to_string(g_frame)
 				+ ",\"state\":\"" + state + "\",\"adapter\":\"flycast\""
-				+ ",\"input_override\":{\"engaged\":"
+				+ ",\"input_override\":{\"observable\":true,\"engaged\":"
 				+ (g_input_override.engaged() ? std::string("true") : std::string("false"))
-				+ ",\"pressed_mask\":" + std::to_string(g_input_override.pressed_mask()) + "}";
+				+ ",\"mode\":\"" + (g_input_override.engaged() ? std::string("persistent") : std::string("native"))
+				+ "\",\"pressed_mask\":" + std::to_string(g_input_override.pressed_mask()) + "}";
+			{
+				std::lock_guard<std::mutex> lk(g_fb_mtx);
+				result += std::string(",\"framebuffer_fresh\":") + (g_fb_fresh ? "true" : "false");
+			}
 			if (g_failure_captured) {
 				result += ",\"reason\":\"" + json_escape(g_failure_reason) + "\""
 					+ std::string(",\"failure_context_available\":")
@@ -1027,6 +1040,11 @@ void handle(const std::string& line) {
 			g_step_id = id;
 			g_step_remaining = n;
 		} else if (method == "set_input") {
+			long port = 0;
+			if (json_num(line, "port", port) && port != 0) {
+				reply_err(id, "bad_params", "Flycast input supports only controller port 0");
+				return;
+			}
 			// 홀드: Maple 소비 지점에서 kcode를 덮어쓴다. 빈 배열은 0 강제가 아니라 네이티브 입력권 반환.
 			u32 mask = 0;
 			std::string input_err;
@@ -1067,16 +1085,22 @@ void handle(const std::string& line) {
 			// 연속 버퍼에서 즉시 PNG 인코딩(emu 스레드, GL 불필요). UI 스레드가 매 렌더마다 raw를 채워두므로
 			// frozen서도 동작한다(버퍼=freeze 직전 프레임=frozen 상태). gui_runOnUiThread/지연은 freeze 중
 			// UI 렌더가 막혀 데드락이라 쓰지 않는다.
-			std::vector<u8> raw; int w = 0, h = 0;
+			std::vector<u8> raw; int w = 0, h = 0; bool fresh = false;
 			{
 				std::lock_guard<std::mutex> lk(g_fb_mtx);
-				raw = g_fb_raw; w = g_fb_w; h = g_fb_h;
+				raw = g_fb_raw; w = g_fb_w; h = g_fb_h; fresh = g_fb_fresh;
 			}
 			if (raw.empty() || w <= 0 || h <= 0) { reply_err(id, "no_frame", "렌더된 프레임 없음(게임 미시작?)"); return; }
+			if (!fresh) {
+				reply_err(id, "bad_state",
+					"load_state 이후 새 렌더 프레임이 아직 없음; step(1) 또는 resume 후 다시 캡처");
+				return;
+			}
 			std::vector<u8> png;
 			emucap_encode_png(raw.data(), w, h, png);
 			if (png.empty()) { reply_err(id, "io_error", "PNG 인코딩 실패"); return; }
-			reply_ok(id, std::string("{\"png_base64\":\"") + base64_encode(png.data(), png.size()) + "\"}");
+			reply_ok(id, std::string("{\"png_base64\":\"") + base64_encode(png.data(), png.size())
+				+ "\",\"freshness\":\"current\",\"frame\":" + std::to_string(g_frame) + "}");
 		} else if (method == "set_breakpoint") {
 			handle_set_breakpoint(id, line);
 		} else if (method == "clear_breakpoint") {
@@ -1296,7 +1320,7 @@ void emucap_service() {
 // kcode[] 전역 쓰기는 os_UpdateInputState(UI 스레드)가 매 프레임 리셋해 경합·드롭이 났다 → 게임이
 // 실제 읽는 pjs->kcode를 GetInput에서 덮으면 emu 스레드 동기라 경합 zero(결정론적 입력).
 bool emucap_input_engaged() { return g_input_override.engaged(); }
-uint32_t emucap_kcode() { return g_input_override.kcode(); }  // active-low: 눌린 비트 클리어
+uint32_t emucap_kcode() { return g_input_override.kcode(); }  // Active-low: pressed bits are clear.
 
 // 인터프리터 Run() 훅(주입)이 매 명령 전 호출 — pc가 exec BP면 true. armed(전역 bool)가 true일 때만
 // 불리므로(핫루프 보호) 여기선 집합 조회만. emu 스레드 단독 접근이라 락 불필요.
@@ -1398,6 +1422,7 @@ void emucap_capture_latest() {
 	try {
 		std::lock_guard<std::mutex> lk(g_fb_mtx);
 		emucap_capture_raw(g_fb_raw, g_fb_w, g_fb_h);
+		g_fb_fresh = !g_fb_raw.empty() && g_fb_w > 0 && g_fb_h > 0;
 	} catch (...) {
 	}
 }

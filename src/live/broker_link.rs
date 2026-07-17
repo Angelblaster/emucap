@@ -73,6 +73,7 @@ pub fn connect(
             protocol_version: PROTOCOL_VERSION,
             methods: vec![],
             memory_types: vec![],
+            contracts: crate::contracts::ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         },
         next_id: 1,
@@ -109,6 +110,7 @@ pub fn connect(
         protocol_version: PROTOCOL_VERSION,
         methods,
         memory_types,
+        contracts: crate::contracts::advertisement_from_hello(&res),
         identity: EmulatorIdentity::from_hello(&res),
     };
     link.start_heartbeat();
@@ -318,6 +320,7 @@ impl EmulatorLink for LazyBrokerLink {
                     protocol_version: PROTOCOL_VERSION,
                     methods: vec![],
                     memory_types: vec![],
+                    contracts: crate::contracts::ContractAdvertisement::Unreported,
                     identity: EmulatorIdentity::default(),
                 })
             })
@@ -332,5 +335,9 @@ impl EmulatorLink for LazyBrokerLink {
             self.inner = None;
         }
         result
+    }
+
+    fn prepare_reconnect(&mut self) {
+        self.inner = None;
     }
 }

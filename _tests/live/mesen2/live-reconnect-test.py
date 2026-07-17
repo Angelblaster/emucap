@@ -19,7 +19,7 @@ import tempfile
 import time
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 LAUNCHER = ROOT / "adapters/mesen2/launch.sh"
 FREEZE_HOLD_SECONDS = 31
 ENTRY_BY_SUFFIX = {
@@ -224,6 +224,16 @@ end, emu.eventType.codeBreakIdle)
                 "disconnect_auto_resume_ms"
             ) != 0:
                 raise RuntimeError(f"default freeze persistence is not indefinite: {freeze_policy}")
+
+            reset = session.request("reset")
+            if not reset.get("ok") or reset.get("result", {}).get("reconnect") is not True:
+                raise RuntimeError(f"reset was not acknowledged before reconnect: {reset}")
+            session.close()
+            session = accept(listener, token)
+            after_reset = session.request("status")
+            if not after_reset.get("ok") or after_reset.get("result", {}).get("state") != "running":
+                raise RuntimeError(f"post-reset session is not usable: {after_reset}")
+
             paused = session.request("pause")
             if not paused.get("ok") or paused.get("result", {}).get("state") != "frozen":
                 raise RuntimeError(f"pause did not enter frozen: {paused}")
@@ -285,6 +295,23 @@ end, emu.eventType.codeBreakIdle)
             resumed = session.request("resume")
             if not resumed.get("ok") or resumed.get("result", {}).get("state") != "running":
                 raise RuntimeError(f"explicit resume failed after persistent freeze: {resumed}")
+
+            frozen = session.request("pause")
+            if not frozen.get("ok") or frozen.get("result", {}).get("state") != "frozen":
+                raise RuntimeError(f"second pause did not enter frozen: {frozen}")
+            frozen_reset = session.request("reset")
+            if not frozen_reset.get("ok") or frozen_reset.get("result", {}).get(
+                "reconnect"
+            ) is not True:
+                raise RuntimeError(f"frozen reset was not acknowledged: {frozen_reset}")
+            session.close()
+            session = accept(listener, token)
+            after_frozen_reset = session.request("status")
+            if not after_frozen_reset.get("ok") or after_frozen_reset.get("result", {}).get(
+                "state"
+            ) != "running":
+                raise RuntimeError(f"frozen reset did not return running: {after_frozen_reset}")
+
             try:
                 os.kill(owned_pid, 0)
             except ProcessLookupError as error:
@@ -297,6 +324,10 @@ end, emu.eventType.codeBreakIdle)
                         "port": port,
                         "same_process": True,
                         "replacement_hello": True,
+                        "reset_ack_before_reconnect": True,
+                        "post_reset_status": after_reset["result"]["state"],
+                        "frozen_reset_ack_before_reconnect": True,
+                        "post_frozen_reset_status": after_frozen_reset["result"]["state"],
                         "zero_drift_across_reconnect": True,
                         "zero_drift_during_hold": True,
                         "freeze_policy": freeze_policy,

@@ -49,15 +49,15 @@ PC ring before upstream state changes, then permits read-only diagnostics in a b
 After collecting the evidence, `dismiss_failure` explicitly ends the quarantine and continues the
 existing termination path; it is not guest recovery.
 
-Native adapter limitations (graceful refusal; the GDB fallback covers a subset): read/write watchpoints·step_instructions (given the freeze model)·dump_memory
+Native adapter limitations (graceful refusal): read/write watchpoints·step_instructions (given the freeze model)·dump_memory
 (a flat-address 16MB dump is a read8 loop, so it is slow). The native adapter does implement
 `set_trace`/`get_trace`/`watch_register`/`call_stack`; the fatal PC ring is separate from opt-in tracing.
 
 **The exec breakpoint is instruction-precise via a hook in the interpreter's Run() loop** — build.sh injects
 `if (g_emucap_bp_armed && emucap_exec_bp_check(pc)) emucap_bp_spin(pc);` into sh4_interpreter.cpp (when armed is false it only
 checks the guard flag). On a hit, emucap_bp_spin stops and services the socket before that instruction executes.
-read/write watchpoints and instruction-level step use the GDB bridge (below). step_instructions is refused because it is
-impossible under the vblank-frame freeze model.
+Read/write watchpoints and `step_instructions` are refused because the required memory-access and instruction-step
+contracts are not available under the native adapter's vblank-frame freeze model.
 
 Mute: sound can be turned on with `EMUCAP_MUTE=0` (default 1 = muted). The launcher writes `aica.Volume` only in
 the emucap-owned config copy.
@@ -66,8 +66,8 @@ the emucap-owned config copy.
 UI rendering, so a gui_runOnUiThread/deferred approach deadlocks. Instead, mainui_rend_frame copies the latest raw frame into a
 buffer on every render via `emucap_capture_latest()`, and on a screenshot request the emu thread PNG-encodes that buffer
 (no GL needed) → it works even while frozen (buffer = the frame just before freeze = the frozen frame). ⚠ After a load_state while
-frozen the screen buffer is not refreshed (UI rendering is stopped), so you must advance one frame with `step 1` to re-capture the
-buffer before the loaded screen becomes visible.
+frozen the screen buffer is not refreshed (UI rendering is stopped). Until a new rendered frame is captured, `screenshot`
+fails with `bad_state` instead of returning the pre-load image; advance one frame with `step(1)` and retry.
 
 ⚠ **Input is injected at the game's consumption point, not into `kcode[]`.** The source of Flycast input is `kcode[4]` (Lua
 `pressButtons` writes here too), but writing to the `kcode[]` global gets reset every frame by `os_UpdateInputState` (UI thread) and
@@ -94,28 +94,12 @@ Default build output:
 recompiler initialization when the interpreter is selected, and the launcher also forces `Dynarec.Enabled=no` for the isolated
 instance.
 
-## GDB-stub fallback
-
-`emucap-gdb-bridge.py` relays Flycast's **built-in GDB stub** (SH-4) to emucap NDJSON. It provides a
-reduced tool surface without the native adapter hooks.
-
-**Supported (advertised) methods**: `read_memory`·`write_memory`·`get_state` (SH-4 registers)·`status`·`pause`·`resume`·
-`step` (1 instruction)·`set_breakpoint` (exec/SW only)·`clear_breakpoint`·`list_breakpoints`·`poll_events`.
-**Unsupported (GDB-stub limits — graceful downgrade)**: screenshot·set_input·save/load_state·run_frames·HW watchpoint.
-→ filled in by the native fork (Flycast fork + emucap.cpp socket hooks).
-
-⚠ Attaching the GDB stub turns off dynarec and slows things down (Flycast's design). Fine for instruction-level tracing.
-
 ## Usage
 
-Prerequisite: Flycast must be built with `ENABLE_GDB_SERVER=ON` (the emucap build sets this).
 The launcher runs Flycast from an emucap-owned runtime copy and seeds an isolated `emu.cfg` under
 `EMUCAP_EMU_HOME/flycast/<port>/`; it also copies an existing user `emu.cfg` as input when present.
-The seeded `[config]` includes:
+When a BIOS is required, the seeded `[config]` includes:
 ```ini
-Debug.GDBEnabled = yes
-Debug.GDBPort = 3263
-Debug.GDBWaitForConnection = no
 Dreamcast.BiosPath = <directory containing dc_boot.bin>
 ```
 `Dreamcast.BiosPath` is the **directory** holding the user-supplied `dc_boot.bin` (see "What the user provides"); omit it if HLE-booting.
@@ -123,10 +107,10 @@ Dreamcast.BiosPath = <directory containing dc_boot.bin>
 Procedure:
 ```bash
 # 1) call emucap-mcp bootstrap/status and use the returned listening_port.
-# 2) Prefer the MCP launch tool; it prepares the runtime copy, config, Flycast, and bridge.
+# 2) Prefer the MCP launch tool; it prepares the runtime copy, config, and native Flycast adapter.
 # 3) Legacy fallback when running outside the MCP launch tool:
 adapters/flycast/launch.sh "<disc.gdi>" <listening_port> [name]
-# 4) control via emucap MCP tools: status → confirm {adapter:"flycast-gdb"}, then pause/get_state/read_memory/step/set_breakpoint
+# 4) control via emucap MCP tools: status → confirm {adapter:"flycast"}, then pause/get_state/read_memory/step/set_breakpoint
 ```
 
 Addresses are all SH-4 addresses (main RAM `0x8C......`, 1ST_READ.BIN from `0x8C010000`). hex strings accepted.

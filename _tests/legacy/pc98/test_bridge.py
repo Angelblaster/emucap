@@ -9,9 +9,10 @@ import unittest
 import zipfile
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-BRIDGE_PATH = ROOT / "emucap-gdb-bridge.py"
-SLED_PATH = ROOT / "scripts" / "make_atomic_restore_sled.py"
+HERE = pathlib.Path(__file__).resolve().parent
+ROOT = pathlib.Path(__file__).resolve().parents[3]
+BRIDGE_PATH = HERE / "emucap-gdb-bridge.py"
+SLED_PATH = ROOT / "_tests" / "adapters" / "pc98" / "make_atomic_restore_sled.py"
 
 spec = importlib.util.spec_from_file_location("pc98_bridge", BRIDGE_PATH)
 assert spec is not None and spec.loader is not None
@@ -112,6 +113,14 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(hello["capability_notes"]["frame_step"])
         self.assertTrue(hello["state_restore"]["deterministic_replay"])
         self.assertTrue(hello["state_restore"]["post_restore_instruction_exact"])
+        self.assertEqual(
+            hello["contracts"]["active_exceptions"],
+            [
+                "pc98-legacy.call-stack.best-effort",
+                "pc98-legacy.input-hold.port-zero-only",
+                "pc98-legacy.input-pulse.constraints",
+            ],
+        )
 
     def test_hello_advertises_memory_types_matching_read(self) -> None:
         # hello.memory_types는 read_memory가 받는 집합(MEM_BASE 키)과 정확히 일치해야 한다
@@ -560,24 +569,57 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(gdb.get_timeout(), 5.0)  # restored after the op
 
     def test_press_buttons_waits_for_terminal_reply_and_scales_timeout(self) -> None:
-        command = "qEmucap,press," + "3000:enter".encode("utf-8").hex()
+        command = "qEmucap,press," + "120:enter".encode("utf-8").hex()
         gdb = FakeGdb({"?": "", command: "OK", "qEmucap,frame": "42"})
         bridge = pc98_bridge.Bridge(gdb)
 
-        result = bridge.press_buttons({"buttons": ["start"], "frames": 3000})
+        result = bridge.press_buttons({"buttons": ["start"], "frames": 120})
 
         self.assertEqual(
             result,
             {
                 "status": "completed",
                 "buttons": ["enter"],
-                "frames": 3000,
+                "frames": 120,
                 "frame": 42,
                 "state": "running",
             },
         )
         self.assertGreater(max(gdb.timeouts), 5.0)
         self.assertEqual(gdb.get_timeout(), 5.0)
+
+    def test_input_rejects_nonzero_port_and_oversized_pulse_before_mutation(self) -> None:
+        for method, params in [
+            ("set_input", {"port": 1, "buttons": ["start"]}),
+            ("press_buttons", {"port": 1, "buttons": ["start"], "frames": 1}),
+            (
+                "press_buttons",
+                {
+                    "buttons": ["start"],
+                    "frames": pc98_bridge.MAX_SYNC_TIMED_INPUT_FRAMES + 1,
+                },
+            ),
+        ]:
+            gdb = FakeGdb({"?": ""})
+            bridge = pc98_bridge.Bridge(gdb)
+            with self.assertRaises(pc98_bridge.BadParamsError):
+                getattr(bridge, method)(params)
+            self.assertEqual(gdb.extension_calls, [])
+
+    def test_status_reports_plugin_input_ownership(self) -> None:
+        gdb = FakeGdb(
+            {
+                "?": "",
+                "qEmucap,frame": "42",
+                "qEmucap,inputstatus": "-1",
+            }
+        )
+        bridge = pc98_bridge.Bridge(gdb)
+        status = bridge.status({})
+        self.assertEqual(
+            status["input_override"],
+            {"observable": True, "engaged": True, "mode": "persistent"},
+        )
 
     def test_press_buttons_reports_breakpoint_interruption(self) -> None:
         command = "qEmucap,press," + "10:enter".encode("utf-8").hex()
