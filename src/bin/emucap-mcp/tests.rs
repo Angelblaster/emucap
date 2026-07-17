@@ -87,6 +87,21 @@ fn server_instructions_publish_the_pc98_display_contract() {
 }
 
 #[test]
+fn server_instructions_publish_the_mednafen_sound_contract() {
+    for required in [
+        "Mednafen 오디오는 기본 off",
+        "sound:true",
+        "display`와 독립",
+        "다른 어댑터의 `sound:true`는 거부",
+    ] {
+        assert!(
+            SERVER_INSTRUCTIONS.contains(required),
+            "server instructions omit required Mednafen sound contract: {required}"
+        );
+    }
+}
+
+#[test]
 fn server_instructions_publish_the_pc98_screenshot_freshness_contract() {
     for required in [
         "PC-98은 load_state가 screen bitmap을 복원하지 않으므로",

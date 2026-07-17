@@ -838,6 +838,14 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     };
 
     let (adapter, force_module) = adapter_for_system(system);
+    let mut preferred_launcher_args = serde_json::json!({
+        "content_path": content_path,
+        "system": system,
+        "name": format!("{system}_session"),
+    });
+    if adapter == "mednafen" {
+        preferred_launcher_args["sound"] = serde_json::json!(false);
+    }
     let fallback_launcher = adapter_script_launcher(&root, adapter);
     let is_ps1 = fallback_launcher.extension().and_then(|e| e.to_str()) == Some("ps1");
     let mut argv: Vec<String> = if is_ps1 {
@@ -937,11 +945,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "preferred_launcher": {
             "kind": "mcp_tool",
             "tool": "launch",
-            "args": {
-                "content_path": content_path,
-                "system": system,
-                "name": format!("{system}_session"),
-            },
+            "args": preferred_launcher_args,
             "reason": "cross-platform Rust launch path; uses emucap-owned config/data roots"
         },
         "legacy_fallback_launcher": fallback_launcher.display().to_string(),
@@ -962,6 +966,16 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
         } else {
             "Use the Rust launch tool from this plan."
+        },
+        "sound_contract": if adapter == "mednafen" {
+            serde_json::json!({
+                "supported": true,
+                "default": false,
+                "enable_with": "launch(..., sound:true)",
+                "independent_of_display": true
+            })
+        } else {
+            serde_json::Value::Null
         },
         "next_action": next_action
     })
@@ -1043,6 +1057,14 @@ pub(crate) fn make_launch(
         });
     };
     let (adapter, module) = adapter_for_system(system);
+    if a.sound == Some(true) && adapter != "mednafen" {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "sound:true is supported only by Mednafen systems",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
     if let Some(root) = find_repo_root() {
         let adapter_binary = adapter_binary_precondition(adapter, &root);
         if !adapter_binary["available"].as_bool().unwrap_or(false) {
@@ -1524,6 +1546,7 @@ fn launch_mednafen(
         return serde_json::json!({ "launched": false, "reason": "Mednafen 바이너리 미발견 — adapters/mednafen/build.sh로 빌드하거나 MEDNAFEN_BIN을 설정하라" });
     };
     let log = adapter_log_path("mednafen", port, "mednafen.log");
+    let sound = a.sound.unwrap_or(false);
     let spec = emucap::launch::mednafen::Launch {
         binary: &binary,
         explicit_binary: explicit,
@@ -1535,12 +1558,14 @@ fn launch_mednafen(
         session_token: token,
         runtime: Some(runtime),
         headless: false,
+        sound,
     };
     match emucap::launch::mednafen::launch(&spec) {
         Ok(pid) => serde_json::json!({
             "launched": true,
             "adapter": "mednafen",
             "module": module,
+            "sound": sound,
             "pid": pid,
             "port": port,
             "binary": binary.display().to_string(),

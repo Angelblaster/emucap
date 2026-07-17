@@ -94,6 +94,8 @@ pub struct Launch<'a> {
     pub session_token: Option<&'a str>,
     pub runtime: Option<super::RuntimeEnv<'a>>,
     pub headless: bool,
+    /// Explicit audio-output policy. False preserves the debugger-oriented silent default.
+    pub sound: bool,
 }
 
 fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -126,7 +128,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
         runtime: l.runtime,
         headless: l.headless,
     };
-    let spec = mednafen_spec(&run_binary, l.log_path, l.module, &opts);
+    let spec = mednafen_spec(&run_binary, l.log_path, l.module, l.sound, &opts);
     super::spawn_detached(&spec)
 }
 

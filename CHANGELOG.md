@@ -2,6 +2,11 @@
 
 Beta software — interfaces may still change.
 
+## 0.7.3
+
+### Fixed
+- The supported Rust/MCP Mednafen launch path now accepts `sound: true` and passes `-sound 1`, so PC Engine CD and other Mednafen systems can enable audio without using the legacy shell launcher. Audio remains off by default, is independent of `display`, and unsupported adapters reject `sound: true` instead of silently ignoring it.
+
 ## 0.7.2
 
 ### Added

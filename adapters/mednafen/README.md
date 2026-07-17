@@ -56,7 +56,7 @@ screen. The classic failure is a missing or misnamed BIOS — e.g. PSX boot fail
 ### Game ROM / disc — the USER must supply this
 emucap does not include games. The user provides the ROM or disc image (a `.cue` plus its track files for
 CD systems; a single cartridge ROM for Mega Drive/HuCard). Ask the user for the file, confirm its exact
-path, and pass that path to `launch.sh` (see **Usage**).
+path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fallback; see **Usage**).
 
 ## Build
 ```
@@ -81,7 +81,18 @@ path, and pass that path to `launch.sh` (see **Usage**).
   directories are rejected unless they carry the script's ownership marker.
 
 ## Usage
-Launch the built binary with `launch.sh`. The actual port is authoritatively the `listening_port` from MCP `status`
+The supported path is the MCP `launch` tool. Audio is off by default; enable it explicitly and independently
+of display visibility. For example, a PC Engine CD launch with audio is:
+
+```json
+{"content_path":"/path/to/pce.cue","system":"pce","sound":true}
+```
+
+The launcher passes `-sound 1` only when `sound:true` is requested and reports the effective `sound` value in
+its result. `sound:true` is currently a Mednafen-only option; other adapters reject it rather than silently
+ignoring it.
+
+`launch.sh` is the legacy fallback. The actual port is authoritatively the `listening_port` from MCP `status`
 (the example is 47800). Calling `status` sets up the MCP listener, so do not skip it. `launch.sh` refuses to
 launch the emulator if there is no MCP listener on the port, does not kill anything if an emulator is already
 connected, and only cleans up orphan Mednafen processes from its own pidfile. It does not return success

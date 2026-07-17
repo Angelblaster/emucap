@@ -17,16 +17,18 @@ pub struct SpecOpts<'a> {
     pub headless: bool,
 }
 
-/// Mednafen (Saturn / PSX / PCE / MD). One binary handles all four; `module` selects it.
-/// Mirrors adapters/mednafen/launch.sh: `-sound 0`, a 6-button pad for MD so the raw input
-/// mask has a stable 2-byte buffer, `-force_module`, then the content path.
+/// Mednafen (Saturn / PSX / PCE / MD / WonderSwan). One binary handles every system; `module`
+/// selects it. Mirrors adapters/mednafen/launch.sh: explicit `-sound 0|1`, a 6-button pad for MD
+/// so the raw input mask has a stable 2-byte buffer, `-force_module`, then the content path.
 pub fn mednafen_spec(
     binary: &Path,
     log_path: &Path,
     module: Option<&str>,
+    sound: bool,
     opts: &SpecOpts,
 ) -> LaunchSpec {
-    let mut spec = LaunchSpec::new(binary, log_path).args(["-sound", "0"]);
+    let mut spec =
+        LaunchSpec::new(binary, log_path).args(["-sound", if sound { "1" } else { "0" }]);
     if module == Some("md") {
         spec = spec.args(["-md.input.auto", "0", "-md.input.port1", "gamepad6"]);
     }
@@ -245,6 +247,7 @@ mod tests {
             Path::new("/run/mednafen"),
             Path::new("/tmp/m.log"),
             Some("ss"),
+            false,
             &opts("game.cue"),
         );
         assert_eq!(
@@ -265,6 +268,7 @@ mod tests {
             Path::new("/run/mednafen"),
             Path::new("/tmp/m.log"),
             Some("md"),
+            false,
             &opts("game.md"),
         );
         assert_eq!(
@@ -288,13 +292,28 @@ mod tests {
         let mut o = opts("g.cue");
         o.name = Some("saturn_session");
         o.session_token = Some("tok123");
-        let spec = mednafen_spec(Path::new("/b"), Path::new("/l"), Some("ss"), &o);
+        let spec = mednafen_spec(Path::new("/b"), Path::new("/l"), Some("ss"), false, &o);
         assert!(spec
             .env
             .contains(&("EMUCAP_NAME".to_string(), "saturn_session".to_string())));
         assert!(spec
             .env
             .contains(&("EMUCAP_SESSION_TOKEN".to_string(), "tok123".to_string())));
+    }
+
+    #[test]
+    fn pce_spec_enables_sound_only_when_requested() {
+        let spec = mednafen_spec(
+            Path::new("/run/mednafen"),
+            Path::new("/tmp/m.log"),
+            Some("pce"),
+            true,
+            &opts("game.cue"),
+        );
+        assert_eq!(
+            spec.args,
+            vec!["-sound", "1", "-force_module", "pce", "game.cue"]
+        );
     }
 
     #[test]

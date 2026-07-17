@@ -499,6 +499,10 @@ pub(crate) struct LaunchArgs {
     /// caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스). HITL 창을 지원하지 않는 어댑터는 무시한다.
     #[serde(default)]
     pub(crate) display: Option<bool>,
+    /// 오디오 출력을 켠다. 현재 Mednafen(Saturn/PSX/PCE/MD/WonderSwan)에서만 지원하며 기본은
+    /// false다. display와 독립적이고, 지원하지 않는 어댑터에서 true를 주면 조용히 무시하지 않고 거부한다.
+    #[serde(default)]
+    pub(crate) sound: Option<bool>,
     /// current capsule의 동일 프로세스가 살아 있을 때 명시적으로 교체한다. PID와 process start identity가
     /// 모두 일치할 때만 해당 generation의 프로세스를 종료하며, 불명확하면 안전하게 거부한다.
     #[serde(default)]

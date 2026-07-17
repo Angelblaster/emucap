@@ -583,6 +583,14 @@ fn launch_plan_for_explicit_md_accepts_ambiguous_bin() {
     assert_eq!(plan["system"], "md");
     assert_eq!(plan["force_module"], "md");
     assert_eq!(plan["inference"]["confidence"], "explicit");
+    assert_eq!(plan["preferred_launcher"]["args"]["sound"], false);
+    assert_eq!(plan["sound_contract"]["supported"], true);
+    assert_eq!(plan["sound_contract"]["default"], false);
+    assert_eq!(plan["sound_contract"]["independent_of_display"], true);
+    assert_eq!(
+        plan["sound_contract"]["enable_with"],
+        "launch(..., sound:true)"
+    );
 }
 
 #[test]
@@ -633,6 +641,7 @@ fn pc98_display_selects_visible_mame_launch() {
         system: Some("pc98".into()),
         name: None,
         display: Some(true),
+        sound: None,
         replace: false,
     };
     assert!(!pc98_headless(&args));
@@ -999,6 +1008,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         system: Some("snes".into()),
         name: Some("capsule-test".into()),
         display: None,
+        sound: None,
         replace: false,
     };
 
@@ -1077,6 +1087,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             system: Some("snes".into()),
             name: None,
             display: None,
+            sound: None,
             replace: false,
         },
     );
@@ -1086,6 +1097,35 @@ fn launch_refuses_missing_content_before_binary_resolution() {
         out["reason"],
         serde_json::json!("content_path does not exist")
     );
+    assert_eq!(link.calls, 1);
+}
+
+#[test]
+fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = tmp.path().join("game.sfc");
+    std::fs::write(&content, b"rom").unwrap();
+    let mut link = NotConnectedPortLink::new();
+
+    let out = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: None,
+            display: None,
+            sound: Some(true),
+            replace: false,
+        },
+    );
+
+    assert_eq!(out["launched"], false);
+    assert_eq!(
+        out["reason"],
+        "sound:true is supported only by Mednafen systems"
+    );
+    assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1);
 }
 
@@ -1123,6 +1163,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             system: Some("dc".into()),
             name: None,
             display: None,
+            sound: None,
             replace: false,
         },
     );
@@ -1192,6 +1233,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             system: Some("pc98".into()),
             name: None,
             display: None,
+            sound: None,
             replace: false,
         },
     );
@@ -1239,6 +1281,7 @@ fn launch_refuses_occupied_port_before_spawn() {
             system: Some("md".into()),
             name: None,
             display: None,
+            sound: None,
             replace: false,
         },
     );
@@ -1310,6 +1353,7 @@ fn launch_refuses_when_this_session_already_connected() {
             system: Some("pc98".into()),
             name: Some("dup-B".into()),
             display: None,
+            sound: None,
             replace: false,
         },
     );
