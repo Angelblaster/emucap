@@ -2,6 +2,17 @@
 
 Prerelease software — interfaces may still change.
 
+## 0.9.0-alpha.4
+
+### Changed
+- A single synchronous frame or instruction advance is limited to 5,000 units and rejected before emulator mutation when it exceeds the active limit. Longer advances must be split into terminally acknowledged calls; `status.contracts.constraints` reports the public `step` and `run_frames` limits, including PC-98's smaller trace-mode frame limit.
+- Rust debugger bridges emit `working` responses while a backend request is active, preventing a slow GDB or WebSocket operation from appearing disconnected. If the front session disappears, the bridge finishes the current backend cleanup before accepting a replacement session.
+
+### Fixed
+- `tap` and `hold_until` now attempt input release and frozen-state restoration even when the initial input response, a step, a read, or the release edge times out after taking effect. Cleanup failure remains an error and is never reported as completion.
+- NDS, PSP, and PC-98 instruction stepping have a backend deadline below the outer request deadline. PC-98 frame operations also reject requests whose current trace-mode time estimate cannot finish within that budget.
+- Mesen2, Mednafen, and Flycast enforce the synchronous advance limit in their adapter wire handlers, so direct or older clients cannot bypass the Control MCP check.
+
 ## 0.9.0-alpha.3
 
 ### Added
