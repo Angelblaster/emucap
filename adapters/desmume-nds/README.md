@@ -72,7 +72,8 @@ tool (screen coordinates)** — see Tier 2.
 ## Tool availability — Tier 1 / Tier 2 / Tier 3
 
 **Tier 1 (through the GDB stub)**: `read_memory` / `write_memory` (RSP `m` / `M`), `get_state` (ARM
-registers r0-r15, pc, sp, lr, cpsr via `g`), `step` / `step_instructions` (`s`), `set_breakpoint`
+registers r0-r15, pc, sp, lr, cpsr via `g`), `step(unit="instructions")` (`s`, backed by the
+adapter's `step_instructions` wire method), `set_breakpoint`
 (exec = `Z0`), `clear_breakpoint`, `pause` / `resume` (break / `c`), `poll_events`.
 
 **Tier 2 (outside GDB — custom RSP hooks owned by the fork, `patches/0002-emucap-hooks.patch`)**:

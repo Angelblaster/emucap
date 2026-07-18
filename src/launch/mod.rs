@@ -240,6 +240,7 @@ pub fn spawn_detached(spec: &LaunchSpec) -> std::io::Result<u32> {
 /// long-lived MCP. Mirrors `spawn_detached`'s reaper but starts no new session — the caller ties the
 /// helper to another process's lifetime rather than detaching it as its own emulator. Returns the
 /// child pid.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn spawn_reaped(mut cmd: Command) -> std::io::Result<u32> {
     let mut child = cmd.spawn()?;
     let pid = child.id();

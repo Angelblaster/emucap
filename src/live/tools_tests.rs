@@ -32,6 +32,10 @@ impl Rec {
         self.fail_calls = calls.to_vec();
         self
     }
+    fn with_methods(mut self, methods: &[&str]) -> Self {
+        self.caps.methods = methods.iter().map(|method| method.to_string()).collect();
+        self
+    }
     fn methods(&self) -> Vec<&str> {
         self.calls.iter().map(|(m, _)| m.as_str()).collect()
     }
@@ -67,6 +71,35 @@ impl EmulatorLink for Rec {
             _ => json!({}),
         })
     }
+}
+
+#[test]
+fn step_routes_public_units_to_compatible_wire_methods() {
+    let mut link = Rec::new("frozen", &[]).with_methods(&["step", "step_instructions"]);
+
+    step(&mut link, 3, StepUnit::Frames, None).unwrap();
+    step(&mut link, 2, StepUnit::Instructions, Some("arm7")).unwrap();
+
+    assert_eq!(link.calls[0], ("step".into(), json!({"frames": 3})));
+    assert_eq!(
+        link.calls[1],
+        (
+            "step_instructions".into(),
+            json!({"count": 2, "cpu": "arm7"})
+        )
+    );
+}
+
+#[test]
+fn step_rejects_units_missing_from_adapter_capabilities() {
+    let mut link = Rec::new("frozen", &[]).with_methods(&["step"]);
+    let error = step(&mut link, 1, StepUnit::Instructions, None).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Emulator { ref kind, .. } if kind == "unsupported"
+    ));
+    assert!(link.calls.is_empty());
 }
 
 #[test]

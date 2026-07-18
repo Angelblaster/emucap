@@ -1,6 +1,6 @@
 {
-  "schema": "emucap-feature-contracts/v2",
-  "contract_version": 2,
+  "schema": "emucap-feature-contracts/v3",
+  "contract_version": 3,
   "default_expectations": [
     "CORE.AVAIL.1",
     "CORE.REJECT.1",
@@ -156,12 +156,12 @@
     {
       "id": "EXEC.STEP.FRAME.1",
       "category": "postcondition",
-      "expression": "step(n).completed => delta_frame = n and frozen(after)"
+      "expression": "step(n,unit=frames).completed => delta_frame = n and frozen(after)"
     },
     {
       "id": "EXEC.STEP.INSTR.1",
       "category": "postcondition",
-      "expression": "step_instructions(n,cpu).completed => delta_instruction(cpu) = n and frozen(after)"
+      "expression": "step(n,unit=instructions,cpu).completed => delta_instruction(cpu) = n and frozen(after)"
     },
     {
       "id": "STATE.LOAD.COHERENT.1",
@@ -401,19 +401,19 @@
       "expectations": ["TIME.RESPONSE.1", "TIME.COMPLETE.1"]
     },
     {
-      "id": "execution.step-frames",
+      "id": "execution.step",
       "surface": "public",
       "methods": ["step"],
       "temporal_classes": ["T1"],
       "disposition": "retain",
-      "expectations": ["EXEC.STEP.FRAME.1", "TIME.EXACT.1", "TIME.GAP.1"]
+      "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.EXACT.1", "TIME.GAP.1"]
     },
     {
-      "id": "execution.step-instructions",
-      "surface": "public",
+      "id": "execution.step-instructions-wire",
+      "surface": "wire",
       "methods": ["step_instructions"],
       "temporal_classes": ["T1"],
-      "disposition": "consolidate",
+      "disposition": "retain",
       "expectations": ["EXEC.STEP.INSTR.1", "TIME.EXACT.1", "TIME.GAP.1"]
     },
     {
@@ -503,14 +503,6 @@
       "temporal_classes": ["T0/P"],
       "disposition": "consolidate",
       "expectations": ["TIME.PERSISTENT.1"]
-    },
-    {
-      "id": "analysis.bisect",
-      "surface": "public",
-      "methods": ["bisect"],
-      "temporal_classes": ["T5"],
-      "disposition": "evaluate_remove",
-      "expectations": ["ANALYSIS.PROVENANCE.1"]
     },
     {
       "id": "analysis.regression",

@@ -222,6 +222,9 @@ has an established emulator/bridge connection after cleaning its own pidfiles.
 
 ## Supported methods
 
+This is the adapter wire surface. The Control MCP publishes both stepping paths as
+`step(count, unit)` and keeps `step_instructions` internal for adapter compatibility.
+
 - `status`
 - `read_memory`
 - `write_memory`
@@ -301,7 +304,7 @@ can update those MAME-internal items consistently.
 bundled save-manager items, writes the bundle's memory regions, applies the
 register packet inside one Lua bridge command, then advances frames and reads
 the target memory before returning to MCP.  This closes the old load/read
-network gap for bisect-style memory predicates, but it does not make
+network gap for repeated frame-boundary predicates, but it does not make
 `load_state` use MAME's native `.sta` machinery.
 
 The repository's public development tests include an atomic-restore fixture
@@ -319,7 +322,7 @@ _tests/adapters/pc98/make_atomic_restore_sled.py \
 ```
 
 An exact post-load restore returns `00` and leaves EIP at `0x8000` until the
-caller explicitly steps or resumes; `step_instructions(1)` then advances the
+caller explicitly steps or resumes; `step(count=1, unit="instructions")` then advances the
 counter and EIP.  The Lua/GDB bridge passes this gate: `load_state` reports
 `post_restore_instruction_exact=true` and `restore_strategy=lua_register_load_hold`.
 A future C++ hook can replace this Lua/GDB hold with a native MAME machine-state
@@ -347,8 +350,8 @@ advance from the boot prompt while returning to frozen state, and
 counter as `frame` when a screen is available.  `step(frames=N)` is a
 deterministic frame-step implemented by the Lua plugin: it runs MAME until the
 screen frame counter reaches the target, then returns to debugger stop.
-`step_instructions(count)` and `step(unit="instructions")` keep the old GDB
-single-instruction path for CPU-level narrowing.  `run_frames(N)` waits for N
+`step(count=N, unit="instructions")` uses the GDB single-instruction path for
+CPU-level narrowing.  `run_frames(N)` waits for N
 frames and leaves the emulator running.  With frame-step available, MCP
 `tap`/`tap_sequence` can drive PC-98 keyboard input from a frozen state without
 relying on host keyboard focus.

@@ -856,7 +856,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     argv.push(content_path.to_string());
     argv.push(p.to_string());
     argv.push(format!("{system}_session"));
-    if adapter == "mednafen" {
+    if adapter == "mesen2" {
+        argv.push(system.to_string());
+    } else if adapter == "mednafen" {
         if let Some(module) = force_module {
             argv.push(module.to_string());
         }
@@ -878,6 +880,14 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
                 "default": "1",
                 "applies_when": "unset",
                 "reason": "1=mute (default, for debugging); set EMUCAP_MUTE=0 to keep sound. The launcher applies this to the emucap-owned isolated config copy."
+            }
+        })
+    } else if adapter == "mesen2" {
+        serde_json::json!({
+            "EMUCAP_MESEN_LUA": {
+                "default": null,
+                "applies_when": "explicitly set",
+                "reason": "optional per-system Lua entry override; otherwise the fallback launcher uses its SYSTEM argument or an unambiguous ROM extension"
             }
         })
     } else {

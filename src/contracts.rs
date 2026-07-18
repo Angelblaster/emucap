@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-pub const CATALOG_ID: &str = "emucap-feature-contracts/v2";
+pub const CATALOG_ID: &str = "emucap-feature-contracts/v3";
+const CONTRACT_VERSION: u32 = 3;
 const EXCEPTION_SCHEMA: &str = "emucap-feature-exceptions/v1";
 
 const CATALOG_SOURCE: &str = include_str!("../contracts/catalog.json");
@@ -312,8 +313,10 @@ pub fn validate_sources(catalog: &ContractCatalog, registry: &ExceptionRegistry)
     if catalog.schema != CATALOG_ID {
         errors.push(format!("catalog schema must be {CATALOG_ID}"));
     }
-    if catalog.contract_version != 2 {
-        errors.push("catalog contract_version must be 2".to_string());
+    if catalog.contract_version != CONTRACT_VERSION {
+        errors.push(format!(
+            "catalog contract_version must be {CONTRACT_VERSION}"
+        ));
     }
     if registry.schema != EXCEPTION_SCHEMA {
         errors.push(format!("exception schema must be {EXCEPTION_SCHEMA}"));

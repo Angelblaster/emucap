@@ -60,7 +60,6 @@ fn composites_appear_when_deps_met() {
         "tap",
         "tap_sequence",
         "hold_until",
-        "bisect",
         "regression_run",
         "verify_determinism",
     ] {
@@ -72,7 +71,7 @@ fn composites_appear_when_deps_met() {
 
 #[test]
 fn composites_absent_without_deps_and_trace_note_present() {
-    // MD류: set_input/step/pause 있으나 probe 없음 → tap O, bisect X. trace 없음 → 콜체인 역추적 대체 note만.
+    // MD류: set_input/step/pause 있으나 probe 없음 → tap O. trace 없음 → 콜체인 역추적 대체 note만.
     let v = enriched(&[
         "set_input",
         "step",
@@ -82,7 +81,6 @@ fn composites_absent_without_deps_and_trace_note_present() {
         "screenshot",
     ]);
     assert!(has_method(&v, "tap") && has_method(&v, "hold_until"));
-    assert!(!has_method(&v, "bisect"));
     assert!(notes_contain(&v, "콜체인 역추적"), "trace 대체 note 누락");
     // 토큰으로 구분 못 하는 명령단위 step·layer 노트는 도출하지 않는다(거짓 신호 방지).
     assert!(!notes_contain(&v, "명령단위 step"), "거짓 step note 도출됨");
@@ -96,8 +94,8 @@ fn composites_absent_without_deps_and_trace_note_present() {
 }
 
 #[test]
-fn bisect_needs_probe_not_just_load_state() {
-    // Flycast류: load_state 광고·probe 미광고 → bisect 과대광고 금지, regression/verify는 OK.
+fn replay_composites_accept_load_state_without_probe() {
+    // Flycast류: load_state 광고·probe 미광고여도 regression/verify는 가능하다.
     let v = enriched(&[
         "set_input",
         "step",
@@ -106,10 +104,6 @@ fn bisect_needs_probe_not_just_load_state() {
         "run_frames",
         "read_memory",
     ]);
-    assert!(
-        !has_method(&v, "bisect"),
-        "bisect는 probe 전용인데 load_state로 과대광고됨"
-    );
     assert!(has_method(&v, "regression_run") && has_method(&v, "verify_determinism"));
 }
 
@@ -218,6 +212,7 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
         .pointer("/command_templates/legacy_mesen2")
         .and_then(|v| v.as_str())
         .expect("mesen2 legacy template");
+    assert!(mesen_template.contains("[system]"));
     if cfg!(windows) {
         assert!(path_ends_with(
             mesen_platform_launch,
@@ -459,7 +454,7 @@ fn contract_status_distinguishes_unreported_from_validated() {
     };
     let mut unreported = serde_json::json!({
         "connected": true,
-        "methods": ["status", "step_instructions", "call_stack"]
+        "methods": ["status", "step", "call_stack"]
     });
     enrich_contract_status(
         &mut unreported,
@@ -485,7 +480,7 @@ fn contract_status_distinguishes_unreported_from_validated() {
     let advertisement = emucap::contracts::advertisement_from_hello(&hello);
     let mut validated = serde_json::json!({
         "connected": true,
-        "methods": ["status", "step_instructions", "call_stack"]
+        "methods": ["status", "step", "call_stack"]
     });
     enrich_contract_status(&mut validated, &identity, &advertisement);
     assert_eq!(validated["contracts"]["state"], "validated");
@@ -504,6 +499,73 @@ fn contract_status_distinguishes_unreported_from_validated() {
         validated["contracts"]["authority"]["debug.call-stack"],
         "best_effort"
     );
+}
+
+#[test]
+fn public_methods_consolidate_instruction_step_without_duplicates() {
+    let mut v = serde_json::json!({"connected": true});
+    enrich_status_value(
+        &mut v,
+        &[
+            "status".to_string(),
+            "step".to_string(),
+            "step_instructions".to_string(),
+        ],
+        &[],
+        None,
+    );
+
+    assert_eq!(v["methods"], serde_json::json!(["status", "step"]));
+}
+
+#[test]
+fn adapter_provided_status_methods_are_also_normalized() {
+    let mut v = serde_json::json!({
+        "connected": true,
+        "methods": ["status", "step_instructions"]
+    });
+    enrich_status_value(&mut v, &[], &[], None);
+
+    assert_eq!(v["methods"], serde_json::json!(["status", "step"]));
+}
+
+#[test]
+fn instruction_only_step_does_not_admit_frame_composites() {
+    let identity = EmulatorIdentity {
+        adapter: Some("desmume-nds-rust-gdb".into()),
+        system: Some("nds".into()),
+        ..Default::default()
+    };
+    let methods = [
+        "status",
+        "set_input",
+        "step_instructions",
+        "pause",
+        "read_memory",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect::<Vec<_>>();
+    let hello = serde_json::json!({
+        "contracts": emucap::contracts::advertisement_value(&[
+            "nds.execution.frame-step-absent"
+        ])
+    });
+    let mut value = serde_json::json!({"connected": true});
+
+    enrich_status_value(&mut value, &methods, &[], None);
+    enrich_contract_status(
+        &mut value,
+        &identity,
+        &emucap::contracts::advertisement_from_hello(&hello),
+    );
+
+    assert!(has_method(&value, "step"));
+    assert!(!has_method(&value, "step_instructions"));
+    assert!(!has_method(&value, "tap"));
+    assert!(!has_method(&value, "tap_sequence"));
+    assert!(!has_method(&value, "hold_until"));
+    assert_eq!(value["contracts"]["state"], "validated");
 }
 
 #[test]

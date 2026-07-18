@@ -1,11 +1,11 @@
 {
   "schema": "emucap-feature-exceptions/v1",
-  "contract_catalog": "emucap-feature-contracts/v2",
-  "contract_version": 2,
+  "contract_catalog": "emucap-feature-contracts/v3",
+  "contract_version": 3,
   "exceptions": [
     {
       "id": "mesen.execution.instruction-step-absent",
-      "feature": "execution.step-instructions",
+      "feature": "execution.step",
       "kind": "capability_absent",
       "targets": ["CORE.AVAIL.1", "EXEC.STEP.INSTR.1"],
       "scope": {"adapter": "mesen2-live"},
@@ -118,7 +118,7 @@
     },
     {
       "id": "flycast.execution.instruction-step-absent",
-      "feature": "execution.step-instructions",
+      "feature": "execution.step",
       "kind": "capability_absent",
       "targets": ["CORE.AVAIL.1", "EXEC.STEP.INSTR.1"],
       "scope": {"adapter": "flycast-native", "systems": ["dreamcast"]},
@@ -151,7 +151,7 @@
     },
     {
       "id": "nds.execution.frame-step-absent",
-      "feature": "execution.step-frames",
+      "feature": "execution.step",
       "kind": "capability_absent",
       "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
       "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
@@ -218,7 +218,7 @@
     },
     {
       "id": "ppsspp.execution.frame-step-absent",
-      "feature": "execution.step-frames",
+      "feature": "execution.step",
       "kind": "capability_absent",
       "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
       "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},

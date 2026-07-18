@@ -1,17 +1,49 @@
 # Windows launcher for the emucap Mesen adapter. It copies Mesen.exe into an emucap-owned portable
 # directory, writes the adapter settings next to that copy, and launches it with the ROM + Lua.
 #
-# Usage:  powershell -ExecutionPolicy Bypass -File launch.ps1 <ROM> <EMUCAP_PORT> [NAME]
+# Usage:  powershell -ExecutionPolicy Bypass -File launch.ps1 <ROM> <EMUCAP_PORT> [NAME] [SYSTEM]
 # Set MESEN_BIN to the full path of Mesen.exe if it is not in a common install path or PATH.
+# Set EMUCAP_MESEN_LUA to override the per-system entry selected from SYSTEM or the ROM extension.
 
 param(
   [Parameter(Mandatory = $true)][string]$Rom,
   [Parameter(Mandatory = $true)][ValidateRange(1, 65535)][int]$Port,
-  [string]$Name = ""
+  [string]$Name = "",
+  [string]$System = ""
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$lua  = if ($env:EMUCAP_MESEN_LUA) { $env:EMUCAP_MESEN_LUA } else { Join-Path $here "emucap-snes.lua" }
+
+function Resolve-MesenLuaEntry([string]$RequestedSystem, [string]$ContentPath) {
+  if ($RequestedSystem) {
+    switch ($RequestedSystem.Trim().ToLowerInvariant()) {
+      "snes" { return (Join-Path $here "emucap-snes.lua") }
+      "gamegear" { return (Join-Path $here "emucap-sms.lua") }
+      "gb" { return (Join-Path $here "emucap-gb.lua") }
+      "gbc" { return (Join-Path $here "emucap-gb.lua") }
+      "gba" { return (Join-Path $here "emucap-gba.lua") }
+      "nes" { return (Join-Path $here "emucap-nes.lua") }
+      default { throw "unsupported Mesen system: $RequestedSystem" }
+    }
+  }
+
+  switch ([System.IO.Path]::GetExtension($ContentPath).ToLowerInvariant()) {
+    { $_ -in @(".sfc", ".smc") } { return (Join-Path $here "emucap-snes.lua") }
+    { $_ -in @(".gg", ".sms") } { return (Join-Path $here "emucap-sms.lua") }
+    { $_ -in @(".gb", ".gbc") } { return (Join-Path $here "emucap-gb.lua") }
+    ".gba" { return (Join-Path $here "emucap-gba.lua") }
+    ".nes" { return (Join-Path $here "emucap-nes.lua") }
+    default {
+      throw "cannot infer the Mesen system from ROM extension: $ContentPath; pass SYSTEM, set EMUCAP_MESEN_LUA, or use MCP launch(content_path, system)"
+    }
+  }
+}
+
+$lua = if ($env:EMUCAP_MESEN_LUA) {
+  $env:EMUCAP_MESEN_LUA
+} else {
+  Resolve-MesenLuaEntry $System $Rom
+}
 
 function Get-LocalTcpConnections([int]$LocalPort) {
   if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
@@ -132,6 +164,7 @@ if (-not (Test-Path -LiteralPath $Rom -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $lua -PathType Leaf)) {
   throw "Lua adapter not found: $lua"
 }
+$lua = (Resolve-Path -LiteralPath $lua).Path
 
 $sourceMesen = ""
 foreach ($candidate in @(Get-MesenCandidatePaths)) {
@@ -256,9 +289,16 @@ try {
   if ($LASTEXITCODE -eq 0 -and $rev) {
     $buildHash = ($rev | Select-Object -First 1).Trim()
   }
-  & git -C $here diff --quiet HEAD -- emucap-core.lua emucap-snes.lua 2>$null
-  if ($LASTEXITCODE -ne 0) {
+  $luaDirectory = [System.IO.Path]::GetFullPath((Split-Path -Parent $lua))
+  $adapterDirectory = [System.IO.Path]::GetFullPath($here)
+  if (-not $luaDirectory.Equals($adapterDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
     $buildHash = "$buildHash-dirty"
+  } else {
+    $entryName = Split-Path -Leaf $lua
+    & git -C $here diff --quiet HEAD -- emucap-core.lua $entryName 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      $buildHash = "$buildHash-dirty"
+    }
   }
 } catch {
 }

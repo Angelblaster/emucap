@@ -405,7 +405,7 @@ class Bridge:
             "region_sizes": REGION_SIZE,
             "state_restore": self._state_restore_info(),
             "contracts": {
-                "catalog": "emucap-feature-contracts/v2",
+                "catalog": "emucap-feature-contracts/v3",
                 "active_exceptions": [
                     "pc98-legacy.call-stack.best-effort",
                     "pc98-legacy.input-hold.port-zero-only",
@@ -445,7 +445,7 @@ class Bridge:
             "memory_types": sorted(MEM_BASE.keys()),
             "state_restore": self._state_restore_info(),
             "contracts": {
-                "catalog": "emucap-feature-contracts/v2",
+                "catalog": "emucap-feature-contracts/v3",
                 "active_exceptions": [
                     "pc98-legacy.call-stack.best-effort",
                     "pc98-legacy.input-hold.port-zero-only",

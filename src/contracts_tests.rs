@@ -1,7 +1,7 @@
 use super::*;
 
 fn identity_methods() -> Vec<String> {
-    vec!["status".to_string(), "step_instructions".to_string()]
+    vec!["status".to_string(), "step".to_string()]
 }
 
 #[test]

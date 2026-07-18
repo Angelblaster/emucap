@@ -195,9 +195,8 @@ fn step_frame_request_is_unsupported_not_reinterpreted_as_instructions() {
 
 #[test]
 fn step_wire_method_with_instructions_unit_dispatches_to_stepping() {
-    // The MCP instruction-step tool (`step_instructions`) reaches the bridge as wire method
-    // `step` with `{frames:n, unit:"instructions"}` (same as the NDS bridge) — it must route to
-    // the cpu.stepInto path, not error as an unknown/ungapped method.
+    // Older hosts may send instruction stepping as wire `step` with
+    // `{frames:n, unit:"instructions"}`. Keep that route compatible with cpu.stepInto.
     let regs = json!({
         "event": "cpu.getAllRegs",
         "categories": [{

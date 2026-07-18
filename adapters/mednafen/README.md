@@ -220,8 +220,9 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   changed — restore to enable-all after analysis. For VDP1/VDP2 routing · clean-plate determination).
 - **Supported (added from previously unsupported)**: `dump_memory` (dedicated RAM/VRAM with no cap, synthetic full-bus with a 64MB cap-skip),
   `get_rom_info` (name/path/size/media_type from EMUCAP_CONTENT + **content_md5** (`MDFNGameInfo->MD5` — disc
-  layout-aware · path-independent, recommended as rom_sha1) + sha1 (file)), `step_instructions` (instruction-granularity advance via
-  the fork's per-instruction CPU callback; SS is 1 instruction of the active CPU).
+  layout-aware · path-independent, recommended as rom_sha1) + sha1 (file)), `step(unit="instructions")`
+  (instruction-granularity advance via the fork's per-instruction CPU callback; SS is 1 instruction
+  of the active CPU).
 - **Unsupported or system-dependent**: set_breakpoint kind `nmi`/`irq`/`dma` is unsupported.
   `break_on_reset` is advertised only for cartridge systems with a meaningful reset vector. Runtime
   `status.methods` is authoritative; `watch_register`, `set_trace`/`get_trace`, and `call_stack` are supported when

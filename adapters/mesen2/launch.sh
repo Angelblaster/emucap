@@ -5,9 +5,10 @@
 # 해당 포트에 MCP listener가 없으면 에뮬레이터를 띄우지 않고 실패한다(status 선행 강제).
 # ⚠ 47800을 하드코딩하지 말 것 — 반드시 status의 listening_port를 넘긴다. 안 그러면 다른 세션의
 #   포트에 끼어들어 그 세션 에뮬레이터를 정리해버릴 수 있다(아래 안전장치가 막지만 포트는 맞게 줄 것).
-# 사용: launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME]
+# 사용: launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME] [SYSTEM]
 # 환경변수:
 #   MESEN_BIN=/path/to/Mesen                  기본: local compatible build; override도 matching sidecar 필수
+#   EMUCAP_MESEN_LUA=/path/to/entry.lua       기본: SYSTEM 또는 ROM 확장자로 시스템 엔트리 선택
 #   EMUCAP_MESEN_LAUNCH_MODE=auto|open|direct 기본: auto(격리 copy를 direct 실행)
 #   EMUCAP_EMU_HOME=/path/to/emucap/home      기본: OS별 사용자 데이터 아래 emucap/
 #   EMUCAP_LAUNCH_WAIT=<seconds>              기본: 20
@@ -16,8 +17,9 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <ROM> <EMUCAP_PORT> [EMUCAP_NAME]" >&2
+  echo "usage: $0 <ROM> <EMUCAP_PORT> [EMUCAP_NAME] [SYSTEM]" >&2
   echo "  EMUCAP_PORT는 emucap MCP status.listening_port를 launch 직전에 다시 조회한 값이어야 한다." >&2
+  echo "  SYSTEM을 생략하면 알려진 ROM 확장자로 엔트리를 고른다. 모호한 확장자는 EMUCAP_MESEN_LUA가 필요하다." >&2
 }
 
 if [ "$#" -lt 2 ]; then
@@ -25,7 +27,7 @@ if [ "$#" -lt 2 ]; then
   exit 2
 fi
 
-ROM="$1"; PORT="$2"; NAME="${3:-}"
+ROM="$1"; PORT="$2"; NAME="${3:-}"; SYSTEM="${4:-}"
 case "$PORT" in
   ''|*[!0-9]*)
     echo "ERROR: EMUCAP_PORT must be a decimal TCP port: $PORT" >&2
@@ -38,16 +40,62 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/runtime-env.sh"
-# 시스템별 엔트리(SNES/GG/GB/GBC/GBA는 각자 SYS config 후 emucap-core.lua를 require). Rust launch 도구가
-# 시스템으로 골라 넘기고, 이 legacy launcher는 EMUCAP_MESEN_LUA로 엔트리를 지정할 수 있다(기본 SNES).
-LUA="${EMUCAP_MESEN_LUA:-$HERE/emucap-snes.lua}"
+
+resolve_mesen_lua() {
+  local system="$1"
+  local key
+  if [ -n "$system" ]; then
+    key="$(printf '%s' "$system" | tr '[:upper:]' '[:lower:]')"
+    case "$key" in
+      snes) printf '%s\n' "$HERE/emucap-snes.lua" ;;
+      gamegear) printf '%s\n' "$HERE/emucap-sms.lua" ;;
+      gb|gbc) printf '%s\n' "$HERE/emucap-gb.lua" ;;
+      gba) printf '%s\n' "$HERE/emucap-gba.lua" ;;
+      nes) printf '%s\n' "$HERE/emucap-nes.lua" ;;
+      *)
+        echo "ERROR: unsupported Mesen system: $system" >&2
+        return 1
+        ;;
+    esac
+    return 0
+  fi
+
+  key="${ROM##*.}"
+  key="$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')"
+  case "$key" in
+    sfc|smc) printf '%s\n' "$HERE/emucap-snes.lua" ;;
+    gg|sms) printf '%s\n' "$HERE/emucap-sms.lua" ;;
+    gb|gbc) printf '%s\n' "$HERE/emucap-gb.lua" ;;
+    gba) printf '%s\n' "$HERE/emucap-gba.lua" ;;
+    nes) printf '%s\n' "$HERE/emucap-nes.lua" ;;
+    *)
+      echo "ERROR: cannot infer the Mesen system from ROM extension: $ROM" >&2
+      echo "  Pass SYSTEM, set EMUCAP_MESEN_LUA, or use MCP launch(content_path, system)." >&2
+      return 1
+      ;;
+  esac
+}
+
+# Explicit override wins. Otherwise the MCP fallback passes SYSTEM; direct legacy use falls back to
+# unambiguous ROM extensions. Unknown media must not silently select the SNES entry.
+if [ -n "${EMUCAP_MESEN_LUA:-}" ]; then
+  LUA="$EMUCAP_MESEN_LUA"
+elif ! LUA="$(resolve_mesen_lua "$SYSTEM")"; then
+  exit 2
+fi
 # 엔트리가 emucap-core.lua를 찾는 어댑터 디렉터리. export해야 direct 모드(python3 os.environ.copy /
 # nohup)가 상속한다 — open 모드는 아래 --env로도 전달한다.
 export EMUCAP_ADAPTER_DIR="$HERE"
 # 빌드 hash: 스크립트 어댑터(Lua)는 로드시가 곧 버전이라 launch 시점 emucap git hash를 넘긴다 — hello/
 # status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. emucap-core.lua(+엔트리)가 HEAD와 다르면 -dirty.
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap-core.lua emucap-snes.lua 2>/dev/null || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
+if [ "$LUA_DIR" = "$HERE" ]; then
+  git -C "$HERE" diff --quiet HEAD -- emucap-core.lua "$(basename "$LUA")" 2>/dev/null \
+    || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+else
+  EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+fi
 export EMUCAP_BUILD_HASH
 
 default_emu_home_base() {

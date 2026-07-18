@@ -192,8 +192,9 @@ analog-input tool yet).
 diff loader consumes for every adapter), `get_state` (`cpu.getAllRegs`'s GPR category
 flattened to `cpu.<name>`), `disassemble` (`memory.disasm`), `set_breakpoint`/`clear_breakpoint`/
 `list_breakpoints`/`clear_all_breakpoints` (`cpu.breakpoint.*` for exec, `memory.breakpoint.*` for
-read/write, both with an optional `condition` expression), `step_instructions` (repeated
-`cpu.stepInto`, since PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
+read/write, both with an optional `condition` expression), `step(unit="instructions")` (the MCP
+maps this to the bridge's `step_instructions` wire method, which repeats `cpu.stepInto` because
+PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
 `cpu.resume`), `poll_events` (draining PPSSPP's spontaneous `cpu.stepping` events), `set_input`/
 `press_buttons` (`input.buttons.send`/`input.buttons.press`), `reset` (`game.reset`), and
 `get_rom_info` (`game.status` for id/title + a locally computed sha1 of the `EMUCAP_CONTENT` image
@@ -212,13 +213,13 @@ read/write, both with an optional `condition` expression), `step_instructions` (
 
 **Not yet supported (`status.capability_notes.planned_methods`/other gaps — `status.methods` is
 authoritative, not this list)**:
-- `step` (frame-based stepping) — only instruction-based `step_instructions` exists today; no
+- `step(unit="frames")` — only instruction-based stepping exists today; no
   fork/PPSSPP primitive advances by video frame yet.
 - `run_frames`, and the MCP-composed `tap`/`tap_sequence`/`hold_until` — all depend on a
   frame-level `step`, which this bridge doesn't dispatch.
 - `probe`, `find_pattern`, `watch_register`, `set_trace`/`get_trace`, `call_stack`,
   `break_on_reset` — no bridge/fork hook yet.
-- The MCP-composed `bisect`/`regression_run`/`verify_determinism` — both of their replay paths
+- The MCP-composed `regression_run`/`verify_determinism` — both replay paths
   need either `probe` or a frame-level `step`, neither of which exists here yet, so they report
   `unsupported`.
 - Structured breakpoint value-conditions (`value`/`value_mask`/`value_len`) — unsupported; use a

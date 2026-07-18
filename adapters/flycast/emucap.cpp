@@ -589,7 +589,7 @@ void handle_get_state(long id) {
 	reply_ok(id, s);
 }
 
-// save/load_state: emucap 프로토콜은 path 기반(bisect/regression). Flycast dc_savestate는 인덱스 기반이라
+// save/load_state: emucap 프로토콜은 path 기반(probe/regression). Flycast dc_savestate는 인덱스 기반이라
 // raw Serializer/Deserializer로 내 path에 직접 쓴다(zip/헤더 우회, emucap 자족). vblank/frozen에서 호출되어
 // 프레임 경계라 상태 일관(dc_serialize/emu.loadstate 안전).
 void handle_save_state(long id, const std::string& line) {
@@ -954,7 +954,7 @@ void handle(const std::string& line) {
 			r += "],"
 			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
-			     "\"contracts\":{\"catalog\":\"emucap-feature-contracts/v2\","
+			     "\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
 			     "\"active_exceptions\":[\"flycast.execution.instruction-step-absent\","
 			     "\"flycast.call-stack.best-effort\",\"flycast.input-hold.port-zero-only\"]}}";
 			const char* tok = getenv("EMUCAP_SESSION_TOKEN");

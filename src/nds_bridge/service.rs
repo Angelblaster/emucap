@@ -389,10 +389,9 @@ impl<G: GdbTransport> NdsBridge<G> {
 
     pub(super) fn step(&mut self, params: &Value) -> NdsResult<Value> {
         // NDS는 프레임 step을 못 한다 — GDB-RSP엔 프레임 개념이 없고, DeSmuME fork에 run-frames 훅이 아직 없다.
-        // 두 MCP 도구가 이 메서드로 온다: step(프레임)은 `{frames:n}`(unit 없음), step_instructions(명령)는
-        // `{frames:n, unit:"instructions"}`. unit=instructions면 그 값을 명령 수로 해석한다(step_count가 frames도
-        // 읽는다). unit이 없는데 frames가 오면 진짜 프레임-step 요청이라 거부한다 — 명령으로 조용히 오해석하면
-        // (60프레임→60명령) freeze-step/tap이 어긋난다.
+        // 이전 호스트와 직접 wire 호출을 위한 호환 경로다. 현재 공개 MCP의 instruction step은
+        // wire step_instructions로 들어온다. unit이 없는데 frames가 오면 진짜 프레임-step 요청이라 거부한다 —
+        // 명령으로 조용히 오해석하면 (60프레임→60명령) freeze-step/tap이 어긋난다.
         match params.get("unit").and_then(Value::as_str) {
             Some("instructions") => {}
             Some(other) => {
@@ -404,7 +403,7 @@ impl<G: GdbTransport> NdsBridge<G> {
                 if params.get("frames").is_some() {
                     return Err(NdsBridgeError::Unsupported(
                         "nds bridge: 프레임 step 미지원 — GDB-RSP엔 프레임 개념이 없다. 명령 단위 진행은 \
-                         step_instructions를 쓰라. DeSmuME fork도 frame-run primitive를 제공하지 않는다"
+                         step(unit=instructions)를 쓰라. DeSmuME fork도 frame-run primitive를 제공하지 않는다"
                             .into(),
                     ));
                 }

@@ -318,8 +318,8 @@ fn step_instructions_single_steps_then_reports_pc() {
 
 #[test]
 fn step_method_treats_frames_with_instructions_unit_as_instruction_count() {
-    // The MCP's step_instructions tool sends {frames:N, unit:"instructions"} to the "step"
-    // method. That must run as an instruction step, NOT be rejected as a frame step.
+    // Older hosts may send `{frames:N, unit:"instructions"}` to wire `step`.
+    // That must run as an instruction step, not be rejected as a frame step.
     let regs = arm_regs_hex(&[(15, 0x0200_0008)], 0);
     let mut bridge = bridge_arm9_only(&[("?", "S05"), ("s", "S05"), ("g", &regs)]);
     let response = bridge.handle_request(Request::new(

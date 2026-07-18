@@ -9,8 +9,10 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+#[cfg(unix)]
 struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
+#[cfg(unix)]
 impl EnvRestore {
     fn new(keys: &[&'static str]) -> Self {
         Self(
@@ -21,6 +23,7 @@ impl EnvRestore {
     }
 }
 
+#[cfg(unix)]
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         for (key, value) in &self.0 {
@@ -450,6 +453,17 @@ fn launch_plan_for_gameboy_family_uses_mesen2_and_gb_entry() {
         assert_eq!(
             plan["button_hint"]["system"],
             expected_button_system(expected),
+            ".{ext}"
+        );
+        let fallback_argv = plan["legacy_fallback_argv"].as_array().unwrap();
+        assert_eq!(
+            fallback_argv.last().and_then(|value| value.as_str()),
+            Some(expected),
+            ".{ext} fallback must pass the normalized system explicitly"
+        );
+        assert_eq!(
+            plan["environment_defaults"]["EMUCAP_MESEN_LUA"]["default"],
+            serde_json::Value::Null,
             ".{ext}"
         );
     }
@@ -931,6 +945,7 @@ impl EmulatorLink for NotConnectedPortLink {
     }
 }
 
+#[cfg(unix)]
 struct RuntimeLaunchLink {
     caps: Capabilities,
     port: u16,
@@ -939,6 +954,7 @@ struct RuntimeLaunchLink {
     available: bool,
 }
 
+#[cfg(unix)]
 impl RuntimeLaunchLink {
     fn new(port: u16) -> Self {
         Self {
@@ -955,6 +971,7 @@ impl RuntimeLaunchLink {
     }
 }
 
+#[cfg(unix)]
 impl EmulatorLink for RuntimeLaunchLink {
     fn capabilities(&self) -> &Capabilities {
         &self.caps

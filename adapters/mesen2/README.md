@@ -65,8 +65,11 @@ Recommended path: call the MCP `launch` tool. It verifies the pinned compatible 
 complete app bundle (macOS) or publish directory into an emucap-owned portable directory, applies
 required options without modifying the user's default settings, and leaves native key mappings
 available. GBA alone creates a minimal portable `settings.json` so the staged BIOS is discoverable.
-The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME]` helper follows the same portable
-copy rule and remains a fallback when the MCP tool is unavailable.
+The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME] [SYSTEM]` helper follows the
+same portable copy rule and remains a fallback when the MCP tool is unavailable. `launch_plan`
+includes the normalized system in this fallback command. Direct use may omit `SYSTEM` for known ROM
+extensions; ambiguous media fail instead of silently loading the SNES entry. `EMUCAP_MESEN_LUA`
+remains an explicit entry override.
 
 ## Retrospective capture (emucap.lua)
 - During play, pressing **Ctrl+Shift+C** drops a slice of roughly the last
@@ -99,7 +102,7 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
 - Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`tap_sequence`/`hold_until`/`save_state`/`load_state`/
-  `run_frames`/`pause`/`step`/`step_instructions`/`resume`/`reset`/`probe`.
+  `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`.
   (⚠ `save_state`/`load_state` work **only while running**; a native halt is rejected because Mesen
   requires a main-CPU execution callback. A save requested after a breakpoint is not an atomic
   capture of the hit point; use breakpoint `snapshot` for hit-time memory. A `set_input` hold persists
@@ -112,10 +115,10 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 - Disassembly: `disassemble(address, count)` → `[{addr,text,bytes}]`. Mesen2 Lua has no
   disassembly API, so a 65816 decoder is implemented directly in the adapter (M/X flags
   start from `cpu.ps` and track REP/SEP).
-- Analysis: `dump_memory`/`bisect`/`regression_run`.
+- Analysis: `dump_memory`/`probe`/`regression_run`.
 - `verify_determinism` — measures reproducibility by replaying a reproduction recipe N
   times and matching hashes (determinism_replay gate).
-- **Note**: of the above, `tap`/`tap_sequence`/`hold_until`/`step_instructions`/`bisect`/`regression_run`/
+- **Note**: of the above, `tap`/`tap_sequence`/`hold_until`/`regression_run`/
   `verify_determinism` are not adapter-native — the MCP server (`emucap-mcp`) synthesizes
   them from primitive tools (set_input · step · read_memory, etc.). The native methods the
   adapter advertises directly are canonically listed in `hello.methods`.
@@ -152,7 +155,7 @@ logs stay under the per-port directory unless `EMUCAP_LOG` overrides the log pat
 
 ```bash
 REPO=/path/to/emu-monitor-hitl-adaptor
-"$REPO/adapters/mesen2/launch.sh" "/path/to/game.sfc" <listening_port> [name]
+"$REPO/adapters/mesen2/launch.sh" "/path/to/game.sfc" <listening_port> [name] [system]
 # launch.sh prints "연결됨" (connected) and returns only after it confirms the TCP
 # connection (ESTABLISHED + post-connect grace) — no separate sleep is needed.
 ```
@@ -172,7 +175,7 @@ already set.
 
 ```powershell
 $env:MESEN_BIN = "C:\path\to\Mesen.exe"
-powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:\path\to\game.sfc" <listening_port> [name]
+powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:\path\to\game.sfc" <listening_port> [name] [system]
 ```
 
 - The agent knows the ROM path (the user tells it, or it is a build-output path).
@@ -275,7 +278,7 @@ with these differences:
   `call_stack` is not built yet — ARM's
   LR-based return does not fit the core's SP-based call-stack model, so `call_stack` is not advertised.
   Everything else (read/write_memory, get_state,
-  step / step_instructions, breakpoints, screenshot, input, save/load_state) works as on SNES.
+  frame step, breakpoints, screenshot, input, save/load_state) works as on SNES.
   `status.methods` is authoritative.
 
 ### NES (Nintendo Entertainment System / Famicom) — 6502

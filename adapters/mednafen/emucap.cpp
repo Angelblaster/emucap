@@ -2119,7 +2119,7 @@ void handle(const std::string& line) {
       add_exception("mednafen.pce-fast.debugger-absent");
     }
     std::string contracts =
-        "{\"catalog\":\"emucap-feature-contracts/v2\",\"active_exceptions\":[" +
+        "{\"catalog\":\"emucap-feature-contracts/v3\",\"active_exceptions\":[" +
         exception_ids + "]}";
     char head[224];
     snprintf(head, sizeof(head),
@@ -2287,11 +2287,11 @@ void handle(const std::string& line) {
     g_insn_skip_first = false;
     if (g_insn_armed) rearm_breakpoints();   // continuous 해제(BP만 있으면 BP 모드로, 없으면 콜백 해제)
     reply_ok(id, "{\"state\":\"running\"}");
-  } else if (method == "step") {
-    // step_instructions(unit="instructions")는 continuous CPU 콜백으로 명령 단위 정지를 한다 —
-    // 프레임 step(g_step_remaining)의 명령단위 판본으로, 같은 resume/freeze 상태머신을 재사용한다.
-    // Rust step_instructions는 count를 "frames"에 싣고 unit="instructions"로 표시한다(tools.rs).
+  } else if (method == "step" || method == "step_instructions") {
+    // 공개 step(unit="instructions")은 wire step_instructions로 들어온다. 이전 호스트의
+    // step{unit:"instructions",frames:N}도 계속 받아 같은 상태머신으로 처리한다.
     std::string unit = json_str(line, "unit");
+    if (method == "step_instructions") unit = "instructions";
     if (unit == "instructions") {
       // frozen(pause/step/BP) 전제 — 정지 지점에서 N명령씩 좁힌다(프레임 step과 달리 running 진입 금지).
       if (!g_frozen) {
@@ -2303,7 +2303,10 @@ void handle(const std::string& line) {
         return;
       }
       long count = 1;
-      json_num(line, "frames", count);   // Rust가 count를 frames 필드에 싣는다
+      if (method == "step_instructions")
+        json_num(line, "count", count);
+      else
+        json_num(line, "frames", count);
       if (count < 1) count = 1;
       g_insn_remaining = count;
       g_insn_step_id = id;               // 완료 응답은 cb가 count 명령 실행 후(지연)
@@ -2328,7 +2331,7 @@ void handle(const std::string& line) {
     // 중에는 거부한다 — Mesen 어댑터와 동일하게 freeze 상태머신과 섞이지 않게 한다.
     if (g_frozen) { reply_err(id, "frozen", "frozen 중에는 probe 불가 — resume 후 사용"); return; }
     std::string probe_mt = json_str(line, "memory_type");
-    // Saturn "physical"은 미구현(read=0)이라 타깃 읽기가 조용히 all-zeros를 줘 거짓 bisect 결과를 낸다 —
+    // Saturn "physical"은 미구현(read=0)이라 타깃 읽기가 조용히 all-zeros를 줘 거짓 probe 결과를 낸다 —
     // read_memory와 동일하게 거부한다(상태-파괴적 savestate 로드/프레임 진행 전에).
     if (reject_ss_physical_read(id, probe_mt)) return;
     std::string path = json_str(line, "state");

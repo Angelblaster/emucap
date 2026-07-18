@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
+use schemars::JsonSchema;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -17,6 +19,30 @@ pub enum ToolOutput {
     },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepUnit {
+    #[default]
+    Frames,
+    Instructions,
+}
+
+impl StepUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Frames => "frames",
+            Self::Instructions => "instructions",
+        }
+    }
+
+    fn capability_method(self) -> &'static str {
+        match self {
+            Self::Frames => "step",
+            Self::Instructions => "step_instructions",
+        }
+    }
+}
+
 pub fn read_memory(
     link: &mut dyn EmulatorLink,
     memory_type: &str,
@@ -28,7 +54,7 @@ pub fn read_memory(
 }
 
 /// 세이브스테이트 복귀 → frame 진행 → 타깃 읽기를 adapter 안에서 한 단위로 수행한다.
-/// bisect/regression뿐 아니라 에이전트가 직접 결정론적 probe를 호출할 때도 같은 경로를 쓴다.
+/// 프레임 경계 탐색과 regression뿐 아니라 에이전트가 직접 probe를 호출할 때도 같은 경로를 쓴다.
 pub fn probe(
     link: &mut dyn EmulatorLink,
     state: &str,
@@ -173,7 +199,8 @@ pub fn press_buttons(
 }
 
 /// 하단 터치스크린(256×192)을 (x,y)에서 터치한다 — release면 뗀다, frames>0이면 그만큼 누른 뒤 자동으로 뗀다(탭),
-/// 둘 다 없으면 다음 touch까지 hold. 어댑터에 그대로 포워딩(터치스크린 있는 시스템만 동작; status.methods 정본).
+/// 둘 다 없으면 다음 touch까지 hold. 터치스크린이 있는 시스템에서 status.methods에
+/// touch가 있을 때만 어댑터로 전달한다.
 pub fn touch(
     link: &mut dyn EmulatorLink,
     port: u64,
@@ -367,26 +394,34 @@ pub fn pause(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutpu
     Ok(ToolOutput::Json(link.call("pause", params)?))
 }
 
-/// frozen에서 N프레임 진행 후 재정지.
+/// frozen에서 지정한 단위만큼 진행 후 재정지. 단위 확인과 실행은 한 번의 wire 호출 안에서 끝난다.
 pub fn step(
     link: &mut dyn EmulatorLink,
-    frames: u64,
-    cpu: Option<&str>,
-) -> Result<ToolOutput, LinkError> {
-    let mut params = json!({ "frames": frames });
-    with_cpu(&mut params, cpu);
-    Ok(ToolOutput::Json(link.call("step", params)?))
-}
-
-/// frozen에서 N개 CPU 명령 진행 후 재정지(derail 직전을 1명령씩 좁히기). 프레임 step과 분리된 도구.
-pub fn step_instructions(
-    link: &mut dyn EmulatorLink,
     count: u64,
+    unit: StepUnit,
     cpu: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
-    let mut params = json!({ "frames": count, "unit": "instructions" });
+    let required = unit.capability_method();
+    if !link
+        .capabilities()
+        .methods
+        .iter()
+        .any(|method| method == required)
+    {
+        return Err(LinkError::Emulator {
+            kind: "unsupported".into(),
+            message: format!(
+                "step unit `{}` is unavailable for this adapter; check status.contracts constraints",
+                unit.as_str()
+            ),
+        });
+    }
+    let (method, mut params) = match unit {
+        StepUnit::Frames => ("step", json!({ "frames": count })),
+        StepUnit::Instructions => ("step_instructions", json!({ "count": count })),
+    };
     with_cpu(&mut params, cpu);
-    Ok(ToolOutput::Json(link.call("step", params)?))
+    Ok(ToolOutput::Json(link.call(method, params)?))
 }
 
 pub fn resume(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {

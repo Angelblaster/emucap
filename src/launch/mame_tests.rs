@@ -3,6 +3,7 @@ use super::{
     resolve_flop2, Launch,
 };
 use crate::launch::test_env::{lock_env, EnvGuard};
+#[cfg(unix)]
 use std::path::Path;
 #[cfg(any(target_os = "macos", windows))]
 use std::path::PathBuf;

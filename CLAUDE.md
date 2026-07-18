@@ -17,9 +17,9 @@ composes them (they do not call each other).
 - `emucap` — case-bundle CLI (`finalize`/`inspect`) + tracking-ledger CLI
   (`track ls|show|compare|summarize|reindex|import`).
 - `emucap-mcp` — the **Control MCP**. Reads and controls a running emulator (stdio): memory, state,
-  screen, input, breakpoints, save-states, plus analysis verbs (`bisect`/`regression_run`/
-  `verify_determinism`, which only *return* results — they do not write to the ledger). Port
-  `EMUCAP_PORT` (default 47800).
+  screen, input, breakpoints, save-states, atomic frame-boundary probes, plus analysis verbs
+  (`regression_run`/`verify_determinism`, which only *return* results — they do not write to the
+  ledger). Port `EMUCAP_PORT` (default 47800).
 - `emucap-track-mcp` — the **Tracking MCP**. An emulator-less server (stdio) that is the single writer
   of the experiment ledger (`.emucap/`): `run_start`/`run_finish`/`log_metric`/`log_gate`/
   `log_finding`/`log_artifact`/`set_reproduction`/`log_intervention`/`query_runs`/`get_run`/

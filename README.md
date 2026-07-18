@@ -10,8 +10,8 @@ GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.8.0 — beta.** This repository is under active, continuous development;
-interfaces and behavior may still change between updates.
+**v0.9.0-alpha.1 — alpha.** This repository is under active, continuous development;
+interfaces and behavior may change between prereleases.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
@@ -80,7 +80,7 @@ them (see §2b).
 
 - **Control MCP** (`emucap-mcp`) — the emulator-driving engine. Reads memory,
   state, and screen; controls input, save-states, and breakpoints; and returns
-  results from analysis verbs (`bisect` / `regression_run` / `verify_determinism`).
+  results from analysis verbs (`regression_run` / `verify_determinism`).
 - **Tracking MCP** (`emucap-track-mcp`) — the experiment ledger (`.emucap/`).
   Starts (`run_start`), records (`log_*`), and queries (`query_runs` /
   `compare_runs` / `summarize_runs`) runs. It **knows nothing about emulators**
@@ -134,10 +134,13 @@ The two MCPs never call each other — **the agent composes them**:
   adapter lacks `get_rom_info`, fall back to `shasum -a1 <content>`). Passing
   `connection_ref` (the Control MCP `status` connection name, or `"port:N"`)
   auto-finalizes the previous unfinished run on that connection.
-- **Analysis verbs only return**: `bisect` / `regression_run` /
-  `verify_determinism` have the Control MCP drive the emulator and *return* a
+- **Analysis verbs only return**: `regression_run` / `verify_determinism` have
+  the Control MCP drive the emulator and *return* a
   result without writing to the ledger. To record it, log the result via the
   Tracking MCP's `log_gate` / `log_metric`.
+- **Frame-boundary search composes `probe`**: binary-search the frame range with
+  repeated atomic `probe` calls. Each call restores the same base state,
+  advances, and reads the predicate without an externally visible gap.
 - **Interventions are logged explicitly**: state changes like `write_memory` /
   `load_state` / `reset` / input are not recorded automatically, so log them via
   the Tracking MCP's `log_intervention` to preserve reproduction fidelity.

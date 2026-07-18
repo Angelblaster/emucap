@@ -65,8 +65,8 @@ fn frame_args_reject_over_cap() {
         "step frames 상한 초과는 거부해야"
     );
     assert!(
-        serde_json::from_str::<StepInstructionsArgs>(&format!(r#"{{"count":{over}}}"#)).is_err(),
-        "step_instructions count 상한 초과는 거부해야"
+        serde_json::from_str::<StepArgs>(&format!(r#"{{"count":{over}}}"#)).is_err(),
+        "step count 상한 초과는 거부해야"
     );
     assert!(
         serde_json::from_str::<HoldUntilArgs>(&format!(
@@ -82,13 +82,6 @@ fn frame_args_reject_over_cap() {
         .is_err(),
         "probe frame 상한 초과는 거부해야(deferred 프로브가 링크를 붙잡음)"
     );
-    assert!(
-        serde_json::from_str::<BisectArgs>(&format!(
-            r#"{{"state":"s","lo":0,"hi":{over},"memory_type":"x","address":0,"op":"eq","value":0}}"#
-        ))
-        .is_err(),
-        "bisect hi 상한 초과는 거부해야"
-    );
 }
 
 #[test]
@@ -97,9 +90,13 @@ fn frame_args_accept_at_cap_and_defaults() {
     let r: RunFramesArgs = serde_json::from_str(&format!(r#"{{"n":{MAX_FRAME_ARG}}}"#)).unwrap();
     assert_eq!(r.n, MAX_FRAME_ARG);
     let s: StepArgs = serde_json::from_str("{}").unwrap();
-    assert_eq!(s.frames, 1, "step frames 기본값");
-    let si: StepInstructionsArgs = serde_json::from_str("{}").unwrap();
-    assert_eq!(si.count, 1, "step_instructions count 기본값");
+    assert_eq!(s.count, 1, "step count 기본값");
+    assert_eq!(s.unit, StepUnit::Frames, "step unit 기본값");
+    let si: StepArgs =
+        serde_json::from_str(r#"{"count":2,"unit":"instructions","cpu":"arm7"}"#).unwrap();
+    assert_eq!(si.count, 2);
+    assert_eq!(si.unit, StepUnit::Instructions);
+    assert_eq!(si.cpu.as_deref(), Some("arm7"));
     let h: HoldUntilArgs =
         serde_json::from_str(r#"{"buttons":["a"],"memory_type":"x","address":0,"length":1}"#)
             .unwrap();

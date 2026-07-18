@@ -431,7 +431,7 @@ function handlers.hello()
     active_exceptions[#active_exceptions + 1] = "mesen.call-stack.best-effort"
   end
   result.contracts = {
-    catalog = "emucap-feature-contracts/v2",
+    catalog = "emucap-feature-contracts/v3",
     active_exceptions = active_exceptions,
   }
   if MESEN_UPSTREAM_COMMIT then

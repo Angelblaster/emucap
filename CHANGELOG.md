@@ -1,6 +1,18 @@
 # Changelog
 
-Beta software — interfaces may still change.
+Prerelease software — interfaces may still change.
+
+## 0.9.0-alpha.1
+
+### Fixed
+- Legacy Mesen launchers now select the per-system Lua entry from the normalized `SYSTEM` supplied by `launch_plan`, or from an unambiguous ROM extension during direct use. Game Boy Color no longer silently falls back to the SNES entry; ambiguous media fail loudly unless `EMUCAP_MESEN_LUA` explicitly selects an entry.
+- Host-specific launch helpers and their tests now compile only on the platforms that use them, so source builds do not pull in unsupported platform paths.
+
+### Changed
+- Frame and instruction stepping now share `step(count, unit, cpu?)`. The separate Control MCP `step_instructions` method was removed, while adapter wire compatibility remains internal. Runtime unit constraints and feature contracts moved to catalog v3.
+
+### Removed
+- The Control MCP no longer exposes the host-composed `bisect` tool. Agents can binary-search the frame boundary with repeated atomic `probe` calls, preserving emulator-time semantics without a dedicated MCP method.
 
 ## 0.8.0
 

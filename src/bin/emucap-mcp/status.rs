@@ -144,16 +144,29 @@ pub(crate) fn enrich_status_value(
             obj.insert("input_buttons".into(), hint);
         }
     }
-    if !obj.contains_key("methods") && !methods.is_empty() {
-        obj.insert("methods".into(), serde_json::json!(methods));
+    if let Some(status_methods) = obj.get("methods").and_then(serde_json::Value::as_array) {
+        let status_methods = status_methods
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(String::from)
+            .collect::<Vec<_>>();
+        obj.insert(
+            "methods".into(),
+            serde_json::json!(public_method_names(&status_methods)),
+        );
+    } else if !methods.is_empty() {
+        obj.insert(
+            "methods".into(),
+            serde_json::json!(public_method_names(methods)),
+        );
     }
     if !obj.contains_key("memory_types") && !memory_types.is_empty() {
         obj.insert("memory_types".into(), serde_json::json!(memory_types));
     }
     // capability_notes: 어댑터가 직접 제공하면(PC-98은 dict) 그게 정본이라 *보존*한다. 제공이 없거나
     // 배열이면, 메서드 부재에서 *신뢰 가능한* substitute만 도출해 덧붙인다(정적 capability 맵 아님 —
-    // capability는 methods가 정본). 어댑터가 직접 advertise하는 능력(step_instructions 등 — Mednafen·PC-98은
-    // 메서드로, Mesen은 step+unit)은 status.methods에 그대로 뜨므로 도출하지 않는다 — 여기선 *메서드로
+    // capability는 methods가 정본). 어댑터가 직접 advertise하는 명령 단위 step 능력은 외부의 step(unit)에
+    // 합쳐지므로 여기서 별도 capability note로 반복하지 않는다 — 여기선 *메서드로
     // 표현되지 않는 substitute*(트레이스 부재 시 콜체인 역추적 등)만 도출한다.
     {
         let adapter_provided = obj
@@ -174,11 +187,11 @@ pub(crate) fn enrich_status_value(
             // 명령단위 추적·콜스택·레지스터워치 부재 → exec BP 콜체인 역추적 대체. watch_register/set_trace는
             // Mesen·PC-98만 보유하는 일관된 토큰이라 부재 도출이 신뢰 가능(Mednafen·Flycast에서만 발화).
             if !has("watch_register") && !has("set_trace") && has("set_breakpoint") {
-                // step 입자는 플랫폼별: Mednafen은 frozen step_instructions(명령단위), Flycast는 step(frames)뿐.
+                // step 입자는 플랫폼별: Mednafen은 명령 단위, Flycast는 프레임 단위만 지원한다.
                 let step_kind = if has("step_instructions") {
-                    "frozen step_instructions(명령단위)"
+                    "frozen step(unit=instructions)"
                 } else {
-                    "frozen step(frames)"
+                    "frozen step(unit=frames)"
                 };
                 notes.push(format!("set_trace/get_trace·call_stack·watch_register 없음 — exec BP를 호출자로 한 홉씩 옮겨 콜체인 역추적 + {step_kind} + disassemble로 부분 대체(간접점프·자기수정·점프테이블 동적복구는 정적 disasm 병행)"));
             }
@@ -187,6 +200,21 @@ pub(crate) fn enrich_status_value(
             }
         }
     }
+}
+
+fn public_method_names(methods: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(methods.len());
+    for method in methods {
+        let method = if method == "step_instructions" {
+            "step"
+        } else {
+            method.as_str()
+        };
+        if !normalized.iter().any(|known| known == method) {
+            normalized.push(method.to_string());
+        }
+    }
+    normalized
 }
 
 pub(crate) fn enrich_contract_status(
@@ -219,7 +247,7 @@ pub(crate) fn enrich_contract_status(
         &methods,
     );
     if contracts.state == "validated" {
-        add_composite_methods(v);
+        add_composite_methods(v, &contracts);
     }
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
@@ -235,7 +263,7 @@ pub(crate) fn enrich_contract_status(
     }
 }
 
-fn add_composite_methods(v: &mut serde_json::Value) {
+fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contracts::ContractStatus) {
     let Some(methods) = v
         .get_mut("methods")
         .and_then(serde_json::Value::as_array_mut)
@@ -244,7 +272,17 @@ fn add_composite_methods(v: &mut serde_json::Value) {
     };
     let has = |method: &str| methods.iter().any(|value| value == method);
     let raw_has = |method: &str| has(method);
-    let tap_ready = raw_has("set_input") && raw_has("step") && raw_has("pause");
+    let frame_step_available = contracts
+        .constraints
+        .get("execution.step.units")
+        .map(|units| {
+            units
+                .as_array()
+                .is_some_and(|units| units.iter().any(|unit| unit == "frames"))
+        })
+        .unwrap_or(true);
+    let tap_ready =
+        frame_step_available && raw_has("set_input") && raw_has("step") && raw_has("pause");
     let hold_until_ready = tap_ready && raw_has("read_memory");
     let probe_ready = raw_has("probe");
     let replay_ready = probe_ready || raw_has("load_state");
@@ -253,7 +291,6 @@ fn add_composite_methods(v: &mut serde_json::Value) {
         (tap_ready, "tap"),
         (tap_ready, "tap_sequence"),
         (hold_until_ready, "hold_until"),
-        (probe_ready, "bisect"),
         (replay_ready, "regression_run"),
         (replay_ready, "verify_determinism"),
     ] {
@@ -343,11 +380,11 @@ fn legacy_mesen_command(root: &Path, port: u16) -> String {
     let launcher = mesen_platform_launcher(root);
     if launcher.extension().and_then(|e| e.to_str()) == Some("ps1") {
         format!(
-            "powershell -ExecutionPolicy Bypass -File {} <ROM.sfc> {port} [name]",
+            "powershell -ExecutionPolicy Bypass -File {} <ROM> {port} [name] [system]",
             powershell_quote(&launcher)
         )
     } else {
-        format!("{} <ROM.sfc> {port} [name]", launcher.display())
+        format!("{} <ROM> {port} [name] [system]", launcher.display())
     }
 }
 

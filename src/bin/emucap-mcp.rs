@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use emucap::analysis::bisect::{self, CmpOp, Predicate};
 use emucap::live::broker_link;
 use emucap::live::continuity;
 use emucap::live::link::{EmulatorLink, LinkError};
@@ -32,8 +31,8 @@ use crate::args::*;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::launch::{make_launch, make_launch_plan, occupied_graceful};
 use crate::regression::{
-    default_session_port, ensure_capabilities_loaded, parse_observe_spec, require_method,
-    run_one_case, verify_determinism_core, DetOutcome,
+    default_session_port, ensure_capabilities_loaded, parse_observe_spec, run_one_case,
+    verify_determinism_core, DetOutcome,
 };
 use crate::result::{err_result, output_result, track_err};
 use crate::status::{
@@ -124,7 +123,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "세이브스테이트 로드→frame 진행→메모리 읽기를 한 어댑터 명령으로 원자 수행한다(bisect/regression의 결정론 경로). 진행 중 BP 히트 시 측정 무효라 {status:interrupted}로 닫는다."
+        description = "세이브스테이트 로드→frame 진행→메모리 읽기를 한 어댑터 명령으로 수행한다(프레임 경계 탐색과 regression의 재생 경로). 진행 중 BP 히트 시 측정 무효라 {status:interrupted}로 닫는다."
     )]
     async fn probe(&self, Parameters(a): Parameters<ProbeArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -372,7 +371,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "컨트롤러/키 입력을 누른 채 유지한다 — 빈 배열 set_input으로 해제할 때까지 지속(running·frozen 무관). 버튼명은 status.input_buttons가 정본."
+        description = "컨트롤러/키 입력을 누른 채 유지한다 — 빈 배열 set_input으로 해제할 때까지 지속(running·frozen 무관). 사용할 버튼은 status.input_buttons에서 확인한다."
     )]
     async fn set_input(&self, Parameters(a): Parameters<InputArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -394,7 +393,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "하단 터치스크린을 (x,y)에서 터치한다 — release=true면 뗀다, frames면 그만큼 눌렀다 자동으로 뗀다(탭), 둘 다 없으면 hold. 터치스크린 있는 시스템(NDS 등)에서만 동작; status.methods 정본."
+        description = "하단 터치스크린을 (x,y)에서 터치한다 — release=true면 뗀다, frames면 그만큼 눌렀다 자동으로 뗀다(탭), 둘 다 없으면 hold. 터치스크린이 있는 시스템에서 status.methods에 이 도구가 보일 때만 사용한다."
     )]
     async fn touch(&self, Parameters(a): Parameters<TouchArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -484,25 +483,11 @@ impl Emucap {
     }
 
     #[tool(
-        description = "일시정지 상태에서 N프레임 진행 후 재정지한다(frozen에서만). 명령 단위로 좁히려면 step_instructions"
+        description = "일시정지 상태에서 지정한 단위만큼 진행 후 재정지한다. step(count=1, unit=\"frames\"|\"instructions\", cpu?)이며 기본 단위는 frames다. 제한이 있는 기기는 status.contracts.constraints의 execution.step.units에 허용 단위를 싣고, 이 제약이 없으면 두 단위를 지원한다."
     )]
     async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::step(&mut *l, a.frames, a.cpu.as_deref()) {
-            Ok(o) => output_result(o),
-            Err(e) => err_result(e),
-        }
-    }
-
-    #[tool(
-        description = "일시정지 상태에서 N개 CPU 명령 진행 후 재정지한다(frozen에서만 — 가용성 status.methods). derail 직전을 1명령씩 좁힐 때 — 1프레임은 수천 명령이라 프레임 step으론 부족하다."
-    )]
-    async fn step_instructions(
-        &self,
-        Parameters(a): Parameters<StepInstructionsArgs>,
-    ) -> CallToolResult {
-        let mut l = self.link();
-        match tools::step_instructions(&mut *l, a.count, a.cpu.as_deref()) {
+        match tools::step(&mut *l, a.count, a.unit, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }
@@ -694,33 +679,8 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "베이스 세이브스테이트에서 타깃이 처음 나빠지는 프레임을 이분 탐색한다")]
-    async fn bisect(&self, Parameters(a): Parameters<BisectArgs>) -> CallToolResult {
-        let op = match CmpOp::parse(&a.op) {
-            Ok(o) => o,
-            Err(e) => return err_result(LinkError::Protocol(e)),
-        };
-        let pred = Predicate {
-            memory_type: a.memory_type,
-            address: a.address.get(),
-            length: a.length,
-            op,
-            value: a.value.get(),
-        };
-        let mut l = self.link();
-        if let Err(e) = require_method(&mut *l, "probe", "bisect") {
-            return err_result(e);
-        }
-        match bisect::run_bisect(&mut *l, &a.state, a.lo, a.hi, &pred) {
-            Ok(r) => CallToolResult::success(vec![Content::text(
-                serde_json::to_string(&r).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}")),
-            )]),
-            Err(e) => err_result(e),
-        }
-    }
-
     #[tool(
-        description = "회귀 스위트를 일괄 재생해 케이스별 PASS/FAIL·무효 버킷을 요약해 반환한다(원장 기록 안 함). 결과를 남기려면 추적 MCP의 log_gate/log_metric으로 기록하라."
+        description = "회귀 스위트를 일괄 재생해 케이스별 PASS/FAIL·무효 버킷을 요약해 반환한다. 실험 기록에는 자동 저장하지 않으므로 결과를 남기려면 추적 MCP의 log_gate/log_metric을 사용한다."
     )]
     async fn regression_run(&self, Parameters(a): Parameters<RegressionRunArgs>) -> CallToolResult {
         let suite = std::path::PathBuf::from(&a.suite_dir);
@@ -756,7 +716,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "케이스 재현 레시피를 N회 재생해 관측 해시 일치로 harness 재현성을 잰다(게임/엔진 결정론 아님). 원장 기록 안 함 — 결과는 log_gate로. observe·한계는 인자 doc·usage."
+        description = "케이스 재현 레시피를 N회 재생해 관측 해시 일치로 실행 절차의 재현성을 잰다(게임/엔진 결정론 아님). 실험 기록에는 자동 저장하지 않으므로 결과는 log_gate로 남긴다. observe와 한계는 인자 설명 및 usage 문서를 따른다."
     )]
     async fn verify_determinism(
         &self,
@@ -839,7 +799,7 @@ async fn main() -> anyhow::Result<()> {
         let sess_addr = format!("127.0.0.1:{sess_port}");
         let name = std::env::var("EMUCAP_NAME").ok();
         // broker 없으면 auto-spawn 후 lazy link로 접속을 미룬다.
-        // 직접 모드로 폴백하지 않는다 — opt-in했으면 broker가 정본(스펙).
+        // 직접 모드로 폴백하지 않는다 — broker를 선택한 세션은 그 연결 경로만 사용한다.
         if let Ok(exe) = std::env::current_exe() {
             let broker_bin = exe.with_file_name("emucap-broker");
             let _ = std::process::Command::new(broker_bin).spawn();

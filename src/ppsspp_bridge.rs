@@ -144,8 +144,8 @@ const METHODS: &[&str] = &[
 /// PSP surface concretely planned for later tasks — none right now. Frame-based `step` is *not*
 /// here: PPSSPP has no frame-advance primitive, so it is a permanent platform gap (an
 /// `unsupported`), not a pending feature. It must not be advertised as "planned", which would imply
-/// it is merely not-yet-callable; the stepping capability is at instruction granularity, exposed by
-/// `step_instructions` being in `METHODS` and `capability_notes.step_units == ["instructions"]`.
+/// it is merely not-yet-callable; the instruction-granularity capability is advertised on the wire
+/// as `step_instructions` and normalized by the MCP to `step` with an instructions-only constraint.
 /// Surfaced under `capability_notes.planned_methods` (alongside `UNSUPPORTED_METHODS`, below) so a
 /// caller can see the target shape while `methods` reflects what works right now.
 const PLANNED_METHODS: &[&str] = &[];

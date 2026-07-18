@@ -40,7 +40,7 @@ NDJSON from `vblank()`. Its advertised methods include status·read_memory·writ
 resume·step (frame)·reset·set_breakpoint·clear_breakpoint·clear_all_breakpoints·list_breakpoints·
 poll_events·find_pattern·disassemble·get_rom_info. Server-composed verbs such as `tap` and
 `tap_sequence` are available when their primitive dependencies exist. `status.methods` is
-authoritative; `bisect` is unavailable because the native adapter has no atomic `probe`.
+authoritative; atomic frame-boundary search is unavailable because the native adapter has no `probe`.
 
 A replacement Control MCP can reconnect without restarting Flycast. Do not treat a disconnected
 socket as permission to relaunch: inspect `status.continuity`, `status.runtime_instance`, and
@@ -49,14 +49,14 @@ PC ring before upstream state changes, then permits read-only diagnostics in a b
 After collecting the evidence, `dismiss_failure` explicitly ends the quarantine and continues the
 existing termination path; it is not guest recovery.
 
-Native adapter limitations (graceful refusal): read/write watchpoints·step_instructions (given the freeze model)·dump_memory
+Native adapter limitations (graceful refusal): read/write watchpoints·instruction-unit step (given the freeze model)·dump_memory
 (a flat-address 16MB dump is a read8 loop, so it is slow). The native adapter does implement
 `set_trace`/`get_trace`/`watch_register`/`call_stack`; the fatal PC ring is separate from opt-in tracing.
 
 **The exec breakpoint is instruction-precise via a hook in the interpreter's Run() loop** — build.sh injects
 `if (g_emucap_bp_armed && emucap_exec_bp_check(pc)) emucap_bp_spin(pc);` into sh4_interpreter.cpp (when armed is false it only
 checks the guard flag). On a hit, emucap_bp_spin stops and services the socket before that instruction executes.
-Read/write watchpoints and `step_instructions` are refused because the required memory-access and instruction-step
+Read/write watchpoints and `step(unit="instructions")` are refused because the required memory-access and instruction-step
 contracts are not available under the native adapter's vblank-frame freeze model.
 
 Mute: sound can be turned on with `EMUCAP_MUTE=0` (default 1 = muted). The launcher writes `aica.Volume` only in

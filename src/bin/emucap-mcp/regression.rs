@@ -423,21 +423,6 @@ fn missing_methods(link: &dyn EmulatorLink, methods: &[&str]) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn require_method(
-    link: &mut dyn EmulatorLink,
-    method: &str,
-    context: &str,
-) -> Result<(), LinkError> {
-    ensure_capabilities_loaded(link)?;
-    if has_method(link, method) {
-        Ok(())
-    } else {
-        Err(LinkError::Protocol(format!(
-            "{context} requires adapter method `{method}`; deterministic replay is unsupported for this adapter"
-        )))
-    }
-}
-
 fn load_state_replay_supported(link: &mut dyn EmulatorLink) -> Result<bool, String> {
     if !has_method(link, "status") {
         return Ok(true);

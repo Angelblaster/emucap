@@ -369,12 +369,11 @@ impl<T: WsTransport> PpssppBridge<T> {
         Ok(json!({ "state": "running" }))
     }
 
-    /// Wire method `step` — both MCP step tools arrive here (same as the NDS bridge): the
-    /// instruction-step tool sends `{frames:n, unit:"instructions"}`, the frame-step tool sends
-    /// `{frames:n}` with no `unit`. PPSSPP has no frame-advance primitive (see the adapter README),
-    /// so only the instruction-unit case is honored — a frame-step request is rejected rather than
-    /// silently reinterpreted as an instruction count (which would make a 60-frame advance step 60
-    /// instructions and derail freeze-step/tap).
+    /// Wire method `step` retained for older hosts and direct calls. The current public MCP routes
+    /// instruction stepping to the `step_instructions` wire method. PPSSPP has no frame-advance
+    /// primitive, so a frame-step request is rejected rather than silently reinterpreted as an
+    /// instruction count (which would make a 60-frame advance step 60 instructions and derail
+    /// freeze-step/tap).
     /// `unit:"instructions"` (and the lenient bare `step` with no unit and no `frames`) route to the
     /// same `cpu.stepInto` logic as the `step_instructions` wire method.
     ///
@@ -383,9 +382,8 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// drive frame `step` which PPSSPP cannot do), and it is *not* claimed as "planned" either
     /// (frame-step is a permanent gap, not a pending feature). The stepping that does work is
     /// advertised as `step_instructions` in `METHODS` plus `step_units == ["instructions"]`.
-    /// The dispatch arm stays because the shared MCP protocol delivers instruction stepping *as*
-    /// wire `step {unit:"instructions"}` (see `src/live/tools.rs`), and because dispatching it lets
-    /// a frame-step request return a precise `unsupported` rather than `unknown_method`.
+    /// The dispatch arm stays for wire compatibility and lets a frame-step request return a precise
+    /// `unsupported` rather than `unknown_method`.
     pub(super) fn step(&mut self, params: &Value) -> BridgeResult<Value> {
         match params.get("unit").and_then(Value::as_str) {
             Some("instructions") => {}
@@ -398,7 +396,7 @@ impl<T: WsTransport> PpssppBridge<T> {
                 if params.get("frames").is_some() {
                     return Err(BridgeError::Unsupported(
                         "psp bridge: frame step unsupported — PPSSPP has no frame-advance primitive. \
-                         Use step_instructions (instruction-unit stepping) instead."
+                         Use step(unit=instructions) instead."
                             .into(),
                     ));
                 }
