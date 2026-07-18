@@ -1,24 +1,31 @@
 use super::link::{EmulatorLink, LinkError};
 use super::tcp;
+use crate::test_env::{lock_env, EnvGuard};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::MutexGuard;
 use std::time::Duration;
 
-/// 세션 식별 env는 프로세스 전역이라, 값을 바꿔 테스트하는 케이스는 직렬화한다.
-static SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
 const SESSION_ENV_KEYS: [&str; 4] = [
     "EMUCAP_SESSION_ID",
     "CODEX_THREAD_ID",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_SESSION_ID",
 ];
+const TEST_ENV_KEYS: [&str; 5] = [
+    "EMUCAP_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "EMUCAP_EMU_HOME",
+];
 
-/// 세션 id env를 원하는 상태로 두고, 가드 드롭 시 이전 값을 원복하는 RAII. 가드가 살아있는 동안
-/// SESSION_ENV_LOCK을 단독 점유해 병렬 테스트 간 간섭을 막는다. `id=None`이면 안정 세션 id 없음(fail-closed).
+/// Set an explicit session environment for a test and restore the previous values on drop.
+/// Holding the shared guard prevents launch tests from changing the environment concurrently.
 struct SessionEnv {
+    _env: EnvGuard,
+    _runtime_home: tempfile::TempDir,
     _guard: MutexGuard<'static, ()>,
-    previous: Vec<Option<String>>,
 }
 
 impl SessionEnv {
@@ -30,14 +37,13 @@ impl SessionEnv {
     }
 
     fn with_vars(values: &[(&str, &str)]) -> Self {
-        let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let previous = SESSION_ENV_KEYS
-            .iter()
-            .map(|key| std::env::var(key).ok())
-            .collect();
+        let guard = lock_env();
+        let env = EnvGuard::new(&TEST_ENV_KEYS);
+        let runtime_home = tempfile::tempdir().unwrap();
         for key in SESSION_ENV_KEYS {
             std::env::remove_var(key);
         }
+        std::env::set_var("EMUCAP_EMU_HOME", runtime_home.path());
         for (key, value) in values {
             assert!(
                 SESSION_ENV_KEYS.contains(key),
@@ -46,19 +52,9 @@ impl SessionEnv {
             std::env::set_var(key, value);
         }
         Self {
+            _env: env,
+            _runtime_home: runtime_home,
             _guard: guard,
-            previous,
-        }
-    }
-}
-
-impl Drop for SessionEnv {
-    fn drop(&mut self) {
-        for (key, previous) in SESSION_ENV_KEYS.iter().zip(&self.previous) {
-            match previous {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
         }
     }
 }
@@ -166,6 +162,7 @@ fn fake_lua(addr: String, ready: std::sync::mpsc::Sender<()>) {
 
 #[test]
 fn tcp_link_does_hello_and_call() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -182,6 +179,7 @@ fn tcp_link_does_hello_and_call() {
 
 #[test]
 fn tcp_link_preserves_contract_advertisement_from_hello() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let h = std::thread::spawn(move || {
@@ -246,6 +244,7 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
 
 #[test]
 fn tcp_link_rejects_mesen_without_native_halt_features() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let h = std::thread::spawn(move || {
@@ -267,6 +266,7 @@ fn tcp_link_rejects_mesen_without_native_halt_features() {
 
 #[test]
 fn tcp_link_rejects_wrong_session_token() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -315,6 +315,7 @@ fn fake_lua_with_keepalive(addr: String, ready: std::sync::mpsc::Sender<()>) {
 
 #[test]
 fn tcp_link_waits_through_keepalive() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -341,6 +342,7 @@ fn fake_lua_hello_then_close(addr: String, ready: std::sync::mpsc::Sender<()>) {
 // 클라이언트가 죽은 뒤 새 클라이언트로 재연결되는지.
 #[test]
 fn tcp_link_reconnects_after_client_disconnect() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(1)).unwrap();
     let addr = link.local_addr().to_string();
 
@@ -414,6 +416,7 @@ fn fake_lua_stale_then_real(addr: String, ready: std::sync::mpsc::Sender<()>) {
 
 #[test]
 fn tcp_link_discards_stale_id_response() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -447,6 +450,7 @@ fn fake_lua_hello_then_hang(
 // 클라이언트가 EOF 없이 행할 때, 호출 타임아웃 후 conn을 비워 새 클라이언트로 재연결되는지.
 #[test]
 fn tcp_link_reconnects_after_timeout_on_hung_client() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(150)).unwrap();
     let addr = link.local_addr().to_string();
 
@@ -506,6 +510,7 @@ fn tcp_link_reconnects_after_timeout_on_hung_client() {
 // timeout 누적(MAX×timeout, ~10초)을 기다리지 않고 "새 접속 대기" 신호로 즉시 채택해야 한다.
 #[test]
 fn tcp_link_adopts_pending_client_while_old_conn_held() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(150)).unwrap();
     let addr = link.local_addr().to_string();
 
@@ -578,6 +583,7 @@ fn tcp_link_adopts_pending_client_while_old_conn_held() {
 #[test]
 fn tcp_link_reports_actual_ephemeral_port_when_base_is_zero() {
     use super::link::EmulatorLink;
+    let _env = lock_env();
     let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(100));
     // 에뮬레이터가 없으니 NotConnected지만, 그 과정에서 :0에 바인드되며 임시포트가 잡힌다.
     let _ = link.call("status", serde_json::json!({}));
@@ -591,6 +597,7 @@ fn tcp_link_reports_actual_ephemeral_port_when_base_is_zero() {
 #[test]
 fn tcp_link_preaccepts_after_not_connected_status() {
     use super::link::EmulatorLink;
+    let _env = lock_env();
     let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2));
 
     let first = link.call("status", serde_json::json!({})).unwrap_err();
@@ -646,6 +653,7 @@ fn tcp_link_preaccepts_after_not_connected_status() {
 #[test]
 fn tcp_link_does_not_wrap_past_u16_max() {
     use super::link::EmulatorLink;
+    let _env = lock_env();
     let owner = match tcp::bind("127.0.0.1:65535", Duration::from_millis(100)) {
         Ok(o) => o,
         Err(_) => return, // 환경상 65535를 못 잡으면 스킵
@@ -683,6 +691,7 @@ fn fake_lua_id_mismatch_flood(addr: String, ready: std::sync::mpsc::Sender<()>) 
 // Protocol 에러를 내고 연결을 비워야 한다.
 #[test]
 fn tcp_link_bails_on_id_mismatch_flood() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(3)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -718,7 +727,8 @@ fn tcp_link_prefers_persisted_port_over_lowest_free() {
     }
     // portfile에 preferred 기록 → lazy(base)가 base(최저빈)가 아니라 preferred를 잡아야 한다.
     let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
-    tcp::write_persisted_port(&pf, preferred);
+    let store = super::runtime::RuntimeStore::discover();
+    tcp::write_persisted_port(&store, base, preferred).unwrap();
 
     let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
     let _ = link.call("status", serde_json::json!({})); // 바인드 트리거(에뮬레이터 없음 → NotConnected)
@@ -754,7 +764,8 @@ fn tcp_link_falls_back_to_scan_when_persisted_port_busy() {
         Err(_) => return, // 못 잡으면 스킵
     };
     let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
-    tcp::write_persisted_port(&pf, busy_pref);
+    let store = super::runtime::RuntimeStore::discover();
+    tcp::write_persisted_port(&store, base, busy_pref).unwrap();
 
     let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
     let _ = link.call("status", serde_json::json!({}));
@@ -774,6 +785,7 @@ fn tcp_link_falls_back_to_scan_when_persisted_port_busy() {
 
 #[test]
 fn tcp_link_not_connected_when_no_client() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(200)).unwrap();
     let err = link.call("read_memory", serde_json::json!({})).unwrap_err();
     assert!(matches!(err, LinkError::NotConnected));
@@ -784,6 +796,7 @@ fn tcp_link_not_connected_when_no_client() {
 #[test]
 fn tcp_link_auto_selects_next_port_when_occupied() {
     use super::link::EmulatorLink;
+    let _env = lock_env();
     let owner = tcp::bind("127.0.0.1:0", Duration::from_millis(100)).unwrap();
     let base_port = owner.local_addr().port();
     let addr = owner.local_addr().to_string();
@@ -824,11 +837,14 @@ fn session_token_reused_for_own_cwd_on_reconnect() {
 }
 
 #[test]
-fn session_token_path_parent_exists() {
+fn session_token_writer_creates_private_runtime_parent() {
+    let _env = SessionEnv::with(Some("token-parent"));
     let path = tcp::session_token_path(59778);
+    assert!(path.ends_with("sessions/compatibility/session-token-59778"));
+    tcp::write_session_token(59778, "parent-test-token").unwrap();
     assert!(
         path.parent().is_some_and(|p| p.is_dir()),
-        "session token parent must exist for best-effort write: {}",
+        "session token writer must create its runtime parent: {}",
         path.display()
     );
 }
@@ -838,12 +854,13 @@ fn session_token_path_parent_exists() {
 fn session_token_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
 
+    let _env = SessionEnv::with(Some("private-token"));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let path = tcp::session_token_path(port);
     let _ = std::fs::remove_file(&path);
 
-    tcp::write_session_token(port, "private-reclaim-token");
+    tcp::write_session_token(port, "private-reclaim-token").unwrap();
 
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
@@ -859,22 +876,25 @@ fn session_token_file_is_private() {
 fn session_token_writer_and_reader_refuse_symlinks() {
     use std::os::unix::fs::symlink;
 
+    let _env = SessionEnv::with(Some("symlink-token"));
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let path = tcp::session_token_path(port);
     let _ = std::fs::remove_file(&path);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let temp = tempfile::tempdir().unwrap();
     let outside = temp.path().join("outside");
     std::fs::write(&outside, "do-not-overwrite").unwrap();
     symlink(&outside, &path).unwrap();
 
-    tcp::write_session_token(port, "replacement");
+    let error = tcp::write_session_token(port, "replacement").unwrap_err();
 
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert_eq!(
         std::fs::read_to_string(&outside).unwrap(),
         "do-not-overwrite"
     );
-    assert!(tcp::reusable_session_token(port).is_none());
+    assert!(tcp::reusable_session_token(port).is_err());
     let _ = std::fs::remove_file(path);
 }
 
@@ -885,9 +905,9 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
     let port = 59777u16; // 테스트 전용 포트(충돌 회피)
     let path = tcp::session_token_path(port);
     let own = tcp::new_session_token();
-    std::fs::write(&path, &own).unwrap();
+    tcp::write_session_token(port, &own).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port).as_deref(),
+        tcp::reusable_session_token(port).unwrap().as_deref(),
         Some(own.as_str()),
         "own은 재사용"
     );
@@ -896,7 +916,7 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
     let foreign: String = chars.into_iter().collect();
     std::fs::write(&path, &foreign).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port),
+        tcp::reusable_session_token(port).unwrap(),
         None,
         "foreign은 재사용 안 함"
     );
@@ -906,6 +926,7 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
 #[test]
 fn distinct_sessions_same_cwd_are_not_own() {
     // 같은 cwd의 두 세션이라도 session id(앵커)가 다르면(동시 실행) 서로 own이 아니어야 한다 — 형제 구별.
+    let _env = SessionEnv::with(Some("distinct-sessions"));
     let own = tcp::new_session_token();
     let mut fields = own.split('-');
     let cwd = fields.next().unwrap();
@@ -936,9 +957,9 @@ fn reusable_session_token_reclaims_across_process_respawn() {
     // 같은 세션 식별부(cwd+앵커), 다른 pid/nanos = respawn된 프로세스가 남긴 토큰.
     let ident: Vec<&str> = mine.split('-').take(2).collect();
     let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
-    std::fs::write(&path, &respawned).unwrap();
+    tcp::write_session_token(port, &respawned).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port).as_deref(),
+        tcp::reusable_session_token(port).unwrap().as_deref(),
         Some(respawned.as_str()),
         "같은 세션 앵커면 respawn(부모 pid 변경) 후에도 reclaim해야"
     );
@@ -953,9 +974,9 @@ fn reusable_session_token_rejects_live_sibling_same_cwd() {
     let port = 59771u16; // 테스트 전용 포트(충돌 회피)
     let path = tcp::session_token_path(port);
     let own = tcp::new_session_token();
-    std::fs::write(&path, &own).unwrap();
+    tcp::write_session_token(port, &own).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port).as_deref(),
+        tcp::reusable_session_token(port).unwrap().as_deref(),
         Some(own.as_str()),
         "내 세션(같은 cwd+앵커) 토큰은 reclaim"
     );
@@ -966,7 +987,7 @@ fn reusable_session_token_rejects_live_sibling_same_cwd() {
     let sibling = format!("{cwd}-{anchor}f-1-1");
     std::fs::write(&path, &sibling).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port),
+        tcp::reusable_session_token(port).unwrap(),
         None,
         "형제 세션(같은 cwd, 다른 session id)의 살아있는 토큰은 reclaim 금지 — 조용한 인계 방지"
     );
@@ -988,9 +1009,9 @@ fn no_stable_session_id_fails_closed_no_takeover() {
     // reusable도 재사용 거부(형제 에뮬 조용한 인계 방지).
     let port = 59762u16;
     let path = tcp::session_token_path(port);
-    std::fs::write(&path, &a_token).unwrap();
+    tcp::write_session_token(port, &a_token).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port),
+        tcp::reusable_session_token(port).unwrap(),
         None,
         "안정 세션 id 없으면 기존 토큰을 재사용(reclaim)하지 않아야"
     );
@@ -1056,9 +1077,9 @@ fn stable_session_id_reclaims_across_reconnect() {
     let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
     let port = 59763u16;
     let path = tcp::session_token_path(port);
-    std::fs::write(&path, &respawned).unwrap();
+    tcp::write_session_token(port, &respawned).unwrap();
     assert_eq!(
-        tcp::reusable_session_token(port).as_deref(),
+        tcp::reusable_session_token(port).unwrap().as_deref(),
         Some(respawned.as_str()),
         "같은 안정 세션 id면 respawn 후에도 reclaim"
     );
@@ -1090,6 +1111,7 @@ fn port_persist_path_keyed_on_session_identity_not_cwd_alone() {
 
 #[test]
 fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
+    let _env = lock_env();
     let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
     assert!(matches!(
         link.call("status", serde_json::json!({})),
@@ -1160,8 +1182,8 @@ fn persisted_control_port_recovers_live_generation_auth() {
     });
     prepared.commit(&manifest).unwrap();
 
-    let persist = tcp::port_persist_path(port).unwrap();
-    tcp::write_persisted_port(&persist, port);
+    let persist = tcp::port_persist_path_with_store(&store, port).unwrap();
+    tcp::write_persisted_port(&store, port, port).unwrap();
     let mut link = tcp::lazy(&format!("127.0.0.1:{port}"), Duration::from_millis(50));
     link.set_runtime_store(store);
     assert!(matches!(
@@ -1202,8 +1224,8 @@ fn fallback_port_does_not_adopt_unrelated_generation_auth() {
     });
     prepared.commit(&manifest).unwrap();
 
-    let persist = tcp::port_persist_path(base).unwrap();
-    tcp::write_persisted_port(&persist, busy_port);
+    let persist = tcp::port_persist_path_with_store(&store, base).unwrap();
+    tcp::write_persisted_port(&store, base, busy_port).unwrap();
     let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
     link.set_runtime_store(store);
     assert!(matches!(
@@ -1343,6 +1365,7 @@ fn fake_lua_hello_then_never_read(
 // 재수락하게 한다(부분 송신은 복구 불가 — 읽기 타임아웃의 conn.pending 보존과 대비).
 #[test]
 fn tcp_link_write_timeout_poisons_conn() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(200)).unwrap();
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1397,6 +1420,7 @@ fn fake_lua_working_flood(addr: String, ready: std::sync::mpsc::Sender<()>) {
 // 끊고 Timeout을 내야 한다 — 안 그러면 SharedLink mutex를 쥔 채 영구 wedge된다.
 #[test]
 fn tcp_link_bails_on_working_flood_past_deadline() {
+    let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     link.set_deferred_deadline(Duration::from_millis(300));
     let addr = link.local_addr().to_string();

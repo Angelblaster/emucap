@@ -246,6 +246,74 @@ fn failure_context_refreshes_an_adapter_snapshot_written_after_link_creation() {
 }
 
 #[test]
+fn corrupt_current_manifest_is_reported_as_runtime_diagnostic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let path = store.current_path(47827);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"{not-json").unwrap();
+    let inner = SequenceLink::new(47827, "launch-unreadable", []);
+    let mut link = ObservedLink::with_store(inner, store);
+
+    let snapshot = link.continuity();
+    assert_eq!(snapshot.evidence.state, EvidenceState::Unavailable);
+    assert_eq!(snapshot.runtime_diagnostics.len(), 1);
+    let diagnostic = &snapshot.runtime_diagnostics[0];
+    assert_eq!(diagnostic.artifact, "current");
+    assert_eq!(diagnostic.kind, "invalid");
+    assert_eq!(diagnostic.path, path.display().to_string());
+    assert!(link.failure_context()["adapter_failure"].is_null());
+}
+
+#[test]
+fn corrupt_link_is_reported_without_discarding_current_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47828);
+    let path = store.link_path(47828, &current.launch_id);
+    std::fs::write(&path, b"{not-json").unwrap();
+    let inner = SequenceLink::new(47828, &current.launch_id, []);
+    let link = ObservedLink::with_store(inner, store);
+
+    let snapshot = link.continuity();
+    assert_eq!(snapshot.runtime_diagnostics.len(), 1);
+    assert_eq!(snapshot.runtime_diagnostics[0].artifact, "link");
+    assert_eq!(snapshot.runtime_diagnostics[0].kind, "invalid");
+    assert_eq!(
+        snapshot.runtime_diagnostics[0].path,
+        path.display().to_string()
+    );
+    assert_eq!(snapshot.execution.state, ExecutionState::Unknown);
+}
+
+#[test]
+fn oversized_adapter_failure_is_diagnostic_not_exact_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47829);
+    let path = store.adapter_failure_path(47829, &current.launch_id);
+    std::fs::write(
+        &path,
+        vec![b'x'; crate::live::runtime::MAX_CAPSULE_FILE_BYTES as usize + 1],
+    )
+    .unwrap();
+    let inner = SequenceLink::new(47829, &current.launch_id, []);
+    let mut link = ObservedLink::with_store(inner, store);
+
+    let snapshot = link.continuity();
+    assert_ne!(snapshot.evidence.state, EvidenceState::Exact);
+    assert_ne!(snapshot.execution.state, ExecutionState::Crashed);
+    assert_eq!(snapshot.runtime_diagnostics[0].artifact, "adapter_failure");
+    assert_eq!(snapshot.runtime_diagnostics[0].kind, "oversized");
+    let context = link.failure_context();
+    assert!(context["adapter_failure"].is_null());
+    assert_eq!(
+        context["continuity"]["runtime_diagnostics"][0]["path"],
+        path.display().to_string()
+    );
+}
+
+#[test]
 fn status_without_an_execution_state_does_not_imply_running() {
     let tmp = tempfile::tempdir().unwrap();
     let store = RuntimeStore::new(tmp.path().join("sessions"));

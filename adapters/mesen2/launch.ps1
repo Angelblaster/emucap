@@ -303,7 +303,18 @@ try {
 } catch {
 }
 $env:EMUCAP_BUILD_HASH = $buildHash
-$tokenFile = Join-Path ([System.IO.Path]::GetTempPath()) "emucap_session_token_$Port"
+$tokenFile = if ($env:EMUCAP_SESSION_TOKEN_FILE) {
+  $env:EMUCAP_SESSION_TOKEN_FILE
+} else {
+  $runtimeBase = if ($env:EMUCAP_EMU_HOME) {
+    $env:EMUCAP_EMU_HOME
+  } elseif ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA "emucap"
+  } else {
+    Join-Path ([System.IO.Path]::GetTempPath()) "emucap"
+  }
+  Join-Path $runtimeBase "sessions\compatibility\session-token-$Port"
+}
 if (-not $env:EMUCAP_SESSION_TOKEN -and (Test-Path -LiteralPath $tokenFile -PathType Leaf)) {
   $env:EMUCAP_SESSION_TOKEN = (Get-Content -LiteralPath $tokenFile -TotalCount 1).Trim()
 }

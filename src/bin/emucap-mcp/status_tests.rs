@@ -427,6 +427,63 @@ fn bootstrap_is_total_when_status_times_out() {
     assert_eq!(value["listening_port"], 47856);
 }
 
+struct DiagnosticLink {
+    caps: emucap::live::link::Capabilities,
+}
+
+impl EmulatorLink for DiagnosticLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        Err(LinkError::NotConnected)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(47857)
+    }
+
+    fn continuity(&self) -> emucap::live::continuity::ContinuitySnapshot {
+        let mut continuity = emucap::live::continuity::ContinuitySnapshot::default();
+        continuity
+            .runtime_diagnostics
+            .push(emucap::live::continuity::RuntimeDiagnostic {
+                artifact: "current".into(),
+                path: "/runtime/47857/current.json".into(),
+                kind: "invalid".into(),
+                reason: "invalid JSON".into(),
+            });
+        continuity
+    }
+}
+
+#[test]
+fn bootstrap_returns_diagnostic_json_when_runtime_capsule_is_corrupt() {
+    let mut link = DiagnosticLink {
+        caps: emucap::live::link::Capabilities::empty(),
+    };
+
+    let value = make_bootstrap_value(&mut link).unwrap();
+
+    assert_eq!(
+        value["status"]["continuity"]["runtime_diagnostics"][0]["artifact"],
+        "current"
+    );
+    assert_eq!(
+        value["status"]["continuity"]["runtime_diagnostics"][0]["kind"],
+        "invalid"
+    );
+    assert!(value["status"]["next_safe_action"]
+        .as_str()
+        .unwrap()
+        .contains("do not replace"));
+}
+
 #[test]
 fn enrich_status_value_adds_methods() {
     let mut v = serde_json::json!({"connected": true, "system": "snes"});

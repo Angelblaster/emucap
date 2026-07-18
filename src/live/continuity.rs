@@ -75,12 +75,22 @@ pub struct FailureObservation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeDiagnostic {
+    pub artifact: String,
+    pub path: String,
+    pub kind: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContinuitySnapshot {
     pub transport: TransportContinuity,
     pub execution: ExecutionContinuity,
     pub evidence: EvidenceContinuity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<FailureObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
     /// Kept out of the `continuity` JSON; status surfaces it under `runtime_instance.lease`.
     #[serde(skip)]
     pub lease: LeaseView,
@@ -103,6 +113,7 @@ impl Default for ContinuitySnapshot {
                 failure_context_available: false,
             },
             last_failure: None,
+            runtime_diagnostics: Vec::new(),
             lease: LeaseView::unknown(),
         }
     }
@@ -221,6 +232,8 @@ pub struct ObservedLink<L> {
     holder: ProcessIdentity,
     current: Option<CurrentManifest>,
     record: Option<LinkRecord>,
+    adapter_failure: Option<Value>,
+    runtime_diagnostics: Vec<RuntimeDiagnostic>,
     snapshot: ContinuitySnapshot,
 }
 
@@ -241,6 +254,8 @@ impl<L: EmulatorLink> ObservedLink<L> {
             holder: capture_process(std::process::id()),
             current: None,
             record: None,
+            adapter_failure: None,
+            runtime_diagnostics: Vec::new(),
             snapshot: ContinuitySnapshot::default(),
         };
         observed.refresh_runtime();
@@ -253,28 +268,61 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 
     fn refresh_runtime(&mut self) {
+        self.runtime_diagnostics.clear();
+        self.adapter_failure = None;
         let Some(port) = self.inner.endpoint_port() else {
-            self.rebuild_snapshot(None);
+            self.rebuild_snapshot();
             return;
         };
-        self.current = self.store.read_current(port).ok().flatten();
-        self.record = self.current.as_ref().and_then(|current| {
-            self.store
-                .read_link_json::<LinkRecord>(port, &current.launch_id)
-                .ok()
-                .flatten()
-                .filter(|record| record.launch_id == current.launch_id)
-        });
-        let adapter = self.current.as_ref().and_then(|current| {
-            self.store
-                .read_adapter_failure(port, &current.launch_id)
-                .ok()
-                .flatten()
-        });
-        self.rebuild_snapshot(adapter.as_ref());
+        self.current = match self.store.read_current(port) {
+            Ok(current) => current,
+            Err(error) => {
+                self.runtime_diagnostics.push(runtime_diagnostic(
+                    "current",
+                    self.store.current_path(port),
+                    &error,
+                ));
+                None
+            }
+        };
+        self.record = match self.current.as_ref() {
+            Some(current) => {
+                match self
+                    .store
+                    .read_link_json::<LinkRecord>(port, &current.launch_id)
+                {
+                    Ok(record) => record.filter(|record| record.launch_id == current.launch_id),
+                    Err(error) => {
+                        self.runtime_diagnostics.push(runtime_diagnostic(
+                            "link",
+                            self.store.link_path(port, &current.launch_id),
+                            &error,
+                        ));
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        self.adapter_failure = match self.current.as_ref() {
+            Some(current) => match self.store.read_adapter_failure(port, &current.launch_id) {
+                Ok(failure) => failure,
+                Err(error) => {
+                    self.runtime_diagnostics.push(runtime_diagnostic(
+                        "adapter_failure",
+                        self.store.adapter_failure_path(port, &current.launch_id),
+                        &error,
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        self.rebuild_snapshot();
     }
 
-    fn rebuild_snapshot(&mut self, adapter_failure: Option<&Value>) {
+    fn rebuild_snapshot(&mut self) {
+        let adapter_failure = self.adapter_failure.as_ref();
         let adapter_exact = self
             .current
             .as_ref()
@@ -355,6 +403,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             execution,
             evidence,
             last_failure: self.record.as_ref().and_then(|r| r.last_failure.clone()),
+            runtime_diagnostics: self.runtime_diagnostics.clone(),
             lease,
         };
     }
@@ -434,7 +483,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             .map(|lease| lease_view(lease, &self.holder, self.control_key.as_deref()))
             .unwrap_or_else(LeaseView::unknown);
         self.record = Some(updated);
-        self.rebuild_snapshot(None);
+        self.rebuild_snapshot();
         Ok(view)
     }
 
@@ -494,7 +543,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 }
             }
             record.updated_at_unix_ms = now;
-            self.rebuild_snapshot(None);
+            self.rebuild_snapshot();
             return;
         };
         let mut identity = self.inner.capabilities().identity.clone();
@@ -585,7 +634,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 recovered_at_unix_ms: None,
             });
             record.updated_at_unix_ms = now;
-            self.rebuild_snapshot(None);
+            self.rebuild_snapshot();
             return;
         };
         let method = method.to_string();
@@ -619,25 +668,45 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 
     fn failure_context_value(&self) -> Value {
-        let adapter_failure = self.current.as_ref().and_then(|current| {
-            self.store
-                .read_adapter_failure(current.port, &current.launch_id)
-                .ok()
-                .flatten()
-                .map(|mut value| {
-                    let stale = value.get("launch_id").and_then(Value::as_str)
-                        != Some(current.launch_id.as_str());
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("stale".into(), Value::Bool(stale));
-                    }
-                    value
-                })
-        });
+        let adapter_failure = self
+            .current
+            .as_ref()
+            .zip(self.adapter_failure.as_ref())
+            .map(|(current, value)| {
+                let mut value = value.clone();
+                let stale = value.get("launch_id").and_then(Value::as_str)
+                    != Some(current.launch_id.as_str());
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("stale".into(), Value::Bool(stale));
+                }
+                value
+            });
         serde_json::json!({
             "continuity": self.snapshot,
             "link_failure": self.record.as_ref().map(LinkRecord::public_value),
             "adapter_failure": adapter_failure,
         })
+    }
+}
+
+fn runtime_diagnostic(
+    artifact: &str,
+    path: std::path::PathBuf,
+    error: &io::Error,
+) -> RuntimeDiagnostic {
+    let reason = error.to_string();
+    let kind = match error.kind() {
+        io::ErrorKind::FileTooLarge => "oversized",
+        io::ErrorKind::InvalidData => "invalid",
+        io::ErrorKind::PermissionDenied => "permission_denied",
+        io::ErrorKind::NotFound => "missing",
+        _ => "io_error",
+    };
+    RuntimeDiagnostic {
+        artifact: artifact.into(),
+        path: path.display().to_string(),
+        kind: kind.into(),
+        reason,
     }
 }
 

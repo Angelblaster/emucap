@@ -10,3 +10,6 @@ pub mod pc98_bridge;
 pub mod ppsspp_bridge;
 pub mod rom;
 pub mod track;
+
+#[cfg(test)]
+pub(crate) mod test_env;

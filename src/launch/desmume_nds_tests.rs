@@ -22,7 +22,7 @@ fn wait_survives_passes_a_living_process_and_flags_an_exited_one() {
     let _ = dead.wait(); // reap so the pid is gone
     assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
 }
-use crate::launch::test_env::{lock_env, EnvGuard};
+use crate::test_env::{lock_env, EnvGuard};
 use std::path::Path;
 
 #[cfg(unix)]

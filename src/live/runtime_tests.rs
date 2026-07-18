@@ -102,7 +102,7 @@ fn oversized_capsule_file_is_rejected_before_parsing() {
     fs::write(&path, vec![b'x'; MAX_CAPSULE_FILE_BYTES as usize + 1]).unwrap();
 
     let err = store.read_current(47804).unwrap_err();
-    assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
 }
 
 #[test]
@@ -175,4 +175,90 @@ fn auth_reader_refuses_symlink() {
 
     let error = store.read_auth(47807, prepared.launch_id()).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn compatibility_files_share_the_private_runtime_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+
+    store
+        .write_compatibility_token(47808, "compatibility-token")
+        .unwrap();
+    store
+        .write_persisted_port("0123456789abcdef-1234", 47800, 47808)
+        .unwrap();
+
+    assert_eq!(
+        store.read_compatibility_token(47808).unwrap().as_deref(),
+        Some("compatibility-token")
+    );
+    assert_eq!(
+        store
+            .read_persisted_port("0123456789abcdef-1234", 47800)
+            .unwrap(),
+        Some(47808)
+    );
+    assert!(store
+        .compatibility_token_path(47808)
+        .starts_with(store.root()));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [
+            store.compatibility_token_path(47808),
+            store
+                .persisted_port_path("0123456789abcdef-1234", 47800)
+                .unwrap(),
+        ] {
+            let mode = fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+}
+
+#[test]
+fn compatibility_reader_rejects_invalid_port_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let identity = "0123456789abcdef-1234";
+    store.write_persisted_port(identity, 47800, 47808).unwrap();
+    let path = store.persisted_port_path(identity, 47800).unwrap();
+    fs::write(&path, "not-a-port").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    let error = store.read_persisted_port(identity, 47800).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(error.to_string().contains(&path.display().to_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn compatibility_writer_refuses_symlink_and_non_private_file() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let token = store.compatibility_token_path(47809);
+    fs::create_dir_all(token.parent().unwrap()).unwrap();
+    let outside = tmp.path().join("outside-token");
+    fs::write(&outside, "outside").unwrap();
+    symlink(&outside, &token).unwrap();
+
+    let error = store
+        .write_compatibility_token(47809, "replacement")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "outside");
+
+    fs::remove_file(&token).unwrap();
+    fs::write(&token, "too-public").unwrap();
+    fs::set_permissions(&token, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = store.read_compatibility_token(47809).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
 }

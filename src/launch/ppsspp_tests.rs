@@ -58,7 +58,7 @@ fn wait_ws_ready_succeeds_once_the_port_is_listening_and_fails_on_dead_process()
     assert!(err.to_string().contains("exited"));
 }
 
-use crate::launch::test_env::{lock_env, EnvGuard};
+use crate::test_env::{lock_env, EnvGuard};
 use std::path::Path;
 
 #[cfg(unix)]

@@ -1,5 +1,4 @@
-use std::fs::OpenOptions;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
@@ -153,63 +152,56 @@ fn cwd_hash() -> u64 {
 /// 이 세션(식별부 `{cwd_hash}-{session_anchor}`)+기준 포트의 포트 영속화 파일 경로. 세션 식별부로 키해
 /// 형제 세션과 다른 파일을 쓴다(cwd만으로 키하면 형제가 같은 파일을 공유해 포트를 가로챈다). 안정 세션
 /// id가 없거나(fail-closed) base==0(임시포트, 세션 고정 무의미)이면 `None` — 영속화를 건너뛴다.
+#[cfg(test)]
 pub(crate) fn port_persist_path(base: u16) -> Option<std::path::PathBuf> {
+    port_persist_path_with_store(&super::runtime::RuntimeStore::discover(), base)
+}
+
+#[cfg(test)]
+pub(crate) fn port_persist_path_with_store(
+    store: &super::runtime::RuntimeStore,
+    base: u16,
+) -> Option<std::path::PathBuf> {
     if base == 0 {
         return None;
     }
     let identity = own_session_identity()?;
-    Some(std::env::temp_dir().join(format!("emucap-mcp-port-{identity}-{base}")))
+    store.persisted_port_path(&identity, base).ok()
 }
 
-fn read_persisted_port(path: &std::path::Path) -> Option<u16> {
-    std::fs::read_to_string(path)
-        .ok()?
-        .trim()
-        .parse::<u16>()
-        .ok()
+fn read_persisted_port(
+    store: &super::runtime::RuntimeStore,
+    base: u16,
+) -> std::io::Result<Option<u16>> {
+    let identity = own_session_identity().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stable control session id is required for listener port persistence",
+        )
+    })?;
+    store.read_persisted_port(&identity, base)
 }
 
-/// 잡은 포트를 best-effort로 적는다(실패해도 무시 — 영속화는 편의 기능이지 정확성 의존 아님).
-pub(crate) fn write_persisted_port(path: &std::path::Path, port: u16) {
-    let _ = std::fs::write(path, port.to_string());
+pub(crate) fn write_persisted_port(
+    store: &super::runtime::RuntimeStore,
+    base: u16,
+    port: u16,
+) -> std::io::Result<()> {
+    let identity = own_session_identity().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stable control session id is required for listener port persistence",
+        )
+    })?;
+    store.write_persisted_port(&identity, base, port)
 }
 
 pub fn session_token_path(port: u16) -> std::path::PathBuf {
-    #[cfg(windows)]
-    {
-        std::env::temp_dir().join(format!("emucap_session_token_{port}"))
-    }
-    #[cfg(not(windows))]
-    {
-        std::path::PathBuf::from(format!("/tmp/emucap_session_token_{port}"))
-    }
+    super::runtime::RuntimeStore::discover().compatibility_token_path(port)
 }
 
-pub(crate) fn write_session_token(port: u16, token: &str) {
-    let path = session_token_path(port);
-    let mut options = OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let Ok(mut file) = options.open(&path) else {
-        return;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if file
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .is_err()
-        {
-            return;
-        }
-    }
-    let _ = file
-        .write_all(token.as_bytes())
-        .and_then(|()| file.sync_all());
+pub(crate) fn write_session_token(port: u16, token: &str) -> std::io::Result<()> {
+    super::runtime::RuntimeStore::discover().write_compatibility_token(port, token)
 }
 
 /// 토큰 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`의 세션 식별부 `{cwd_hash}-{session_anchor}`
@@ -253,26 +245,12 @@ pub fn same_session_identity(a: &str, b: &str) -> bool {
 /// 새 토큰 유지; foreign 에뮬은 여전히 mismatch → 진입점이 graceful 처리). 토큰파일은 포트별이나,
 /// 같은 cwd의 형제 세션이 잠깐 이 포트를 놓쳐 이 세션이 바인드하더라도, 식별부(cwd+session id)가 달라
 /// 형제의 살아있는 토큰은 재사용하지 않는다 — 그 형제 에뮬레이터를 조용히 이어받는 것을 막는다.
-pub(crate) fn reusable_session_token(port: u16) -> Option<String> {
-    let path = session_token_path(port);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut existing = String::new();
-    options
-        .open(path)
-        .ok()?
-        .read_to_string(&mut existing)
-        .ok()?;
-    let existing = existing.trim();
-    if session_token_is_own(existing) {
-        Some(existing.to_string())
+pub(crate) fn reusable_session_token(port: u16) -> std::io::Result<Option<String>> {
+    let existing = super::runtime::RuntimeStore::discover().read_compatibility_token(port)?;
+    if existing.as_deref().is_some_and(session_token_is_own) {
+        Ok(existing)
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -292,7 +270,7 @@ pub fn bind(addr: &str, timeout: Duration) -> std::io::Result<TcpLink> {
     let local = listener.local_addr()?;
     let port = local.port();
     let link = fresh(&local.to_string(), Some(listener), timeout);
-    write_session_token(port, &link.session_token);
+    write_session_token(port, &link.session_token)?;
     Ok(link)
 }
 
@@ -438,16 +416,17 @@ impl TcpLink {
         self.caps = Capabilities::empty();
     }
 
-    fn set_reclaim_token(&mut self, token: &str) {
+    fn set_reclaim_token(&mut self, token: &str) -> Result<(), LinkError> {
+        if let Some(port) = self.endpoint_port() {
+            write_session_token(port, token).map_err(io_to_link)?;
+        }
         self.session_token.clear();
         self.session_token.push_str(token);
         *self
             .preaccept_token
             .write()
             .unwrap_or_else(|e| e.into_inner()) = token.to_string();
-        if let Some(port) = self.endpoint_port() {
-            write_session_token(port, token);
-        }
+        Ok(())
     }
 
     fn finish_preaccept(&mut self, wait: Duration) -> Result<bool, LinkError> {
@@ -611,8 +590,11 @@ impl TcpLink {
             // 세션 고정 의미가 없어 건너뛴다. 점유 중이거나 파일이 없으면 아래 스캔으로 폴백(기존 동작).
             // 단일 bind 시도라 TOCTOU로 막혀도 그냥 폴백 — 절대 블록/루프하지 않는다. base==0(임시포트)이나
             // 안정 세션 id가 없으면(fail-closed) port_persist_path가 None → 영속화를 건너뛰고 스캔만 한다.
-            let persist = port_persist_path(base);
-            let persisted_port = persist.as_ref().and_then(|pf| read_persisted_port(pf));
+            let persist_identity = (base != 0).then(own_session_identity).flatten();
+            let persisted_port = match persist_identity.as_deref() {
+                Some(_) => read_persisted_port(&self.runtime_store, base).map_err(io_to_link)?,
+                None => None,
+            };
             let mut bound_from_persist = false;
             if bound.is_none() {
                 if let Some(pp) = persisted_port {
@@ -656,32 +638,28 @@ impl TcpLink {
             }
             match bound {
                 Some(l) => {
-                    // 잡은 포트를 영속화 — 다음 (재)시작이 이 포트를 되찾도록(best-effort, 실패 무시).
-                    if let Some(pf) = persist.as_ref() {
-                        if let Ok(a) = l.local_addr() {
-                            write_persisted_port(pf, a.port());
-                        }
+                    let local = l.local_addr().map_err(io_to_link)?;
+                    if persist_identity.is_some() {
+                        write_persisted_port(&self.runtime_store, base, local.port())
+                            .map_err(io_to_link)?;
                     }
-                    if let Ok(a) = l.local_addr() {
-                        // reclaim-own: 이 포트의 기존 토큰이 이 세션(cwd+session id 식별부) 소유면
-                        // 재사용해, 서버 respawn/재연결이 토큰을 회전하지 않게 한다 — 실행 중인 자기
-                        // 에뮬레이터가 옛 토큰으로 strand되지 않고 reclaim된다. 형제 세션(다른 session id)·
-                        // foreign이면 새 토큰 유지 → 그 살아있는 에뮬을 이어받지 않는다.
-                        if let Some(tok) = reclaim_token.take().or_else(|| {
-                            bound_from_persist
-                                .then(|| {
-                                    self.runtime_store
-                                        .live_current_with_auth(a.port())
-                                        .ok()
-                                        .flatten()
-                                        .map(|(_, token)| token)
-                                })
-                                .flatten()
-                                .or_else(|| reusable_session_token(a.port()))
-                        }) {
-                            self.set_reclaim_token(&tok);
-                        }
-                        write_session_token(a.port(), &self.session_token);
+
+                    let mut token = reclaim_token.take();
+                    if token.is_none() && bound_from_persist {
+                        token = self
+                            .runtime_store
+                            .live_current_with_auth(local.port())
+                            .map_err(io_to_link)?
+                            .map(|(_, token)| token);
+                    }
+                    if token.is_none() {
+                        token = reusable_session_token(local.port()).map_err(io_to_link)?;
+                    }
+                    if let Some(token) = token {
+                        self.set_reclaim_token(&token)?;
+                    } else {
+                        write_session_token(local.port(), &self.session_token)
+                            .map_err(io_to_link)?;
                     }
                     self.listener = Some(l);
                 }
@@ -879,7 +857,7 @@ impl EmulatorLink for TcpLink {
 
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
         self.drop_conn();
-        self.set_reclaim_token(token);
+        self.set_reclaim_token(token)?;
         Ok(true)
     }
 

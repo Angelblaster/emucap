@@ -23,53 +23,6 @@ pub mod spec;
 #[path = "mod_tests.rs"]
 mod tests;
 
-/// Process-wide serialization for launch tests that mutate global env (HOME, EMUCAP_*, ...).
-///
-/// The launch test modules all compile into one test binary and run in one process; several mutate
-/// process-global environment variables. A per-module lock lets one module's mutation race another
-/// module's env read, clobbering the value a running test asserts on, so every env-mutating launch
-/// test takes this single shared lock.
-#[cfg(test)]
-pub(crate) mod test_env {
-    use std::ffi::OsString;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Take the shared env lock, tolerating a poisoned lock (a panicking test leaves the env
-    /// snapshot to restore anyway) so one failed test does not cascade into the rest.
-    pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Snapshots the named env vars on construction and restores them (set previous value or remove)
-    /// on drop, so a test that mutates process-global env leaves it as it found it.
-    pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-    impl EnvGuard {
-        pub(crate) fn new(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
 /// Base directory for emucap-owned emulator data, per OS. `EMUCAP_EMU_HOME` overrides it.
 pub(crate) fn emu_home_base() -> PathBuf {
     if let Some(base) = std::env::var_os("EMUCAP_EMU_HOME") {

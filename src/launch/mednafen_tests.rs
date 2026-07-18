@@ -1,9 +1,6 @@
 use super::*;
 #[cfg(windows)]
-use std::sync::Mutex;
-
-#[cfg(windows)]
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+use crate::test_env::{lock_env, EnvGuard};
 
 #[cfg(unix)]
 fn make_executable(path: &Path) {
@@ -43,17 +40,13 @@ fn repo_local_candidate_is_platform_native() {
 #[cfg(windows)]
 #[test]
 fn default_install_candidates_include_windows_user_installs() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let old = std::env::var_os("LOCALAPPDATA");
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["LOCALAPPDATA"]);
     let base = PathBuf::from(r"C:\Users\alice\AppData\Local");
     std::env::set_var("LOCALAPPDATA", &base);
 
     let candidates = default_install_candidates();
 
-    match old {
-        Some(v) => std::env::set_var("LOCALAPPDATA", v),
-        None => std::env::remove_var("LOCALAPPDATA"),
-    }
     assert!(candidates.contains(&base.join("Programs/Mednafen/mednafen.exe")));
 }
 

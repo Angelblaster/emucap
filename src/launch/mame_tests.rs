@@ -2,7 +2,7 @@ use super::{
     default_rompath, gdb_port_for_emucap_port, repo_local_binary, resolve_bridge_launch,
     resolve_flop2, Launch,
 };
-use crate::launch::test_env::{lock_env, EnvGuard};
+use crate::test_env::{lock_env, EnvGuard};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(any(target_os = "macos", windows))]

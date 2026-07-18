@@ -1,9 +1,7 @@
 use super::set_ini;
+use crate::test_env::{lock_env, EnvGuard};
 #[cfg(any(target_os = "macos", windows))]
 use std::path::PathBuf;
-use std::sync::Mutex;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(unix)]
 fn make_executable(path: &std::path::Path) {
@@ -112,7 +110,8 @@ fn default_install_candidates_include_macos_app() {
 
 #[test]
 fn resolve_binary_accepts_explicit_app_bundle_path() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["FLYCAST_APP"]);
     let dir = tempfile::tempdir().unwrap();
     let app = dir.path().join("Flycast.app");
     let binary = app.join("Contents/MacOS/Flycast");
@@ -121,13 +120,8 @@ fn resolve_binary_accepts_explicit_app_bundle_path() {
     #[cfg(unix)]
     make_executable(&binary);
 
-    let old = std::env::var_os("FLYCAST_APP");
     std::env::set_var("FLYCAST_APP", &app);
     let resolved = super::resolve_binary();
-    match old {
-        Some(v) => std::env::set_var("FLYCAST_APP", v),
-        None => std::env::remove_var("FLYCAST_APP"),
-    }
 
     assert_eq!(resolved, Some(binary));
 }
@@ -135,17 +129,13 @@ fn resolve_binary_accepts_explicit_app_bundle_path() {
 #[cfg(windows)]
 #[test]
 fn default_install_candidates_include_windows_user_installs() {
-    let _guard = ENV_LOCK.lock().unwrap();
-    let old = std::env::var_os("LOCALAPPDATA");
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["LOCALAPPDATA"]);
     let base = PathBuf::from(r"C:\Users\alice\AppData\Local");
     std::env::set_var("LOCALAPPDATA", &base);
 
     let candidates = super::default_install_candidates();
 
-    match old {
-        Some(v) => std::env::set_var("LOCALAPPDATA", v),
-        None => std::env::remove_var("LOCALAPPDATA"),
-    }
     assert!(candidates.contains(&base.join("Programs/Flycast/Flycast.exe")));
 }
 

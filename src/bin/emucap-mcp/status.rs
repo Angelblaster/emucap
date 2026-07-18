@@ -755,6 +755,14 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
         "continuity".into(),
         serde_json::to_value(&continuity).unwrap_or_else(|_| serde_json::json!({})),
     );
+    if !continuity.runtime_diagnostics.is_empty() {
+        object.insert(
+            "next_safe_action".into(),
+            serde_json::json!(
+                "inspect the reported runtime artifact; do not replace a live emulator until ownership is proven"
+            ),
+        );
+    }
     let candidates = link.runtime_candidates();
     if !candidates.is_empty() {
         object.insert(

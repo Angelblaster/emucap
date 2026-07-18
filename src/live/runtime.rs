@@ -148,6 +148,81 @@ impl RuntimeStore {
             .join("adapter-failure.json")
     }
 
+    pub fn compatibility_token_path(&self, port: u16) -> PathBuf {
+        self.root
+            .join("compatibility")
+            .join(format!("session-token-{port}"))
+    }
+
+    pub fn persisted_port_path(&self, identity: &str, base: u16) -> io::Result<PathBuf> {
+        validate_compatibility_identity(identity)?;
+        if base == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot persist an ephemeral base port",
+            ));
+        }
+        Ok(self
+            .root
+            .join("compatibility")
+            .join(format!("listener-port-{identity}-{base}")))
+    }
+
+    pub fn write_compatibility_token(&self, port: u16, token: &str) -> io::Result<()> {
+        if token.trim().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to write an empty compatibility token",
+            ));
+        }
+        let path = self.compatibility_token_path(port);
+        validate_existing_private_file(&path)?;
+        write_atomic_bytes(&path, token.as_bytes())
+    }
+
+    pub fn read_compatibility_token(&self, port: u16) -> io::Result<Option<String>> {
+        let path = self.compatibility_token_path(port);
+        validate_existing_private_file(&path)?;
+        let Some(bytes) = read_bounded_if_exists(&path)? else {
+            return Ok(None);
+        };
+        let token = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("empty compatibility token file: {}", path.display()),
+            ));
+        }
+        Ok(Some(token.to_string()))
+    }
+
+    pub fn write_persisted_port(&self, identity: &str, base: u16, port: u16) -> io::Result<()> {
+        let path = self.persisted_port_path(identity, base)?;
+        validate_existing_private_file(&path)?;
+        write_atomic_bytes(&path, port.to_string().as_bytes())
+    }
+
+    pub fn read_persisted_port(&self, identity: &str, base: u16) -> io::Result<Option<u16>> {
+        let path = self.persisted_port_path(identity, base)?;
+        validate_existing_private_file(&path)?;
+        let Some(bytes) = read_bounded_if_exists(&path)? else {
+            return Ok(None);
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        text.trim().parse::<u16>().map(Some).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid persisted listener port in {}: {error}",
+                    path.display()
+                ),
+            )
+        })
+    }
+
     pub fn prepare(&self, port: u16) -> io::Result<PreparedGeneration> {
         let launch_id = format!("launch-{}", ulid::Ulid::new().to_string().to_lowercase());
         let reclaim_token = format!(
@@ -571,6 +646,66 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn validate_compatibility_identity(identity: &str) -> io::Result<()> {
+    if identity.is_empty()
+        || identity.len() > 128
+        || !identity
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid compatibility session identity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_existing_private_file(path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("refusing symlink runtime file: {}", path.display()),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("runtime path is not a regular file: {}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = metadata.uid();
+        let current = unsafe { libc::geteuid() };
+        if owner != current {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime file is owned by uid {owner}, current uid is {current}: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "runtime file is accessible by group or other users: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let bytes =
         serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -580,7 +715,7 @@ fn write_atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CAPSULE_FILE_BYTES {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::FileTooLarge,
             format!("runtime capsule file exceeds {MAX_CAPSULE_FILE_BYTES} bytes"),
         ));
     }
@@ -673,7 +808,7 @@ fn read_bounded_if_exists(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let len = file.metadata()?.len();
     if len > MAX_CAPSULE_FILE_BYTES {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::FileTooLarge,
             format!("runtime capsule file exceeds {MAX_CAPSULE_FILE_BYTES} bytes"),
         ));
     }
@@ -682,7 +817,7 @@ fn read_bounded_if_exists(path: &Path) -> io::Result<Option<Vec<u8>>> {
         .read_to_end(&mut bytes)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CAPSULE_FILE_BYTES {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
+            io::ErrorKind::FileTooLarge,
             format!("runtime capsule file exceeds {MAX_CAPSULE_FILE_BYTES} bytes"),
         ));
     }
