@@ -1,7 +1,6 @@
 use super::*;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::io::Write;
 
 #[derive(Default)]
 struct FakeGdb {
@@ -57,10 +56,10 @@ impl FakeGdb {
 }
 
 impl GdbTransport for FakeGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.calls.push(payload.into());
         let Some((expected, reply)) = self.replies.pop_front() else {
-            return Err(BridgeError::Emulator(format!(
+            return Err(GdbError::Emulator(format!(
                 "unexpected fake GDB call: {payload}"
             )));
         };
@@ -76,12 +75,12 @@ impl GdbTransport for FakeGdb {
         Ok(reply)
     }
 
-    fn send_no_reply(&mut self, payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, payload: &str) -> GdbResult<()> {
         self.no_reply.push(payload.into());
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         self.interrupts += 1;
         // The real stub leaves its trailing echo stop(s) buffered *after* the 0x03 break, so
         // enqueue them to nonblocking here rather than pre-seeding them ahead of the interrupt.
@@ -91,7 +90,7 @@ impl GdbTransport for FakeGdb {
         Ok("S05".into())
     }
 
-    fn get_timeout(&self) -> BridgeResult<Duration> {
+    fn get_timeout(&self) -> GdbResult<Duration> {
         if self.timeout.is_zero() {
             Ok(Duration::from_secs(5))
         } else {
@@ -99,13 +98,13 @@ impl GdbTransport for FakeGdb {
         }
     }
 
-    fn set_timeout(&mut self, timeout: Duration) -> BridgeResult<()> {
+    fn set_timeout(&mut self, timeout: Duration) -> GdbResult<()> {
         self.timeout = timeout;
         self.timeouts.push(timeout);
         Ok(())
     }
 
-    fn recv_nonblocking(&mut self) -> BridgeResult<Option<String>> {
+    fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
         Ok(self.nonblocking.pop_front())
     }
 }
@@ -152,7 +151,7 @@ impl StateSaveGdb {
 }
 
 impl GdbTransport for StateSaveGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -164,10 +163,10 @@ impl GdbTransport for StateSaveGdb {
         }
         if let Some(hex_path) = payload.strip_prefix("qEmucap,saveitems,") {
             let bytes = hex::decode(hex_path)
-                .map_err(|_| BridgeError::Emulator("bad saveitems path hex".into()))?;
+                .map_err(|_| GdbError::Emulator("bad saveitems path hex".into()))?;
             let path = PathBuf::from(
                 String::from_utf8(bytes)
-                    .map_err(|_| BridgeError::Emulator("bad saveitems path utf8".into()))?,
+                    .map_err(|_| GdbError::Emulator("bad saveitems path utf8".into()))?,
             );
             std::fs::create_dir_all(&path)?;
             std::fs::write(path.join("manifest.txt"), "item\n")?;
@@ -176,26 +175,24 @@ impl GdbTransport for StateSaveGdb {
         }
         if let Some(rest) = payload.strip_prefix('m') {
             let Some((_addr, len_hex)) = rest.split_once(',') else {
-                return Err(BridgeError::Emulator(format!("bad read: {payload}")));
+                return Err(GdbError::Emulator(format!("bad read: {payload}")));
             };
             let len = usize::from_str_radix(len_hex, 16)
-                .map_err(|_| BridgeError::Emulator(format!("bad read len: {payload}")))?;
+                .map_err(|_| GdbError::Emulator(format!("bad read len: {payload}")))?;
             self.reads += 1;
             if self.fail_at_read == Some(self.reads) {
-                return Err(BridgeError::Emulator(
-                    "simulated region read timeout".into(),
-                ));
+                return Err(GdbError::Emulator("simulated region read timeout".into()));
             }
             return Ok("00".repeat(len));
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
@@ -218,7 +215,7 @@ impl StateLoadGdb {
 }
 
 impl GdbTransport for StateLoadGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -227,10 +224,10 @@ impl GdbTransport for StateLoadGdb {
         }
         if let Some(hex_path) = payload.strip_prefix("qEmucap,loaditems,") {
             let bytes = hex::decode(hex_path)
-                .map_err(|_| BridgeError::Emulator("bad loaditems path hex".into()))?;
+                .map_err(|_| GdbError::Emulator("bad loaditems path hex".into()))?;
             self.load_items_dirs
                 .push(PathBuf::from(String::from_utf8(bytes).map_err(|_| {
-                    BridgeError::Emulator("bad loaditems path utf8".into())
+                    GdbError::Emulator("bad loaditems path utf8".into())
                 })?));
             return Ok("OK|1|0".into());
         }
@@ -239,29 +236,29 @@ impl GdbTransport for StateLoadGdb {
             return Ok("OK".into());
         }
         if let Some(hex_regs) = payload.strip_prefix("qEmucap,regload,") {
-            let bytes = hex::decode(hex_regs)
-                .map_err(|_| BridgeError::Emulator("bad regload hex".into()))?;
+            let bytes =
+                hex::decode(hex_regs).map_err(|_| GdbError::Emulator("bad regload hex".into()))?;
             let regs = String::from_utf8(bytes)
-                .map_err(|_| BridgeError::Emulator("bad regload utf8".into()))?;
+                .map_err(|_| GdbError::Emulator("bad regload utf8".into()))?;
             assert_eq!(regs, self.regs_hex);
             return Ok(format!("OK|{}", self.regs_hex));
         }
         if let Some(hex_spec) = payload.strip_prefix("qEmucap,regprobe,") {
-            let bytes = hex::decode(hex_spec)
-                .map_err(|_| BridgeError::Emulator("bad regprobe hex".into()))?;
+            let bytes =
+                hex::decode(hex_spec).map_err(|_| GdbError::Emulator("bad regprobe hex".into()))?;
             let spec = String::from_utf8(bytes)
-                .map_err(|_| BridgeError::Emulator("bad regprobe utf8".into()))?;
+                .map_err(|_| GdbError::Emulator("bad regprobe utf8".into()))?;
             self.regprobe_specs.push(spec);
             return Ok(format!("HEX:cafe|FRAME:3|REGS:{}", self.regs_hex));
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
@@ -297,7 +294,7 @@ fn write_test_state(path: &Path, regs_hex: &str) {
 
 #[test]
 fn hello_advertises_only_implemented_rust_methods() {
-    let env = BridgeEnv {
+    let env = GdbBridgeEnv {
         name: Some("pc98".into()),
         session_token: Some("token".into()),
         build: Some("abc123".into()),
@@ -421,7 +418,7 @@ fn read_and_write_memory_map_regions_to_absolute_gdb_addresses() {
         ("ma0010,4", "01020304"),
         ("Ma0010,2:aabb", "OK"),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
 
     let read = bridge.handle_request(Request::new(
         2,
@@ -440,7 +437,7 @@ fn read_and_write_memory_map_regions_to_absolute_gdb_addresses() {
 
 #[test]
 fn read_memory_rejects_access_straddling_region_end() {
-    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), BridgeEnv::default());
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         4,
         "read_memory",
@@ -455,7 +452,7 @@ fn read_memory_rejects_access_straddling_region_end() {
 
 #[test]
 fn write_memory_rejects_access_straddling_region_end() {
-    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), BridgeEnv::default());
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         5,
         "write_memory",
@@ -471,7 +468,7 @@ fn write_memory_rejects_access_straddling_region_end() {
 #[test]
 fn memory_access_ending_exactly_at_region_end_is_allowed() {
     let fake = FakeGdb::with(&[("?", "S05"), ("ma3fff,1", "7f"), ("Ma3fff,1:80", "OK")]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
 
     let read = bridge.handle_request(Request::new(
         6,
@@ -492,7 +489,7 @@ fn memory_access_ending_exactly_at_region_end_is_allowed() {
 fn find_pattern_scans_region_with_match_limit() {
     let mut bridge = Bridge::new(
         FakeGdb::with(&[("?", "S05"), ("m0,8", "aa00aa00aa00aa00")]),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let response = bridge.handle_request(Request::new(
         7,
@@ -517,7 +514,7 @@ fn input_methods_send_lua_commands_with_normalized_buttons() {
             ("qEmucap,reset", "OK"),
             ("qEmucap,breakonreset,31", "OK"),
         ]),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
 
     let set = bridge.handle_request(Request::new(
@@ -578,7 +575,7 @@ fn breakpoint_methods_set_list_clear_and_enrich_events() {
         ("ma0000,2".into(), "aabb".into()),
     ])
     .with_nonblocking(&["T05hwbreak:00000a00;idx:2;"]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
 
     let set = bridge.handle_request(Request::new(
         12,
@@ -648,7 +645,7 @@ fn set_breakpoint_rejects_out_of_range_region_offset() {
     // tvram is 0x4000; without the bound, region.base + start lands past the region and MAME's
     // setpoint may silently accept an address that can never fire. Reject before arming.
     let fake = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let r = bridge.handle_request(Request::new(
         1,
         "set_breakpoint",
@@ -677,7 +674,7 @@ fn set_breakpoint_in_range_resolves_to_region_base_plus_offset() {
             "BP:9".into(),
         ),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let r = bridge.handle_request(Request::new(
         1,
         "set_breakpoint",
@@ -701,7 +698,7 @@ fn watch_register_sets_regpoint_and_reports_value() {
         ("g".into(), regs),
     ])
     .with_nonblocking(&["T05regwatch:00100000;idx:3;"]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
 
     let set = bridge.handle_request(Request::new(
         17,
@@ -745,7 +742,7 @@ fn run_frames_sends_lua_command_with_scaled_timeout() {
         ("qEmucap,runframes,33303030", "OK"),
         ("qEmucap,frame", "42"),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(14, "run_frames", json!({"n": 3000})));
     let result = response.result.unwrap();
     assert_eq!(result["status"], "completed");
@@ -763,7 +760,7 @@ fn run_frames_sends_lua_command_with_scaled_timeout() {
 #[test]
 fn run_frames_rejects_work_past_backend_deadline_before_mutation() {
     let fake = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let requested = bridge.max_sync_frame_count() + 1;
     let response = bridge.handle_request(Request::new(14, "run_frames", json!({"n": requested})));
 
@@ -782,7 +779,7 @@ fn press_buttons_reports_breakpoint_interruption_and_releases_operation() {
         ),
         ("qEmucap,frame", "77"),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         15,
         "press_buttons",
@@ -814,7 +811,7 @@ fn input_rejects_nonzero_port_and_oversized_pulse_before_mutation() {
         ),
     ] {
         let fake = FakeGdb::with(&[("?", "S05")]);
-        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+        let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
         let response = bridge.handle_request(Request::new(19, method, params));
         assert!(!response.ok, "{method} must reject before mutation");
         assert_eq!(response.error.unwrap().kind, "bad_params");
@@ -830,7 +827,7 @@ fn status_reports_plugin_input_ownership() {
         ("qEmucap,inputstatus", "-1"),
         ("qEmucap,frame", "42"),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(20, "status", json!({})));
     let result = response.result.unwrap();
     let input = &result["input_override"];
@@ -854,7 +851,7 @@ fn step_frames_returns_interrupted_on_stop_reply() {
         ("qEmucap,framestep,3130", "T05hwbreak:01000000;idx:2;"),
         ("qEmucap,frame", "77"),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(15, "step", json!({"frames": 10})));
     let result = response.result.unwrap();
     assert_eq!(result["status"], "interrupted");
@@ -875,7 +872,7 @@ fn step_frames_drains_immediate_stop_after_ok() {
         ("qEmucap,frame", "9"),
     ])
     .enqueue_nonblocking_after("qEmucap,framestep,31", "S05");
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(16, "step", json!({"frames": 1})));
     let result = response.result.unwrap();
     assert_eq!(result["status"], "interrupted");
@@ -886,7 +883,7 @@ fn step_frames_drains_immediate_stop_after_ok() {
 #[test]
 fn step_instructions_sends_gdb_single_step_count() {
     let fake = FakeGdb::with(&[("?", "S05"), ("s", "S05"), ("s", "S05"), ("s", "S05")]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response =
         bridge.handle_request(Request::new(17, "step_instructions", json!({"count": 3})));
     let result = response.result.unwrap();
@@ -907,7 +904,7 @@ fn step_instructions_sends_gdb_single_step_count() {
 #[test]
 fn step_instructions_rejects_over_sync_cap_before_mutation() {
     let fake = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         17,
         "step_instructions",
@@ -922,26 +919,26 @@ fn step_instructions_rejects_over_sync_cap_before_mutation() {
 struct DasmGdb;
 
 impl GdbTransport for DasmGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
         let prefix = "qEmucap,dasm,";
         if let Some(hex_spec) = payload.strip_prefix(prefix) {
             let bytes = hex::decode(hex_spec)
-                .map_err(|_| BridgeError::Emulator("bad dasm spec hex".into()))?;
+                .map_err(|_| GdbError::Emulator("bad dasm spec hex".into()))?;
             let spec = String::from_utf8(bytes)
-                .map_err(|_| BridgeError::Emulator("bad dasm spec utf8".into()))?;
+                .map_err(|_| GdbError::Emulator("bad dasm spec utf8".into()))?;
             let mut parts = spec.split('|');
             let path = parts
                 .next()
-                .ok_or_else(|| BridgeError::Emulator("missing dasm path".into()))?;
+                .ok_or_else(|| GdbError::Emulator("missing dasm path".into()))?;
             let address = parts
                 .next()
-                .ok_or_else(|| BridgeError::Emulator("missing dasm address".into()))?;
+                .ok_or_else(|| GdbError::Emulator("missing dasm address".into()))?;
             let len = parts
                 .next()
-                .ok_or_else(|| BridgeError::Emulator("missing dasm length".into()))?;
+                .ok_or_else(|| GdbError::Emulator("missing dasm length".into()))?;
             assert_eq!(address, "1000");
             assert_eq!(len, "20");
             std::fs::write(
@@ -950,21 +947,21 @@ impl GdbTransport for DasmGdb {
             )?;
             return Ok("OK".into());
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
 
 #[test]
 fn disassemble_uses_lua_dasm_and_parses_instruction_rows() {
-    let mut bridge = Bridge::new(DasmGdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(DasmGdb, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         19,
         "disassemble",
@@ -988,7 +985,7 @@ struct TraceGdb {
 }
 
 impl TraceGdb {
-    fn write_trace(&self) -> BridgeResult<()> {
+    fn write_trace(&self) -> GdbResult<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
@@ -1006,16 +1003,16 @@ impl TraceGdb {
 }
 
 impl GdbTransport for TraceGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
         let prefix = "qEmucap,tracestart,";
         if let Some(hex_path) = payload.strip_prefix(prefix) {
             let bytes = hex::decode(hex_path)
-                .map_err(|_| BridgeError::Emulator("bad trace path hex".into()))?;
+                .map_err(|_| GdbError::Emulator("bad trace path hex".into()))?;
             let path = String::from_utf8(bytes)
-                .map_err(|_| BridgeError::Emulator("bad trace path utf8".into()))?;
+                .map_err(|_| GdbError::Emulator("bad trace path utf8".into()))?;
             self.path = Some(PathBuf::from(path));
             self.write_trace()?;
             return Ok("OK".into());
@@ -1029,21 +1026,21 @@ impl GdbTransport for TraceGdb {
             self.stops += 1;
             return Ok("OK".into());
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
 
 #[test]
 fn trace_methods_manage_lua_trace_file_and_parse_rows() {
-    let mut bridge = Bridge::new(TraceGdb::default(), BridgeEnv::default());
+    let mut bridge = Bridge::new(TraceGdb::default(), GdbBridgeEnv::default());
     let started = bridge.handle_request(Request::new(20, "set_trace", json!({"enabled": true})));
     let started = started.result.unwrap();
     assert_eq!(started["tracing"], true);
@@ -1087,7 +1084,7 @@ fn status_drains_nonblocking_stop_when_running() {
         ("qEmucap,frame", "12"),
     ])
     .with_nonblocking(&["S05"]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     bridge.frozen = false;
     let response = bridge.handle_request(Request::new(18, "status", json!({})));
     let result = response.result.unwrap();
@@ -1113,7 +1110,7 @@ fn dump_memory_writes_regions_under_requested_directory() {
             offset += chunk;
         }
     }
-    let mut bridge = Bridge::new(FakeGdb::from_pairs(replies), BridgeEnv::default());
+    let mut bridge = Bridge::new(FakeGdb::from_pairs(replies), GdbBridgeEnv::default());
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("dump");
     let response = bridge.handle_request(Request::new(
@@ -1140,7 +1137,7 @@ fn save_state_writes_python_compatible_zip_bundle() {
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("state.zip");
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
-    let mut bridge = Bridge::new(StateSaveGdb::new(regs.clone()), BridgeEnv::default());
+    let mut bridge = Bridge::new(StateSaveGdb::new(regs.clone()), GdbBridgeEnv::default());
 
     let response = bridge.handle_request(Request::new(
         24,
@@ -1179,7 +1176,10 @@ fn save_state_preserves_prior_save_on_mid_save_failure() {
 
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
     // Fail on the first region read (timeout mid-zip), after the staging file is created.
-    let mut bridge = Bridge::new(StateSaveGdb::failing_at_read(regs, 1), BridgeEnv::default());
+    let mut bridge = Bridge::new(
+        StateSaveGdb::failing_at_read(regs, 1),
+        GdbBridgeEnv::default(),
+    );
     let response = bridge.handle_request(Request::new(
         60,
         "save_state",
@@ -1225,7 +1225,7 @@ fn run_frames_drains_pre_command_stale_stop() {
         ("qEmucap,frame".into(), "42".into()),
     ])
     .with_nonblocking(&["T05hwbreak:00100000;idx:2"]);
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(50, "run_frames", json!({"n": 3})));
     let result = response.result.unwrap();
     assert_eq!(
@@ -1254,7 +1254,7 @@ fn step_framestep_drains_pre_command_stale_stop() {
         ("qEmucap,frame".into(), "7".into()),
     ])
     .with_nonblocking(&["T05hwbreak:00200000;idx:3"]);
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         51,
         "step",
@@ -1279,7 +1279,7 @@ fn interrupt_trailing_stop_does_not_produce_phantom_event() {
     // not an async game event — the counter must suppress it so it never surfaces as a phantom.
     let gdb =
         FakeGdb::with(&[("?", "S05"), ("qEmucap,pollreset", "NONE")]).with_interrupt_echo(&["S05"]);
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     bridge.frozen = false; // core running, so pause() actually injects an interrupt
     bridge.pause().unwrap();
     bridge.resume().unwrap();
@@ -1309,7 +1309,7 @@ fn pause_preserves_real_bp_hit_buffered_before_interrupt() {
     ])
     .with_nonblocking(&["T05hwbreak:00100000;idx:2"]) // real hit already buffered
     .with_interrupt_echo(&["S05"]); // interrupt's own trailing echo, enqueued after interrupt
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     bridge.frozen = false; // core running, so pause() actually injects an interrupt
     bridge.pause().unwrap();
     bridge.resume().unwrap();
@@ -1333,7 +1333,7 @@ fn drain_immediate_stops_does_not_return_suppressed_echo() {
     // command's immediate stop must be suppressed by note_stop, not returned as the frame's
     // stop result — otherwise a completed frame is mis-reported as interrupted+frozen.
     let gdb = FakeGdb::with(&[("?", "S05")]).with_nonblocking(&["S05"]);
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     bridge.pending_interrupt_stops = 1;
     let stop = bridge.drain_immediate_stops().unwrap();
     assert_eq!(
@@ -1353,7 +1353,7 @@ fn load_state_restores_save_items_memory_and_registers() {
     let state = tmp.path().join("state.zip");
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
     write_test_state(&state, &regs);
-    let mut bridge = Bridge::new(StateLoadGdb::new(regs), BridgeEnv::default());
+    let mut bridge = Bridge::new(StateLoadGdb::new(regs), GdbBridgeEnv::default());
 
     let response = bridge.handle_request(Request::new(
         25,
@@ -1376,7 +1376,7 @@ fn probe_restores_state_and_uses_lua_register_probe() {
     let state = tmp.path().join("state.zip");
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
     write_test_state(&state, &regs);
-    let mut bridge = Bridge::new(StateLoadGdb::new(regs.clone()), BridgeEnv::default());
+    let mut bridge = Bridge::new(StateLoadGdb::new(regs.clone()), GdbBridgeEnv::default());
 
     let response = bridge.handle_request(Request::new(
         26,
@@ -1402,7 +1402,7 @@ fn get_state_decodes_i386_register_packet_and_segmented_pc() {
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234), ("esp", 0xAA55)]);
     let mut bridge = Bridge::new(
         FakeGdb::with(&[("?", "S05"), ("g", &regs)]),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let response = bridge.handle_request(Request::new(4, "get_state", json!({})));
     let state = &response.result.unwrap()["state"];
@@ -1416,7 +1416,7 @@ fn get_rom_info_hashes_content_path() {
     let tmp = tempfile::tempdir().unwrap();
     let disk = tmp.path().join("game.hdi");
     std::fs::write(&disk, b"pc98").unwrap();
-    let env = BridgeEnv {
+    let env = GdbBridgeEnv {
         content: Some(disk.clone()),
         ..Default::default()
     };
@@ -1431,7 +1431,7 @@ fn get_rom_info_hashes_content_path() {
 
 #[test]
 fn unknown_method_uses_protocol_unknown_method_kind() {
-    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), BridgeEnv::default());
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(6, "not_a_method", json!({})));
     assert!(!response.ok);
     assert_eq!(response.error.unwrap().kind, "unknown_method");
@@ -1440,7 +1440,7 @@ fn unknown_method_uses_protocol_unknown_method_kind() {
 struct SnapshotGdb;
 
 impl GdbTransport for SnapshotGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -1450,27 +1450,27 @@ impl GdbTransport for SnapshotGdb {
         let prefix = "qEmucap,snapshot,";
         if let Some(hex_path) = payload.strip_prefix(prefix) {
             let bytes = hex::decode(hex_path)
-                .map_err(|_| BridgeError::Emulator("bad snapshot path hex".into()))?;
+                .map_err(|_| GdbError::Emulator("bad snapshot path hex".into()))?;
             let path = String::from_utf8(bytes)
-                .map_err(|_| BridgeError::Emulator("bad snapshot path utf8".into()))?;
+                .map_err(|_| GdbError::Emulator("bad snapshot path utf8".into()))?;
             std::fs::write(path, b"\x89PNG\r\n\x1a\nfake")?;
             return Ok("OK".into());
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
 
 #[test]
 fn screenshot_returns_png_base64_from_lua_snapshot() {
-    let mut bridge = Bridge::new(SnapshotGdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(SnapshotGdb, GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(13, "screenshot", json!({})));
     let result = response.result.unwrap();
     assert_eq!(
@@ -1490,45 +1490,6 @@ fn screenshot_returns_png_base64_from_lua_snapshot() {
     assert_eq!(result["frame_binding"], "unverified");
 }
 
-#[test]
-fn rsp_client_sends_acknowledged_packet_and_decodes_reply() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let handle = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut request = Vec::new();
-        loop {
-            let mut b = [0u8; 1];
-            stream.read_exact(&mut b).unwrap();
-            request.push(b[0]);
-            if request.len() >= 4 && request[request.len() - 3] == b'#' {
-                break;
-            }
-        }
-        assert_eq!(std::str::from_utf8(&request).unwrap(), "$g#67");
-        stream.write_all(b"+").unwrap();
-        let payload = b"OK";
-        let frame = format!(
-            "$OK#{:02x}",
-            payload.iter().fold(0u8, |sum, b| sum.wrapping_add(*b))
-        );
-        stream.write_all(frame.as_bytes()).unwrap();
-        let mut ack = [0u8; 1];
-        stream.read_exact(&mut ack).unwrap();
-        assert_eq!(ack[0], b'+');
-    });
-
-    let mut client = GdbRspClient::connect(
-        "127.0.0.1",
-        port,
-        Duration::from_secs(2),
-        Duration::from_secs(2),
-    )
-    .unwrap();
-    assert_eq!(client.send("g").unwrap(), "OK");
-    handle.join().unwrap();
-}
-
 // P1: stale async stop이 데이터 명령의 응답 자리에 오배달돼도 send_cmd가 이벤트 큐로
 // 걷어내고 진짜 응답을 이어 읽어 off-by-one 디싱크를 막는지 검증한다.
 #[derive(Default)]
@@ -1538,22 +1499,22 @@ struct StaleStopGdb {
 }
 
 impl GdbTransport for StaleStopGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
         Ok(self.stale.take().unwrap_or_else(|| self.reply.clone()))
     }
 
-    fn recv_reply(&mut self) -> BridgeResult<String> {
+    fn recv_reply(&mut self) -> GdbResult<String> {
         Ok(self.reply.clone())
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
@@ -1564,7 +1525,7 @@ fn send_cmd_demuxes_stale_async_stop_ahead_of_data_reply() {
         stale: Some("T05".into()),
         reply: "OK".into(),
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let resp = bridge
         .send_cmd("qEmucap,setinput,656e746572")
         .expect("send_cmd returns the real reply");
@@ -1583,7 +1544,7 @@ struct StaleStopReadGdb {
 }
 
 impl GdbTransport for StaleStopReadGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -1591,15 +1552,15 @@ impl GdbTransport for StaleStopReadGdb {
         Ok(self.stale.take().unwrap_or_else(|| self.hex.clone()))
     }
 
-    fn recv_reply(&mut self) -> BridgeResult<String> {
+    fn recv_reply(&mut self) -> GdbResult<String> {
         Ok(self.hex.clone())
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
@@ -1611,7 +1572,7 @@ fn read_abs_hex_demuxes_stale_stop_ahead_of_memory_reply() {
         hex: "deadbeef".into(),
         reads: Vec::new(),
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let hex = bridge
         .read_abs_hex(0x1234, 4)
         .expect("read_abs_hex returns the real hex reply");
@@ -1639,7 +1600,7 @@ fn send_cmd_drains_stale_ok_ahead_of_register_read() {
         hex: "00ff0000160000008080".into(), // i386 레지스터 hex(축약)
         reads: Vec::new(),
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let resp = bridge.send_cmd_data("g").expect("g returns register hex");
     assert_eq!(
         resp, "00ff0000160000008080",
@@ -1657,7 +1618,7 @@ fn send_cmd_data_drains_stale_ok_ahead_of_frame_read() {
         hex: "2028".into(), // qEmucap,frame의 10진 프레임 번호
         reads: Vec::new(),
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let resp = bridge
         .send_cmd_data("qEmucap,frame")
         .expect("frame returns the decimal frame number");
@@ -1676,7 +1637,7 @@ fn send_cmd_data_keeps_ok_pipe_data_reply() {
         hex: "OK|3|0".into(),
         reads: Vec::new(),
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let resp = bridge
         .send_cmd_data("qEmucap,saveitems,2f74")
         .expect("saveitems returns OK|data");
@@ -1693,7 +1654,7 @@ struct StepStaleGdb {
 }
 
 impl GdbTransport for StepStaleGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -1701,18 +1662,18 @@ impl GdbTransport for StepStaleGdb {
             self.steps += 1;
             return Ok(self.step_reply.clone());
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 
-    fn recv_nonblocking(&mut self) -> BridgeResult<Option<String>> {
+    fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
         Ok(self.buffered.pop_front())
     }
 }
@@ -1724,7 +1685,7 @@ fn step_instruction_drains_pre_command_stale_stop() {
         step_reply: "S05".into(),
         steps: 0,
     };
-    let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     let response =
         bridge.handle_request(Request::new(40, "step_instructions", json!({"count": 1})));
     assert!(response.ok, "instruction step still completes");
@@ -1750,7 +1711,7 @@ fn set_input_names_unavailable_button_and_lists_machine_fields() {
         ),
         ("qEmucap,inputfields".into(), "a,b,enter,esc,space".into()),
     ]);
-    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
     let response =
         bridge.handle_request(Request::new(30, "set_input", json!({"buttons": ["help"]})));
     assert!(!response.ok);
@@ -1770,7 +1731,7 @@ struct CallStackFpGdb {
 }
 
 impl GdbTransport for CallStackFpGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -1780,22 +1741,22 @@ impl GdbTransport for CallStackFpGdb {
         if let Some(rest) = payload.strip_prefix('m') {
             let (addr_hex, len_hex) = rest
                 .split_once(',')
-                .ok_or_else(|| BridgeError::Emulator(format!("bad read: {payload}")))?;
+                .ok_or_else(|| GdbError::Emulator(format!("bad read: {payload}")))?;
             let addr = u64::from_str_radix(addr_hex, 16)
-                .map_err(|_| BridgeError::Emulator(format!("bad addr: {payload}")))?;
+                .map_err(|_| GdbError::Emulator(format!("bad addr: {payload}")))?;
             let len = usize::from_str_radix(len_hex, 16)
-                .map_err(|_| BridgeError::Emulator(format!("bad len: {payload}")))?;
+                .map_err(|_| GdbError::Emulator(format!("bad len: {payload}")))?;
             let value = self.mem.get(&addr).copied().unwrap_or(0);
             return Ok(hex::encode(&value.to_le_bytes()[..len]));
         }
-        Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
+        Err(GdbError::Emulator(format!("unexpected call: {payload}")))
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 }
@@ -1815,11 +1776,25 @@ fn call_stack_walks_frame_pointer_chain_without_trace() {
             regs_hex: regs,
             mem,
         },
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let response = bridge.handle_request(Request::new(31, "call_stack", json!({})));
     let result = response.result.unwrap();
     assert_eq!(result["method"], "frame_pointer");
     assert_eq!(result["call_stack"], json!([0xAAAA, 0xBBBB]));
     assert_eq!(result["depth"], 2);
+}
+
+#[test]
+fn gdb_backend_and_stream_errors_keep_distinct_protocol_kinds() {
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(32, "get_state", json!({})));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "emulator_error");
+
+    let stream_error = BridgeError::Gdb(GdbError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "fake reset",
+    )));
+    assert_eq!(error_kind(&stream_error), "bridge_error");
 }

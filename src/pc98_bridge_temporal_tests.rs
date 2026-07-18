@@ -20,7 +20,7 @@ impl DelayedStepGdb {
 }
 
 impl GdbTransport for DelayedStepGdb {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
         match payload {
             "?" => Ok("S05".into()),
             "s" => {
@@ -28,32 +28,32 @@ impl GdbTransport for DelayedStepGdb {
                 let wait = self.step_delay.min(self.timeout);
                 std::thread::sleep(wait);
                 if self.timeout < self.step_delay {
-                    return Err(BridgeError::Io(std::io::Error::new(
+                    return Err(GdbError::Io(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "delayed GDB step exceeded its clipped timeout",
                     )));
                 }
                 Ok("S05".into())
             }
-            other => Err(BridgeError::Emulator(format!(
+            other => Err(GdbError::Emulator(format!(
                 "unexpected delayed GDB call: {other}"
             ))),
         }
     }
 
-    fn send_no_reply(&mut self, _payload: &str) -> BridgeResult<()> {
+    fn send_no_reply(&mut self, _payload: &str) -> GdbResult<()> {
         Ok(())
     }
 
-    fn interrupt(&mut self) -> BridgeResult<String> {
+    fn interrupt(&mut self) -> GdbResult<String> {
         Ok("S05".into())
     }
 
-    fn get_timeout(&self) -> BridgeResult<Duration> {
+    fn get_timeout(&self) -> GdbResult<Duration> {
         Ok(self.timeout)
     }
 
-    fn set_timeout(&mut self, timeout: Duration) -> BridgeResult<()> {
+    fn set_timeout(&mut self, timeout: Duration) -> GdbResult<()> {
         self.timeout = timeout;
         self.timeout_history.push(timeout);
         Ok(())
@@ -64,7 +64,7 @@ impl GdbTransport for DelayedStepGdb {
 fn delayed_backend_cannot_turn_a_partial_pc98_step_into_completion() {
     let mut bridge = Bridge::new(
         DelayedStepGdb::new(Duration::from_millis(70)),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let started = Instant::now();
     let error = bridge

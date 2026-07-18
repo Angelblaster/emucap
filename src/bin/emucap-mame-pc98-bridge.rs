@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use emucap::gdb_rsp::{GdbBridgeEnv, GdbRspClient};
 use emucap::live::reconnect::serve_reconnecting;
-use emucap::pc98_bridge::{Bridge, BridgeEnv, GdbRspClient};
+use emucap::pc98_bridge::Bridge;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -27,7 +28,7 @@ fn main() -> anyhow::Result<()> {
         Duration::from_secs(30),
     )
     .with_context(|| format!("connect GDB stub at {gdb_host}:{gdb_port}"))?;
-    let mut bridge = Bridge::new(gdb, BridgeEnv::from_process_env());
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::from_process_env());
 
     serve_reconnecting(emucap_port, "mame-pc98-rust", move |request| {
         bridge.handle_request(request)

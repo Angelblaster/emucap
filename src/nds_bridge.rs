@@ -5,7 +5,8 @@
 //! standard RSP (`c`/`s`/`m`/`M`/`g`/`Z0`/`z0`/`?`) to those stubs on the other, routing
 //! memory/registers/stepping/breakpoints to the ARM9 or ARM7 connection per request.
 //!
-//! Transport (`GdbRspClient`, `GdbTransport`, `BridgeEnv`) is reused from `pc98_bridge`.
+//! Transport (`GdbRspClient`, `GdbTransport`, `GdbBridgeEnv`) comes from the adapter-neutral
+//! `gdb_rsp` module.
 //! Tier-1 (memory/registers/step/breakpoints) rides standard RSP. Screenshot, input, save/load
 //! state, and disassemble, which standard RSP cannot serve, ride repo-owned custom RSP commands
 //! the DeSmuME fork adds: `qEmucap,ss` returns a base64 PNG of both screens,
@@ -25,8 +26,8 @@ use base64::Engine;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 
+use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
-use crate::pc98_bridge::{BridgeEnv, BridgeError as GdbError, GdbTransport};
 
 /// Bulk-read chunk size for the GDB `m addr,len` path. A read reply is 2 hex chars per byte written
 /// into the DeSmuME stub's fixed `hidden_buffer[BUFMAX]`; a chunk whose reply overruns that buffer
@@ -208,12 +209,8 @@ pub enum NdsBridgeError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
-}
-
-impl From<GdbError> for NdsBridgeError {
-    fn from(err: GdbError) -> Self {
-        NdsBridgeError::Emulator(err.to_string())
-    }
+    #[error(transparent)]
+    Gdb(#[from] GdbError),
 }
 
 type NdsResult<T> = Result<T, NdsBridgeError>;
@@ -229,14 +226,14 @@ struct CpuConn<G> {
 pub struct NdsBridge<G> {
     arm9: CpuConn<G>,
     arm7: Option<CpuConn<G>>,
-    env: BridgeEnv,
+    env: GdbBridgeEnv,
     bps: BTreeMap<u64, NdsBreakpoint>,
     next_bp: u64,
     events: Vec<Value>,
 }
 
 impl<G: GdbTransport> NdsBridge<G> {
-    pub fn new(arm9: G, arm7: Option<G>, env: BridgeEnv) -> Self {
+    pub fn new(arm9: G, arm7: Option<G>, env: GdbBridgeEnv) -> Self {
         Self {
             arm9: CpuConn::new(CpuId::Arm9, arm9),
             arm7: arm7.map(|g| CpuConn::new(CpuId::Arm7, g)),

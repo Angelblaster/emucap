@@ -40,8 +40,12 @@ pub(super) fn error_kind(err: &NdsBridgeError) -> &'static str {
         NdsBridgeError::BadParams(_) => "bad_params",
         NdsBridgeError::UnknownMethod(_) => "unknown_method",
         NdsBridgeError::Unsupported(_) => "unsupported",
-        NdsBridgeError::Emulator(_) => "emulator_error",
-        NdsBridgeError::Io(_) | NdsBridgeError::Json(_) => "bridge_error",
+        NdsBridgeError::Emulator(_) | NdsBridgeError::Gdb(GdbError::Emulator(_)) => {
+            "emulator_error"
+        }
+        NdsBridgeError::Io(_)
+        | NdsBridgeError::Json(_)
+        | NdsBridgeError::Gdb(GdbError::Io(_) | GdbError::Poisoned) => "bridge_error",
     }
 }
 

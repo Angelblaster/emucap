@@ -4,8 +4,11 @@ pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::BadParams(_) => "bad_params",
         BridgeError::UnknownMethod(_) => "unknown_method",
-        BridgeError::Emulator(_) => "emulator_error",
-        BridgeError::Io(_) | BridgeError::Json(_) | BridgeError::Zip(_) => "bridge_error",
+        BridgeError::Emulator(_) | BridgeError::Gdb(GdbError::Emulator(_)) => "emulator_error",
+        BridgeError::Io(_)
+        | BridgeError::Json(_)
+        | BridgeError::Zip(_)
+        | BridgeError::Gdb(GdbError::Io(_) | GdbError::Poisoned) => "bridge_error",
     }
 }
 

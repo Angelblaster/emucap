@@ -1,5 +1,5 @@
 use super::*;
-use crate::pc98_bridge::BridgeError as GdbError;
+use crate::gdb_rsp::GdbError;
 use std::time::{Duration, Instant};
 
 struct DelayedStepGdb {
@@ -68,7 +68,7 @@ fn delayed_backend_cannot_turn_a_partial_nds_step_into_completion() {
     let mut bridge = NdsBridge::new(
         DelayedStepGdb::new(Duration::from_millis(70)),
         None,
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let started = Instant::now();
     let error = bridge

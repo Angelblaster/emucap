@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod bundle;
 pub mod contracts;
+pub mod gdb_rsp;
 pub mod launch;
 pub mod live;
 pub mod nds_bridge;

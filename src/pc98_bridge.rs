@@ -11,6 +11,9 @@ use sha2::Sha256;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+#[cfg(test)]
+use crate::gdb_rsp::GdbResult;
+use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 const MAX_READ_CHUNK: usize = 0x4000;
@@ -221,37 +224,15 @@ pub enum BridgeError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
+    #[error(transparent)]
+    Gdb(#[from] crate::gdb_rsp::GdbError),
 }
 
 type BridgeResult<T> = Result<T, BridgeError>;
 
-mod transport;
-pub use transport::{GdbRspClient, GdbTransport};
-
-#[derive(Debug, Clone, Default)]
-pub struct BridgeEnv {
-    pub name: Option<String>,
-    pub session_token: Option<String>,
-    pub launch_id: Option<String>,
-    pub content: Option<PathBuf>,
-    pub build: Option<String>,
-}
-
-impl BridgeEnv {
-    pub fn from_process_env() -> Self {
-        Self {
-            name: std::env::var("EMUCAP_NAME").ok(),
-            session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
-            launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
-            content: std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
-            build: std::env::var("EMUCAP_BUILD_HASH").ok(),
-        }
-    }
-}
-
 pub struct Bridge<G> {
     gdb: G,
-    env: BridgeEnv,
+    env: GdbBridgeEnv,
     frozen: bool,
     tracing: bool,
     trace_path: Option<PathBuf>,
@@ -267,7 +248,7 @@ pub struct Bridge<G> {
 }
 
 impl<G: GdbTransport> Bridge<G> {
-    pub fn new(mut gdb: G, env: BridgeEnv) -> Self {
+    pub fn new(mut gdb: G, env: GdbBridgeEnv) -> Self {
         let frozen = gdb.send("?").is_ok();
         Self {
             gdb,

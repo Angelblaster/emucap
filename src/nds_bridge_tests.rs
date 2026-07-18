@@ -1,5 +1,5 @@
 use super::*;
-use crate::pc98_bridge::BridgeError;
+use crate::gdb_rsp::GdbError;
 use std::collections::VecDeque;
 
 #[derive(Default)]
@@ -33,10 +33,10 @@ impl FakeGdb {
 }
 
 impl GdbTransport for FakeGdb {
-    fn send(&mut self, payload: &str) -> Result<String, BridgeError> {
+    fn send(&mut self, payload: &str) -> Result<String, GdbError> {
         self.calls.push(payload.into());
         let Some((expected, reply)) = self.replies.pop_front() else {
-            return Err(BridgeError::Emulator(format!(
+            return Err(GdbError::Emulator(format!(
                 "unexpected fake GDB call: {payload}"
             )));
         };
@@ -44,23 +44,23 @@ impl GdbTransport for FakeGdb {
         Ok(reply)
     }
 
-    fn send_no_reply(&mut self, payload: &str) -> Result<(), BridgeError> {
+    fn send_no_reply(&mut self, payload: &str) -> Result<(), GdbError> {
         self.calls.push(payload.into());
         Ok(())
     }
 
-    fn interrupt(&mut self) -> Result<String, BridgeError> {
+    fn interrupt(&mut self) -> Result<String, GdbError> {
         if self.fail_interrupt {
-            return Err(BridgeError::Emulator("fake interrupt failure".into()));
+            return Err(GdbError::Emulator("fake interrupt failure".into()));
         }
         // A real interrupt reads the next packet off the socket: a pending stop is consumed here
         // (the loss the pause fix drains first). Otherwise the stub answers our SIGINT (S02).
         Ok(self.nonblocking.pop_front().unwrap_or_else(|| "S02".into()))
     }
 
-    fn recv_nonblocking(&mut self) -> Result<Option<String>, BridgeError> {
+    fn recv_nonblocking(&mut self) -> Result<Option<String>, GdbError> {
         if self.fail_nonblocking {
-            return Err(BridgeError::Emulator("fake nonblocking failure".into()));
+            return Err(GdbError::Emulator("fake nonblocking failure".into()));
         }
         Ok(self.nonblocking.pop_front())
     }
@@ -82,7 +82,7 @@ fn arm_regs_hex(regs: &[(usize, u32)], cpsr: u32) -> String {
 }
 
 fn bridge_arm9_only(replies: &[(&str, &str)]) -> NdsBridge<FakeGdb> {
-    NdsBridge::new(FakeGdb::with(replies), None, BridgeEnv::default())
+    NdsBridge::new(FakeGdb::with(replies), None, GdbBridgeEnv::default())
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn hello_advertises_only_tier1_truths() {
     let mut bridge = NdsBridge::new(
         FakeGdb::with(&[("?", "S05")]),
         Some(FakeGdb::with(&[("?", "S05")])),
-        BridgeEnv {
+        GdbBridgeEnv {
             name: Some("nds".into()),
             ..Default::default()
         },
@@ -277,7 +277,7 @@ fn arm7_memory_type_routes_to_arm7_connection() {
     // ARM9 only handles the handshake; the read must land on the ARM7 stub.
     let arm9 = FakeGdb::with(&[("?", "S05")]);
     let arm7 = FakeGdb::with(&[("?", "S05"), ("m3800000,4", "cafef00d")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     let response = bridge.handle_request(Request::new(
         7,
         "read_memory",
@@ -929,7 +929,7 @@ fn resume_defaults_to_arm9_only() {
     let mut bridge = NdsBridge::new(
         FakeGdb::with(&[("?", "S05")]),
         Some(FakeGdb::with(&[("?", "S05")])),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let response = bridge.handle_request(Request::new(1, "resume", json!({})));
     assert!(response.ok);
@@ -946,7 +946,7 @@ fn resume_both_opts_into_dual_continue() {
     let mut bridge = NdsBridge::new(
         FakeGdb::with(&[("?", "S05")]),
         Some(FakeGdb::with(&[("?", "S05")])),
-        BridgeEnv::default(),
+        GdbBridgeEnv::default(),
     );
     let response = bridge.handle_request(Request::new(1, "resume", json!({"cpu": "both"})));
     assert!(response.ok);
@@ -1236,7 +1236,7 @@ fn shared_read_freezes_running_arm7_then_restores_it() {
     // for the read and restored to running after (proven by the resume `c` it receives).
     let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false; // HITL both-running
     bridge.arm7.as_mut().unwrap().frozen = false;
     let resp = bridge.handle_request(Request::new(
@@ -1267,7 +1267,7 @@ fn shared_read_leaves_already_frozen_arm7_frozen() {
     // core the agent deliberately paused). Only ARM9 is running here.
     let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
     let arm7 = FakeGdb::with(&[("?", "S05")]); // stays frozen after the handshake
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false;
     let resp = bridge.handle_request(Request::new(
         2,
@@ -1386,7 +1386,7 @@ fn shared_main_write_leaves_running_arm7_untouched() {
         (format!("M{addr2:x},10:{hex2}"), "OK".into()),
     ]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false; // HITL both-running
     bridge.arm7.as_mut().unwrap().frozen = false;
     let response = bridge.handle_request(Request::new(
@@ -1450,7 +1450,7 @@ fn shared_read_does_not_phantom_freeze_arm7_when_stale_sigint_drains_after_resum
         ("m2000000,8".into(), "1122334455667788".into()),
     ]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false; // HITL both-running (resume cpu="both")
     bridge.arm7.as_mut().unwrap().frozen = false;
 
@@ -1500,7 +1500,7 @@ fn nonshared_write_does_not_freeze_running_arm7() {
     // for the write and resumed after; ARM7 is left untouched.
     let arm9 = FakeGdb::with(&[("?", "S05"), ("M2000000,4:deadbeef", "OK")]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false; // both running
     bridge.arm7.as_mut().unwrap().frozen = false;
     let response = bridge.handle_request(Request::new(
@@ -1540,7 +1540,7 @@ fn shared_read_arm7_pause_failure_resumes_arm9() {
     let arm9 = FakeGdb::with(&[("?", "S05")]);
     let mut arm7 = FakeGdb::with(&[("?", "S05")]);
     arm7.fail_interrupt = true; // ARM7's pause (SIGINT) will error
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.frozen = false; // both running (HITL)
     bridge.arm7.as_mut().unwrap().frozen = false;
     let resp = bridge.handle_request(Request::new(
@@ -1569,7 +1569,7 @@ fn poll_events_preserves_arm9_events_when_arm7_drain_errors() {
     let regs = arm_regs_hex(&[(15, 0x0200_0000)], 0);
     let arm9 = FakeGdb::with(&[("?", "S05"), ("g", &regs)]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
     bridge.arm9.gdb.nonblocking.push_back("S05".into()); // an ARM9 breakpoint hit is pending
     bridge.arm7.as_mut().unwrap().gdb.fail_nonblocking = true; // the ARM7 drain will error
 
@@ -1592,5 +1592,19 @@ fn poll_events_preserves_arm9_events_when_arm7_drain_errors() {
 }
 
 fn bridge_arm9_only_pairs(replies: Vec<(String, String)>) -> NdsBridge<FakeGdb> {
-    NdsBridge::new(FakeGdb::from_pairs(replies), None, BridgeEnv::default())
+    NdsBridge::new(FakeGdb::from_pairs(replies), None, GdbBridgeEnv::default())
+}
+
+#[test]
+fn gdb_backend_and_stream_errors_keep_distinct_protocol_kinds() {
+    let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+    let response = bridge.handle_request(Request::new(99, "get_state", json!({})));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "emulator_error");
+
+    let stream_error = NdsBridgeError::Gdb(GdbError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "fake reset",
+    )));
+    assert_eq!(error_kind(&stream_error), "bridge_error");
 }

@@ -1,33 +1,75 @@
+//! Adapter-neutral GDB Remote Serial Protocol transport and process metadata.
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use super::{BridgeError, BridgeResult};
+#[cfg(test)]
+#[path = "gdb_rsp_tests.rs"]
+mod tests;
+
+#[derive(Debug, thiserror::Error)]
+pub enum GdbError {
+    #[error("{0}")]
+    Emulator(String),
+    #[error("GDB transport is poisoned after a prior stream error")]
+    Poisoned,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+pub type GdbResult<T> = Result<T, GdbError>;
 
 pub trait GdbTransport {
-    fn send(&mut self, payload: &str) -> BridgeResult<String>;
-    fn send_no_reply(&mut self, payload: &str) -> BridgeResult<()>;
-    fn interrupt(&mut self) -> BridgeResult<String>;
-    /// 직전 write 없이 다음 RSP 패킷을 blocking으로 읽는다. `send_cmd`가 stale async stop을
-    /// 실제 응답 앞에서 걷어낸 뒤 진짜 응답을 이어 읽을 때 쓴다.
-    fn recv_reply(&mut self) -> BridgeResult<String> {
-        Err(BridgeError::Emulator("recv_reply unsupported".into()))
+    fn send(&mut self, payload: &str) -> GdbResult<String>;
+    fn send_no_reply(&mut self, payload: &str) -> GdbResult<()>;
+    fn interrupt(&mut self) -> GdbResult<String>;
+    /// Reads the next RSP packet without first writing a command.
+    ///
+    /// Adapter demultiplexers use this after discarding an asynchronous stop that arrived before
+    /// the actual command response.
+    fn recv_reply(&mut self) -> GdbResult<String> {
+        Err(GdbError::Emulator("recv_reply unsupported".into()))
     }
-    fn get_timeout(&self) -> BridgeResult<Duration> {
+    fn get_timeout(&self) -> GdbResult<Duration> {
         Ok(Duration::from_secs(5))
     }
-    fn set_timeout(&mut self, _timeout: Duration) -> BridgeResult<()> {
+    fn set_timeout(&mut self, _timeout: Duration) -> GdbResult<()> {
         Ok(())
     }
-    fn recv_nonblocking(&mut self) -> BridgeResult<Option<String>> {
+    fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
         Ok(None)
+    }
+}
+
+/// Process identity and content metadata shared by GDB-backed adapters.
+#[derive(Debug, Clone, Default)]
+pub struct GdbBridgeEnv {
+    pub name: Option<String>,
+    pub session_token: Option<String>,
+    pub launch_id: Option<String>,
+    pub content: Option<PathBuf>,
+    pub build: Option<String>,
+}
+
+impl GdbBridgeEnv {
+    pub fn from_process_env() -> Self {
+        Self {
+            name: std::env::var("EMUCAP_NAME").ok(),
+            session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
+            launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
+            content: std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
+            build: std::env::var("EMUCAP_BUILD_HASH").ok(),
+        }
     }
 }
 
 pub struct GdbRspClient {
     stream: TcpStream,
     buf: VecDeque<u8>,
+    poisoned: bool,
 }
 
 impl GdbRspClient {
@@ -46,6 +88,7 @@ impl GdbRspClient {
                     return Ok(Self {
                         stream,
                         buf: VecDeque::new(),
+                        poisoned: false,
                     });
                 }
                 Err(err) if Instant::now() < deadline => {
@@ -148,43 +191,23 @@ impl GdbRspClient {
         }
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
-}
 
-impl GdbTransport for GdbRspClient {
-    fn send(&mut self, payload: &str) -> BridgeResult<String> {
-        self.write_packet(payload)?;
-        Ok(self.read_packet()?)
+    fn ensure_usable(&self) -> GdbResult<()> {
+        if self.poisoned {
+            Err(GdbError::Poisoned)
+        } else {
+            Ok(())
+        }
     }
 
-    fn send_no_reply(&mut self, payload: &str) -> BridgeResult<()> {
-        self.write_packet(payload)?;
-        Ok(())
+    fn finish_io<T>(&mut self, result: std::io::Result<T>) -> GdbResult<T> {
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result.map_err(GdbError::from)
     }
 
-    fn recv_reply(&mut self) -> BridgeResult<String> {
-        Ok(self.read_packet()?)
-    }
-
-    fn interrupt(&mut self) -> BridgeResult<String> {
-        self.stream.write_all(&[0x03])?;
-        std::thread::sleep(Duration::from_millis(10));
-        self.send("?")
-    }
-
-    fn get_timeout(&self) -> BridgeResult<Duration> {
-        Ok(self
-            .stream
-            .read_timeout()?
-            .unwrap_or(Duration::from_secs(5)))
-    }
-
-    fn set_timeout(&mut self, timeout: Duration) -> BridgeResult<()> {
-        self.stream.set_read_timeout(Some(timeout))?;
-        self.stream.set_write_timeout(Some(timeout))?;
-        Ok(())
-    }
-
-    fn recv_nonblocking(&mut self) -> BridgeResult<Option<String>> {
+    fn recv_nonblocking_packet(&mut self) -> std::io::Result<Option<String>> {
         let previous = self.stream.read_timeout()?;
         self.stream.set_nonblocking(true)?;
         let read = {
@@ -205,9 +228,59 @@ impl GdbTransport for GdbRspClient {
         self.stream.set_nonblocking(false)?;
         self.stream.set_read_timeout(previous)?;
         read?;
-        if !self.buf.iter().any(|b| *b == b'$') {
+        if !self.buf.iter().any(|byte| *byte == b'$') {
             return Ok(None);
         }
         Ok(Some(self.read_packet()?))
+    }
+}
+
+impl GdbTransport for GdbRspClient {
+    fn send(&mut self, payload: &str) -> GdbResult<String> {
+        self.ensure_usable()?;
+        let result = (|| {
+            self.write_packet(payload)?;
+            self.read_packet()
+        })();
+        self.finish_io(result)
+    }
+
+    fn send_no_reply(&mut self, payload: &str) -> GdbResult<()> {
+        self.ensure_usable()?;
+        let result = self.write_packet(payload);
+        self.finish_io(result)
+    }
+
+    fn recv_reply(&mut self) -> GdbResult<String> {
+        self.ensure_usable()?;
+        let result = self.read_packet();
+        self.finish_io(result)
+    }
+
+    fn interrupt(&mut self) -> GdbResult<String> {
+        self.ensure_usable()?;
+        let result = self.stream.write_all(&[0x03]);
+        self.finish_io(result)?;
+        std::thread::sleep(Duration::from_millis(10));
+        self.send("?")
+    }
+
+    fn get_timeout(&self) -> GdbResult<Duration> {
+        Ok(self
+            .stream
+            .read_timeout()?
+            .unwrap_or(Duration::from_secs(5)))
+    }
+
+    fn set_timeout(&mut self, timeout: Duration) -> GdbResult<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.stream.set_write_timeout(Some(timeout))?;
+        Ok(())
+    }
+
+    fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
+        self.ensure_usable()?;
+        let result = self.recv_nonblocking_packet();
+        self.finish_io(result)
     }
 }

@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use emucap::gdb_rsp::{GdbBridgeEnv, GdbRspClient};
 use emucap::live::reconnect::serve_reconnecting;
 use emucap::nds_bridge::NdsBridge;
-use emucap::pc98_bridge::{BridgeEnv, GdbRspClient};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let mut bridge = NdsBridge::new(arm9, arm7, BridgeEnv::from_process_env());
+    let mut bridge = NdsBridge::new(arm9, arm7, GdbBridgeEnv::from_process_env());
 
     serve_reconnecting(emucap_port, "desmume-nds-rust", move |request| {
         bridge.handle_request(request)

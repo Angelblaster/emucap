@@ -259,7 +259,7 @@ impl<G: GdbTransport> Bridge<G> {
                 "before the next backend call",
             ));
         };
-        self.gdb.set_timeout(default_timeout.min(remaining))
+        Ok(self.gdb.set_timeout(default_timeout.min(remaining))?)
     }
 
     fn instruction_step_deadline_error(
@@ -587,7 +587,7 @@ impl<G: GdbTransport> Bridge<G> {
         match (result, restore) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(err), Ok(())) => Err(err),
-            (Ok(_), Err(err)) => Err(err),
+            (Ok(_), Err(err)) => Err(err.into()),
             (Err(err), Err(_)) => Err(err),
         }
     }
