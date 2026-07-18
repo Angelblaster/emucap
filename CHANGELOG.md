@@ -2,13 +2,21 @@
 
 Prerelease software — interfaces may still change.
 
-## Unreleased
+## 0.9.0-alpha.2
 
 ### Added
 - `write_memory` accepts a bounded raw-binary `input_file` slice as an alternative to inline hex. The Control MCP snapshots and hashes the slice before contacting the adapter, optionally enforces an expected SHA-256, and returns input provenance with the write result.
 
 ### Changed
 - All Control MCP memory writes reject empty, malformed, overflowing, or over-limit payloads before transport. `status.contracts.constraints` reports the accepted input sources, byte cap, and file-load deadline.
+
+### Fixed
+- Direct, broker, and reconnecting bridge transports now enforce one bounded NDJSON frame size while preserving partial frames across read timeouts. Oversized, truncated, or invalid UTF-8 frames close their connection; direct and broker clients also discard malformed or ID-desynchronized response streams before reconnecting.
+- Broker mode probes for an existing broker before auto-spawning one, and a reaper waits for every spawned broker child so fast bind failures cannot accumulate as zombies.
+- DeSmuME GDB packet transmission and ACK handling now have a two-second total deadline and at most three attempts. Slow readers, missing ACKs, and peer resets close only that GDB connection; subsequent bridge connections can attach without restarting the emulator.
+
+### Removed
+- Removed the Control MCP `tap_sequence` convenience method. Call `tap` repeatedly instead; each call releases input and returns frozen, so host latency between calls does not advance emulator time.
 
 ## 0.9.0-alpha.1
 

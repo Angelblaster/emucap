@@ -1,7 +1,7 @@
 # 출력 케이스 번들 — ROM 파생·대용량, 절대 커밋 금지
 bundles/
 
-# 실험 추적 루트 — ROM 파생·대용량 아티팩트, 정본은 FS·DB는 재구축 인덱스
+# Experiment records may contain ROM-derived or large artifacts; database indexes are rebuilt locally.
 .emucap/
 
 # 원본·출력 이미지

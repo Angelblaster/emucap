@@ -10,7 +10,7 @@ GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.9.0-alpha.1 — alpha.** This repository is under active, continuous development;
+**v0.9.0-alpha.2 — alpha.** This repository is under active, continuous development;
 interfaces and behavior may change between prereleases.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
