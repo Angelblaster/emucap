@@ -2,6 +2,16 @@
 
 Prerelease software — interfaces may still change.
 
+## 0.9.0-alpha.5
+
+### Changed
+- Host-composed frozen input operations can reconnect only to the same control session and launch generation when a cleanup response is lost. The replacement connection must confirm its `launch_id` before an idempotent input release, breakpoint cleanup, or frozen-state restoration is retried; explicit persistent input holds are not released by reconnect alone.
+- NDS, PSP, and PC-98 instruction stepping apply one wall-clock deadline across preparation, every backend step, and terminal CPU-state collection. Each blocking GDB or WebSocket exchange is limited to the remaining budget, and the transport's ordinary timeout is restored afterward.
+
+### Fixed
+- `tap`, `hold_until`, and input replay no longer strand request-scoped input merely because the front TCP connection disappears after an operation took effect. A replacement generation, an unverifiable legacy connection, or unconfirmed terminal cleanup fails loudly instead of mutating an unrelated emulator or reporting completion.
+- A delayed final debugger exchange can no longer outlive the instruction-step budget and still return `completed`. Deadline errors report the number of acknowledged steps and leave the CPU halted or frozen.
+
 ## 0.9.0-alpha.4
 
 ### Changed

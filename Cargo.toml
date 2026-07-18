@@ -1,6 +1,6 @@
 [package]
 name = "emucap"
-version = "0.9.0-alpha.4"
+version = "0.9.0-alpha.5"
 edition = "2021"
 authors = ["mcpads"]
 # GPL-2.0-or-later is compatible with the adapters' upstream licenses — GPLv2 (Mednafen/Flycast),
