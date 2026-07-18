@@ -842,6 +842,10 @@ impl EmulatorLink for TcpLink {
         self.raw_call(method, params)
     }
 
+    fn supports_session_reconnect(&self) -> bool {
+        true
+    }
+
     fn prepare_reconnect(&mut self) {
         self.drop_conn();
     }

@@ -727,6 +727,10 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         result
     }
 
+    fn supports_session_reconnect(&self) -> bool {
+        self.inner.supports_session_reconnect()
+    }
+
     fn prepare_reconnect(&mut self) {
         self.inner.prepare_reconnect();
     }

@@ -20,4 +20,6 @@ mod protocol_tests;
 #[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]
+mod tools_socket_tests;
+#[cfg(test)]
 mod tools_tests;

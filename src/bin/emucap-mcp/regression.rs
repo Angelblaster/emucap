@@ -1,6 +1,7 @@
 use emucap::analysis::bisect::{self, CmpOp, Predicate};
 use emucap::analysis::regression;
 use emucap::live::link::{EmulatorLink, LinkError};
+use emucap::live::tools;
 
 // 본체 bin의 핸들러들이 `regression::load_suite` 등 외부 크레이트 항목을 *이 로컬 모듈을 통해*
 // 참조하도록 재노출한다(본체는 `mod regression;`이라 `use emucap::analysis::regression;`을 동시에
@@ -491,8 +492,9 @@ fn replay_movie_observe<T>(
     validate_movie_frames(movie)?;
     link.call("pause", serde_json::json!({}))
         .map_err(|e| e.to_string())?;
+    let launch_id = link.capabilities().identity.launch_id.clone();
     let outcome = replay_movie_body(link, movie, anchor, observe);
-    let cleanup = cleanup_replay(link);
+    let cleanup = cleanup_replay(link, launch_id.as_deref());
     emucap::live::temporal::finish_with_cleanup(
         outcome,
         cleanup,
@@ -562,10 +564,13 @@ fn replay_movie_body<T>(
     Ok(Some(observe(link)?))
 }
 
-fn cleanup_replay(link: &mut dyn EmulatorLink) -> Result<(), String> {
+fn cleanup_replay(
+    link: &mut dyn EmulatorLink,
+    expected_launch_id: Option<&str>,
+) -> Result<(), String> {
     let mut failures = Vec::new();
     let mut attempt = |method: &str, params: serde_json::Value| {
-        if let Err(error) = link.call(method, params) {
+        if let Err(error) = tools::call_session_cleanup(link, method, params, expected_launch_id) {
             failures.push(format!("{method}: {error}"));
         }
     };

@@ -147,6 +147,12 @@ impl Capabilities {
 pub trait EmulatorLink {
     fn capabilities(&self) -> &Capabilities;
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError>;
+    /// Whether the link can discard a failed front-side session and attach the same control
+    /// session again. Temporal cleanup uses this only for idempotent compensation calls after an
+    /// ambiguous transport failure and verifies the launch generation separately.
+    fn supports_session_reconnect(&self) -> bool {
+        false
+    }
     /// Discard the current front-side session after an adapter has acknowledged an operation that
     /// recreates its transport. The emulator process and launch generation remain intact.
     fn prepare_reconnect(&mut self) {}

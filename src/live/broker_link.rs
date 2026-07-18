@@ -336,6 +336,10 @@ impl EmulatorLink for LazyBrokerLink {
         result
     }
 
+    fn supports_session_reconnect(&self) -> bool {
+        true
+    }
+
     fn prepare_reconnect(&mut self) {
         self.inner = None;
     }

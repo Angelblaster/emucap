@@ -289,18 +289,19 @@ fn one_tap(
     port: u64,
     buttons: &[String],
     press_frames: u64,
+    expected_launch_id: Option<&str>,
 ) -> Result<(), LinkError> {
     if let Err(primary) = link.call("set_input", json!({ "port": port, "buttons": buttons })) {
         // A lost set_input response is ambiguous: the adapter may already own the override. Always
         // issue an explicit release before returning the original error.
-        return finish_transient_input(link, port, Err(primary));
+        return finish_transient_input(link, port, expected_launch_id, Err(primary));
     }
     let outcome = link
         .call("step", json!({ "frames": press_frames.max(1) }))
         .map(|_| ());
-    finish_transient_input(link, port, outcome)?;
+    finish_transient_input(link, port, expected_launch_id, outcome)?;
     let release_edge = link.call("step", json!({ "frames": 1 })).map(|_| ());
-    finish_frozen(link, release_edge)?;
+    finish_frozen(link, expected_launch_id, release_edge)?;
     Ok(())
 }
 
@@ -315,30 +316,128 @@ fn combine_temporal_cleanup_error(primary: Option<LinkError>, cleanup: LinkError
     }
 }
 
+const SESSION_CLEANUP_ATTEMPTS: usize = 3;
+
+/// Deliver an idempotent cleanup call across a replacement front-side session when the first
+/// response is ambiguous. The retry is enabled only for links that explicitly preserve the same
+/// control session across reconnect; links without that support remain single-call.
+///
+/// Each direct-link attempt either adopts a pending client or waits at most one 250 ms preaccept
+/// slice. Three attempts cover Mesen's worst-case 500 ms reconnect throttle without multiplying a
+/// backend request timeout across a long retry train.
+pub fn call_session_cleanup(
+    link: &mut dyn EmulatorLink,
+    method: &str,
+    params: Value,
+    expected_launch_id: Option<&str>,
+) -> Result<Value, LinkError> {
+    let reconnectable = link.supports_session_reconnect();
+    let current_launch_id = link.capabilities().identity.launch_id.as_deref();
+    let current_connection_known = link.capabilities().protocol_version != 0;
+    let must_preflight = match expected_launch_id {
+        Some(expected) if current_launch_id == Some(expected) => false,
+        Some(_) if current_launch_id.is_some() => {
+            return Err(LinkError::Emulator {
+                kind: "bad_state".into(),
+                message: "launch generation changed before session cleanup".into(),
+            })
+        }
+        Some(_) if reconnectable => true,
+        Some(_) => {
+            return Err(LinkError::Emulator {
+                kind: "bad_state".into(),
+                message: "launch generation is unavailable before session cleanup".into(),
+            })
+        }
+        None if reconnectable && !current_connection_known => {
+            return Err(LinkError::Emulator {
+                kind: "bad_state".into(),
+                message: "launch generation is unavailable before reconnecting session cleanup"
+                    .into(),
+            })
+        }
+        None => false,
+    };
+
+    let mut last = LinkError::NotConnected;
+    if !must_preflight {
+        match link.call(method, params.clone()) {
+            Ok(value) => return Ok(value),
+            Err(error @ (LinkError::NotConnected | LinkError::Timeout))
+                if reconnectable && expected_launch_id.is_some() =>
+            {
+                last = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let Some(expected_launch_id) = expected_launch_id else {
+        return Err(last);
+    };
+
+    for _ in 0..SESSION_CLEANUP_ATTEMPTS {
+        link.prepare_reconnect();
+        match link.call("status", json!({})) {
+            Ok(status) => {
+                let actual = link.capabilities().identity.launch_id.as_deref();
+                if actual != Some(expected_launch_id) {
+                    return Err(LinkError::Emulator {
+                        kind: "bad_state".into(),
+                        message: format!(
+                            "launch generation changed while recovering session cleanup \
+                             (expected {expected_launch_id}, got {actual:?})"
+                        ),
+                    });
+                }
+                if method == "status" {
+                    return Ok(status);
+                }
+            }
+            Err(error @ (LinkError::NotConnected | LinkError::Timeout)) => {
+                last = error;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+        match link.call(method, params.clone()) {
+            Ok(value) => return Ok(value),
+            Err(error @ (LinkError::NotConnected | LinkError::Timeout)) => last = error,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last)
+}
+
 /// Release a request-scoped input override and restore the frozen terminal state on every failure.
 /// Calls continue after an individual cleanup error so a failed release does not suppress the
 /// re-freeze attempt. A transport loss remains fail-loud: both cleanup failures are retained.
 fn finish_transient_input<T>(
     link: &mut dyn EmulatorLink,
     port: u64,
+    expected_launch_id: Option<&str>,
     outcome: Result<T, LinkError>,
 ) -> Result<T, LinkError> {
     let empty: [String; 0] = [];
-    let release = link
-        .call("set_input", json!({ "port": port, "buttons": empty }))
-        .map(|_| ());
+    let release = call_session_cleanup(
+        link,
+        "set_input",
+        json!({ "port": port, "buttons": empty }),
+        expected_launch_id,
+    )
+    .map(|_| ());
     let result = finish_with_cleanup(outcome, release, combine_temporal_cleanup_error);
-    finish_frozen(link, result)
+    finish_frozen(link, expected_launch_id, result)
 }
 
 fn finish_frozen<T>(
     link: &mut dyn EmulatorLink,
+    expected_launch_id: Option<&str>,
     outcome: Result<T, LinkError>,
 ) -> Result<T, LinkError> {
     if outcome.is_ok() {
         return outcome;
     }
-    let stabilize = link.call("pause", json!({})).map(|_| ());
+    let stabilize = call_session_cleanup(link, "pause", json!({}), expected_launch_id).map(|_| ());
     finish_with_cleanup(outcome, stabilize, combine_temporal_cleanup_error)
 }
 
@@ -355,12 +454,13 @@ pub fn tap(
     validate_sync_advance("tap press frame", press_frames)?;
     validate_sync_advance("tap trailing frame", after_frames)?;
     link.call("pause", json!({}))?; // 멱등
-    one_tap(link, port, buttons, press_frames)?;
+    let launch_id = link.capabilities().identity.launch_id.clone();
+    one_tap(link, port, buttons, press_frames, launch_id.as_deref())?;
     if after_frames > 0 {
         let outcome = link
             .call("step", json!({ "frames": after_frames }))
             .map(|_| ());
-        finish_frozen(link, outcome)?;
+        finish_frozen(link, launch_id.as_deref(), outcome)?;
     }
     Ok(ToolOutput::Json(json!({
         "tapped": buttons, "press_frames": press_frames, "after_frames": after_frames, "state": "frozen"
@@ -392,8 +492,9 @@ pub fn hold_until(
             .to_string())
     };
     link.call("pause", json!({}))?; // 멱등
+    let launch_id = link.capabilities().identity.launch_id.clone();
     if let Err(primary) = link.call("set_input", json!({ "port": port, "buttons": buttons })) {
-        return finish_transient_input(link, port, Err(primary));
+        return finish_transient_input(link, port, launch_id.as_deref(), Err(primary));
     }
     // 코어 루프를 돌리되 성패 무관하게 입력을 해제한다.
     let outcome: Result<(bool, u64, String, String), LinkError> = (|| {
@@ -412,9 +513,10 @@ pub fn hold_until(
         }
         Ok((changed, frames, before, after))
     })();
-    let (changed, frames, before, after) = finish_transient_input(link, port, outcome)?;
+    let (changed, frames, before, after) =
+        finish_transient_input(link, port, launch_id.as_deref(), outcome)?;
     let release_edge = link.call("step", json!({ "frames": 1 })).map(|_| ());
-    finish_frozen(link, release_edge)?;
+    finish_frozen(link, launch_id.as_deref(), release_edge)?;
     Ok(ToolOutput::Json(json!({
         "changed": changed, "frames": frames, "before": before, "after": after, "state": "frozen"
     })))
