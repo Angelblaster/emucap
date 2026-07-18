@@ -61,7 +61,7 @@ pub fn open_index(path: &Path) -> Result<Connection, IndexError> {
     Ok(conn)
 }
 
-/// FS 정본을 walk해 인덱스를 재생성한다(전체·멱등). 인덱싱한 run 수를 반환.
+/// 파일 원장을 순회해 인덱스를 재생성한다(전체·멱등). 인덱싱한 run 수를 반환.
 ///
 /// DELETE-all + 재삽입 전체를 단일 트랜잭션으로 감싸 중단 시 부분 빈 상태가
 /// 노출되지 않도록 한다(WAL + 단일-작성자 직렬화 요건).
@@ -88,7 +88,7 @@ pub fn reindex_lenient(
     Ok((n, skipped))
 }
 
-/// 메모리에 로드된 FS 정본으로 인덱스를 재생성한다(전체·멱등, 단일 트랜잭션).
+/// 메모리에 로드된 원장 데이터로 인덱스를 재생성한다(전체·멱등, 단일 트랜잭션).
 fn reindex_from(
     conn: &Connection,
     roms: &[crate::track::model::Rom],

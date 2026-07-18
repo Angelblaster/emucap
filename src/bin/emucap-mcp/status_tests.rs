@@ -624,7 +624,7 @@ fn composite_admission_requires_a_validated_contract_generation() {
 
 #[test]
 fn normalize_rom_sha1_prefers_content_md5() {
-    // Mednafen: content_md5가 canonical, sha1은 보조 — content_md5를 rom_sha1로.
+    // Mednafen: content_md5가 식별 기준이고 sha1은 보조 — content_md5를 rom_sha1로.
     let mut v = serde_json::json!({"content_md5": "abc", "sha1": "def"});
     normalize_rom_sha1(&mut v);
     assert_eq!(v["rom_sha1"], "abc");

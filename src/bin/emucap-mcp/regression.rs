@@ -11,7 +11,7 @@ pub(crate) use emucap::analysis::regression::{load_case, load_suite, CaseResult,
 #[path = "regression_tests.rs"]
 pub(crate) mod tests;
 
-/// 결정론 게이트 판정. 측정 무효(MeasurementInvalid)와 진짜 재현 불가(NotReproducible)를
+/// 결정론 재현 판정. 측정 무효(MeasurementInvalid)와 진짜 재현 불가(NotReproducible)를
 /// 절대 섞지 않는다.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DetOutcome {
@@ -96,7 +96,7 @@ fn run_repro_observe(
             movie,
             anchor,
         } => {
-            // 재생 필수 메서드 + observe 요구 메서드 capability 게이트(재생 전 선검사).
+            // 재생 필수 메서드와 observe 요구 메서드를 재생 전에 확인한다.
             // read_memory는 재생 자체엔 안 쓴다(observe=Memory일 때만 필요 → observe_missing이 검사).
             // 무조건 포함하면 screenshot/state-only 어댑터를 거짓 Unsupported로 거부한다(강등 위반).
             let mut required = vec!["pause", "set_input", "step", "clear_all_breakpoints"];
@@ -227,7 +227,8 @@ pub(crate) fn verify_determinism_core(
     // rom 대조(get_rom_info 가용 시). 불일치는 측정 무효.
     if has_method(link, "get_rom_info") {
         if let Ok(info) = link.call("get_rom_info", serde_json::json!({})) {
-            // Mednafen은 content_md5가 canonical(run_start에 그 값을 넘김), Mesen/PC-98은 sha1. 저장된 키와 같은 우선순위로 대조.
+            // Mednafen은 content_md5를 우선하고(run_start에 그 값을 넘김), Mesen/PC-98은 sha1을 쓴다.
+            // 저장된 키와 같은 우선순위로 대조한다.
             let h = info
                 .get("content_md5")
                 .and_then(|s| s.as_str())
@@ -301,7 +302,8 @@ pub(crate) fn run_one_case(
         .any(|m| m == "get_rom_info")
     {
         if let Ok(info) = link.call("get_rom_info", serde_json::json!({})) {
-            // Mednafen은 content_md5가 canonical(run_start에 그 값을 넘김), Mesen/PC-98은 sha1. 저장된 키와 같은 우선순위로 대조.
+            // Mednafen은 content_md5를 우선하고(run_start에 그 값을 넘김), Mesen/PC-98은 sha1을 쓴다.
+            // 저장된 키와 같은 우선순위로 대조한다.
             let h = info
                 .get("content_md5")
                 .and_then(|s| s.as_str())
@@ -479,7 +481,7 @@ fn validate_movie_frames(movie: &regression::Movie) -> Result<(), String> {
 }
 
 /// 무비를 frozen 프레임별로 적용하고, 종점(또는 anchor 히트)에서 `observe`를 1회 호출한다.
-/// regression(predicate read)·결정론 게이트(observe_hash)가 공유한다. anchor 미히트면 Ok(None).
+/// regression(predicate read)·결정론 재현 판정(observe_hash)이 공유한다. anchor 미히트면 Ok(None).
 fn replay_movie_observe<T>(
     link: &mut dyn EmulatorLink,
     movie: &regression::Movie,

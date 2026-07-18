@@ -111,7 +111,7 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   미종료 run이 자동 마감된다.
 - **분석 verb는 반환만**: `regression_run`/`verify_determinism`은 제어 MCP가 에뮬을 구동해
   결과를 *반환*할 뿐 원장에 쓰지 않는다. 남기려면 그 결과를 추적 MCP의 `log_gate`(예:
-  `determinism_replay` machine 게이트)·`log_metric`으로 기록한다.
+  `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
 - **프레임 경계 탐색은 `probe`를 조립**: 같은 베이스 상태에서 원자적 `probe`를 반복 호출해 프레임
   범위를 이분한다. 각 호출이 상태 복원·진행·판정을 한 번에 수행하므로 호출 사이 지연은 결과를 바꾸지 않는다.
 - **개입은 명시 기록**: `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동

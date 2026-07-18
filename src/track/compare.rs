@@ -1,4 +1,4 @@
-//! 두 run을 구조화 diff한다(메트릭 delta·게이트 변화·재현성·개입·산출물 집계). 순수 읽기,
+//! 두 run을 구조화 diff한다(메트릭 delta·판정 결과 변화·재현성·개입·산출물 집계). 순수 읽기,
 //! 에뮬레이터 무통신. gates/metrics는 append-only라 name/key별 삽입순 마지막을
 //! 대표로 집고 발생 횟수를 함께 노출한다(다중성 은폐 금지).
 use std::collections::BTreeMap;
@@ -47,7 +47,7 @@ pub struct GateDiff {
     pub a: Option<bool>,
     pub b: Option<bool>,
     pub change: GateChange,
-    pub kind: Option<GateKind>, // 존재하는 쪽(b 우선)의 게이트 종류
+    pub kind: Option<GateKind>, // 존재하는 쪽(b 우선)의 판정 종류
     pub a_count: u64,
     pub b_count: u64,
 }
@@ -101,7 +101,7 @@ fn meta(run: &Run) -> RunMeta {
     }
 }
 
-/// name별 (삽입순 마지막 게이트, 발생 횟수). Vec 순서 = 추가 순서.
+/// name별 (삽입순 마지막 판정, 발생 횟수). Vec 순서 = 추가 순서.
 pub(crate) fn latest_gates(run: &Run) -> BTreeMap<String, (&Gate, u64)> {
     let mut m: BTreeMap<String, (&Gate, u64)> = BTreeMap::new();
     for g in &run.gates {

@@ -15,7 +15,7 @@ end
 local function av_write(bp, addr, value)
   local len = bp.value_len
   local off = addr - bp.start
-  if off >= 0x800000 then off = off - 0x800000 end   -- $80 뱅크 미러 → canonical 오프셋
+  if off >= 0x800000 then off = off - 0x800000 end   -- $80 뱅크 미러 → 기본 오프셋
   if off < 0 or off >= len then return nil end
   local buf = bp.wbytes
   if off == 0 then
@@ -61,8 +61,8 @@ eq(av_write(bp3b, 0x000000, 0x11), nil, "3B off0")
 eq(av_write(bp3b, 0x000001, 0x22), nil, "3B off1")
 eq(av_write(bp3b, 0x000002, 0x33), 0x332211, "3B off2 → 0x332211 완결")
 
--- 핵심 회귀($80 뱅크 미러 히트): 폭>1 write 값-BP가 canonical addr가 아닌 $80 미러(0x802118)로 발화해도
--- access_value가 canonical 오프셋으로 정규화해 누적·완결한다(정규화 없으면 off=0x800000+ → 영영 미발화).
+-- 핵심 회귀($80 뱅크 미러 히트): 폭>1 write 값-BP가 기본 주소가 아닌 $80 미러(0x802118)로 발화해도
+-- access_value가 기본 오프셋으로 정규화해 누적·완결한다(정규화 없으면 off=0x800000+ → 영영 미발화).
 local bpM = { start = 0x2118, value_len = 2 }
 eq(av_write(bpM, 0x802118, 0x34), nil, "$80 미러 low(0x802118) → 미결")
 eq(av_write(bpM, 0x802119, 0x12), 0x1234, "$80 미러 high(0x802119) → 0x1234 완결")

@@ -112,7 +112,7 @@ local TRACE_CAP = 256
 local trace_ring = {}          -- 링버퍼 슬롯 -> { pc, op }
 local trace_idx = 0            -- 누적 명령 수(슬롯 = (trace_idx-1)%CAP +1)
 local callstack = {}           -- shadow 콜스택: 호출지(call의 pc) 리스트(바깥→안), 각 { pc, sp=호출 직전 SP }
-local pending_ret_check = false -- 직전 명령이 return류(op_is_return/ED prefix)면 true — 다음 명령에서 SP로 정합
+local pending_ret_check = false -- 직전 명령이 return류(op_is_return/ED prefix)면 true — 다음 명령에서 SP로 실제 리턴 여부 확인
 -- get_trace 뱅크 섀도: trace_ring 엔트리에 pc의 ROM 뱅크를 붙인다. 매 명령 getState는 비싸므로(리컨사일
 -- 거부 사유) SYS.bank_write_ranges write 콜백이 banks_dirty를 세우고, trace_cb가 dirty일 때만 refresh(매퍼
 -- write당 ~1회, 다음 명령에서 = write 반영 후). SYS.bank_of 없는 시스템은 cur_banks가 nil로 남아 무동작.
@@ -883,7 +883,7 @@ local function access_value(bp, addr, value)
   if len <= 1 then return value end
   if bp.kind == "write" and not bp.is_vram_recon then
     local off = addr - bp.start
-    -- 뱅크 미러($80) 콜백은 절대주소(예 0x802118)로 발화하므로 canonical span(bp.start 기준)으로
+    -- 뱅크 미러($80) 콜백은 절대주소(예 0x802118)로 발화하므로 bp.start 기준 span으로
     -- 되돌린다 — 안 그러면 off가 0x800000+가 되어 폭>1 write 누적이 영영 완결되지 않는다. 미러는 +0x800000.
     if off >= 0x800000 then off = off - 0x800000 end
     if off < 0 or off >= len then return nil end
@@ -1011,13 +1011,13 @@ function handlers.set_breakpoint(p)
   -- DMA: MDMAEN($420B, 또는 start로 지정) write 시 채널 스냅샷을 dma 이벤트로. 매 프레임 발생이라
   -- 기본은 freeze 안 함(pause_on_hit=true면 freeze). poll_events로 "이번 프레임 DMA"를 드레인.
   if p.kind == "dma" then
-    -- 능력 게이트: dma BP는 SNES MDMAEN($420B) 컨트롤러 전용이다. 그런 DMA가 없는 시스템(GG/Z80 등)은
+    -- 사전 조건: dma BP는 SNES MDMAEN($420B) 컨트롤러 전용이다. 그런 DMA가 없는 시스템(GG/Z80 등)은
     -- unsupported를 낸다(break_on_reset의 `if not SYS.reset_vector` 패턴 — garbage 대신 명시적 에러).
     if not SYS.dma_supported then return false, "unsupported", "dma breakpoints not supported for " .. SYS.system end
     -- $420B(MDMAEN)는 banks $00-$3F·$80-$BF에 미러된다. 게임이 어느 뱅크에서 STA $420B 하든 잡으려면
     -- 미러를 등록해야 한다(Mesen 메모리 콜백은 뱅크별 절대주소 — bank $00 등록은 bank $80 접근을 못 잡음).
     -- 기본은 슬로우($00:420B)·패스트($80:420B) 뱅크 둘. p.start로 특정 뱅크 미러만 지정 가능.
-    -- start=$420B(canonical) 또는 미지정/0이면 슬로우($00)·패스트($80) 뱅크 미러 둘 다 자동 등록.
+    -- start=$420B(기본 주소) 또는 미지정/0이면 슬로우($00)·패스트($80) 뱅크 미러 둘 다 자동 등록.
     -- 특정 뱅크 미러만 원하면 그 절대주소(예 $80:420B=0x80420B)를 start로.
     local regs = (p.start == nil or p.start == 0 or p.start == 0x420B) and { 0x420B, 0x80420B } or { p.start }
     local bp = { id = id, kind = "dma", is_dma = true, cbtype = emu.callbackType.write,
@@ -1150,7 +1150,7 @@ function handlers.set_breakpoint(p)
   -- 폭 확장과 뱅크 미러는 직교한다: 폭>1 write 값-BP는 len 연속 바이트가 각각 per-byte write 콜백으로
   -- 오므로 상위 바이트 콜백까지 닿게 폭 전체(span)를 등록해야 한다(안 그러면 저바이트만 트리거돼
   -- access_value 누적이 영영 완결 안 됨 → 값-BP 미발화). $2000-$7FFF의 폭>1 write 값-BP는 상위 바이트
-  -- 주소'와' 그 뱅크 미러가 둘 다 필요하므로 두 축을 합성한다 — span을 먼저 구해 각 미러가 폭 전체를 덮게.
+  -- 주소'와' 그 뱅크 미러가 둘 다 필요하므로 두 조건을 함께 적용한다 — span을 먼저 구해 각 미러가 폭 전체를 덮게.
   local span = bp.end_
   if p.kind == "write" and bp.has_value and bp.value_len > 1 and bp.start == bp.end_ then
     span = bp.start + bp.value_len - 1
@@ -1279,14 +1279,14 @@ local function trace_cb(addr, value)
     pending_ret_check = false
     reconcile_callstack(emu.getState()["cpu.sp"])
   end
-  if SYS.op_is_call(op) then                            -- 호출 명령: 호출지 push(SP 정합 후)
+  if SYS.op_is_call(op) then                            -- 호출 명령: SP로 이전 프레임을 정리한 뒤 호출지 push
     local st = emu.getState()                            -- SP + 뱅크를 한 번에(추가 getState 없음)
     local sp = st["cpu.sp"]
     reconcile_callstack(sp)                             -- 이미 리턴한 프레임(JMP-리턴 포함) 정리
     local bank = SYS.read_banks and SYS.bank_of(addr, SYS.read_banks(st)) or nil  -- addr = 호출지 pc
     callstack[#callstack + 1] = { pc = addr, sp = sp, bank = bank }
   elseif SYS.op_is_return(op) or op == 0xED then        -- return류(RET/조건부 RET) 또는 ED 프리픽스(RETI/RETN)
-    pending_ret_check = true                             -- opcode로 pop하지 않고 다음 명령에서 SP로 정합
+    pending_ret_check = true                             -- opcode로 pop하지 않고 다음 명령에서 SP로 실제 리턴 여부 확인
   end
 end
 
@@ -1334,7 +1334,7 @@ end
 
 -- 콜스택: 호출지 프레임 { pc, bank } 리스트, 바깥→안(안쪽이 마지막). "어떻게 여기 왔나" 즉답. bank은 pc가
 -- 페이징된 ROM 뱅크(GG/GB), 아니면 nil(SNES는 뱅크가 pc 안). 모든 Mesen 시스템이 균일하게 { pc, bank } 객체.
--- 조회 시 SP로 한 번 더 정합(마지막 호출 이후 리턴한 프레임 정리). frozen이면 freeze 시점 스냅샷 SP를 쓴다
+-- 조회 시 SP와 한 번 더 맞춘다(마지막 호출 이후 리턴한 프레임 정리). frozen이면 freeze 시점 스냅샷 SP를 쓴다
 -- (live getState를 다시 호출하지 않아도 freeze 진입 시점과 같은 SP를 쓰도록 get_state와 frozen_state를 공유).
 function handlers.call_stack()
   if not HAS_CALLSTACK then

@@ -159,7 +159,7 @@ pub trait EmulatorLink {
     fn session_token(&self) -> Option<&str> {
         None
     }
-    /// 새 launch generation의 비공개 reclaim capability를 direct listener에 설치한다.
+    /// 새 launch generation의 서버 외부에 노출하지 않는 reclaim capability를 direct listener에 설치한다.
     /// broker 등 capability를 직접 소유하지 않는 링크는 false로 강등한다.
     fn replace_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
         Ok(false)

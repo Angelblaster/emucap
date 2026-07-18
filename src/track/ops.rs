@@ -16,7 +16,7 @@ pub enum OpsError {
     RunNotFound { rom_sha1: String, run_id: String },
 }
 
-/// 새 Run을 생성하고 rom.json + run.json을 정본에 쓴다(status=running).
+/// 새 Run을 생성하고 rom.json + run.json을 원장에 쓴다(status=running).
 #[allow(clippy::too_many_arguments)]
 pub fn create_run(
     root: &Path,
@@ -167,7 +167,7 @@ pub fn log_metric(
     Ok(())
 }
 
-/// run에 게이트 1건 append.
+/// run에 판정 1건을 추가한다.
 #[allow(clippy::too_many_arguments)]
 pub fn log_gate(
     root: &Path,

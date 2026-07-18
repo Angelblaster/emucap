@@ -35,7 +35,7 @@ struct ActiveRun {
 
 #[derive(Deserialize, JsonSchema)]
 struct TrackRunStartArgs {
-    /// 필수 — 제어 MCP `get_rom_info`의 균일 `rom_sha1` 필드를 받아 전달한다(어댑터가 어떤 해시를 쓰든 canonical로 정규화돼 나오는 opaque 그룹핑 키). 이 MCP는 에뮬레이터를 모르므로 추론하지 않는다.
+    /// 필수 — 제어 MCP `get_rom_info`의 균일 `rom_sha1` 필드를 받아 전달한다(어댑터별 해시를 정규화한 불투명한 그룹 식별자). 이 MCP는 에뮬레이터를 모르므로 추론하지 않는다.
     rom_sha1: String,
     /// 선택 — 어느 세션/연결의 run인지 표식(제어 MCP `status.emulator_identity.name` 또는 `"port:"`+
     /// `status.listening_port`). 같은 connection_ref의 직전 미종료 run을 자동 마감(superseded)하는 데 쓴다.

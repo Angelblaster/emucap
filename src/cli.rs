@@ -55,7 +55,7 @@ pub enum Command {
 
 #[derive(Subcommand)]
 pub enum TrackAction {
-    /// FS 정본을 walk해 index.sqlite를 재생성한다.
+    /// 파일 원장을 순회해 index.sqlite를 재생성한다.
     Reindex,
     /// 기존 번들(manifest.json)을 run으로 흡수한다.
     Import { bundle: PathBuf },
@@ -72,7 +72,7 @@ pub enum TrackAction {
         rom: String,
         run_id: String,
     },
-    /// 두 run을 비교한다(메트릭·게이트·재현성·개입·산출물).
+    /// 두 run을 비교한다(메트릭·판정·재현성·개입·산출물).
     Compare { run_id_a: String, run_id_b: String },
     /// run들을 goal/tag/rom로 묶어 횡단 요약한다.
     Summarize {

@@ -34,7 +34,7 @@ fn create_run_writes_rom_and_run() {
         run.repro_status,
         Some(ReproStatus::ReplayableWithInterventions)
     );
-    // rom.json + run.json 정본 존재
+    // rom.json + run.json 존재
     assert_eq!(store::load_rom(root, "sha_a").unwrap().sha1, "sha_a");
     assert_eq!(
         store::load_run(root, "sha_a", &run.id)

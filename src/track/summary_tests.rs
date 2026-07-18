@@ -98,7 +98,7 @@ fn gate_stats_and_intervention_ops() {
         created_at: "t".into(),
     }];
     let mut b = base_run("bbb", "g");
-    // 같은 게이트 다회 → 삽입순 마지막(false) 대표
+    // 같은 판정 다회 → 삽입순 마지막(false) 대표
     b.gates = vec![gate("det", Some(true)), gate("det", Some(false))];
     crate::track::store::save_run(root, &a).unwrap();
     crate::track::store::save_run(root, &b).unwrap();

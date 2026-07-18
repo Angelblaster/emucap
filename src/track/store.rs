@@ -240,7 +240,7 @@ fn load_lenient<T: serde::de::DeserializeOwned>(paths: Vec<PathBuf>) -> (Vec<T>,
     (out, skipped)
 }
 
-/// roms/*/runs/*/run.json 전부 로드. 손상 run.json은 에러(무결성 검사·정합용).
+/// roms/*/runs/*/run.json 전부 로드. 손상 run.json은 에러(무결성과 데이터 일치 검사).
 pub fn walk_runs(root: &Path) -> Result<Vec<Run>, TrackError> {
     run_json_paths(root)?.iter().map(|p| read_json(p)).collect()
 }

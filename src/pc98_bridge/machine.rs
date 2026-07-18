@@ -152,7 +152,7 @@ impl<G: GdbTransport> Bridge<G> {
 
     pub(super) fn refresh_input_fields(&mut self) -> Vec<String> {
         // 머신 ioport에 실제 등록된 키 필드를 조회한다. 버튼 이름은 균일 매핑을 유지하고,
-        // 가용성만 머신별로 다르므로 status/에러가 이 목록을 정본으로 노출한다. 구 plugin은
+        // 가용성만 머신별로 다르므로 status/에러가 이 목록을 그대로 노출한다. 구 plugin은
         // 이 쿼리를 몰라 빈 응답→Err이니 빈 목록으로 폴백한다(비-non-empty만 캐시).
         if let Some(cached) = &self.input_fields {
             return cached.clone();

@@ -73,7 +73,7 @@ async fn run_start_binds_active_and_log_metric_round_trips() {
         .await;
     assert_ne!(r.is_error, Some(true));
 
-    // disk 정본 확인
+    // 디스크에 기록된 값을 확인
     let run = emucap::track::store::load_run(root, "sha_a", &run_id).unwrap();
     assert_eq!(run.status, emucap::track::model::RunStatus::Running);
     assert!(run

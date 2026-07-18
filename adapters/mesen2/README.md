@@ -121,7 +121,7 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 - **Note**: of the above, `tap`/`tap_sequence`/`hold_until`/`regression_run`/
   `verify_determinism` are not adapter-native — the MCP server (`emucap-mcp`) synthesizes
   them from primitive tools (set_input · step · read_memory, etc.). The native methods the
-  adapter advertises directly are canonically listed in `hello.methods`.
+  adapter advertises directly are listed in `hello.methods`.
 
 ### The agent launches Mesen
 

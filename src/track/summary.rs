@@ -1,4 +1,4 @@
-//! run 횡단 rollup — goal/tag/rom로 묶은 run들의 사실 집계(상태·재현성·게이트 통과율·개입
+//! run 횡단 rollup — goal/tag/rom로 묶은 run들의 사실 집계(상태·재현성·판정 통과율·개입
 //! op 빈도·per-run 캡슐). **성공 판정은 안 한다** — 패턴 추론은 AI 몫. 순수 읽기.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

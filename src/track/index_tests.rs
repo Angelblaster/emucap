@@ -68,7 +68,7 @@ fn db_deletion_recovers_via_reindex() {
     std::fs::remove_file(&dbp).unwrap(); // DB 손실
     let conn = index::open_index(&dbp).unwrap();
     let n = index::reindex(root, &conn).unwrap();
-    assert_eq!(n, 1); // FS 정본에서 완전 복원
+    assert_eq!(n, 1); // 파일 원장에서 완전 복원
 }
 
 #[test]

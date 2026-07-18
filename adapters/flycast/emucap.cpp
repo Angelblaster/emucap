@@ -633,7 +633,7 @@ void handle_load_state(long id, const std::string& line) {
 }
 
 // ── breakpoint(exec) ─────────────────────────────────────────
-// SH-4 P0..P3 미러(같은 29비트 외부주소의 0x0C/0x8C/0xAC/0xCC… 폼)를 canonical 29비트 폼으로 접는다.
+// SH-4 P0..P3 미러(같은 29비트 외부주소의 0x0C/0x8C/0xAC/0xCC… 폼)를 정규화된 29비트 폼으로 접는다.
 // exec BP는 PC와 BP 양쪽을 이 폼으로 접어 비교하므로, get_state가 노출하는 PC 폼(캐시미러 0x8Cxxxxxx)이
 // 아닌 언캐시드/물리 미러(0xAC/0x0C…)로 줘도 같은 명령에 걸린다(mirror-form BP의 조용한 미발화 방지).
 // P4(온칩 0xE0000000+, 스토어큐·제어레지스터)는 PC가 실행하지 않으므로 접지 않는다.
@@ -641,7 +641,7 @@ static inline uint32_t sh4_fold_pc(uint32_t a) {
 	return (a < 0xE0000000u) ? (a & 0x1FFFFFFFu) : a;
 }
 // g_bps에서 빠른 조회 집합 g_bp_addrs와 armed 플래그를 재구성한다(set/clear 후 호출).
-// 조회 집합은 fold된 canonical 폼으로 채운다(EmuBp.addr는 list용으로 사용자가 준 원 폼을 보존).
+// 조회 집합은 fold된 29비트 폼으로 채운다(EmuBp.addr는 list용으로 사용자가 준 원 폼을 보존).
 void rearm_breakpoints() {
 	g_bp_addrs.clear();
 	for (const auto& b : g_bps) g_bp_addrs.insert(sh4_fold_pc(b.addr));
@@ -1272,9 +1272,9 @@ void emucap_notify_shutdown() noexcept {
 void emucap_service() {
 	try {
 		g_frame++;
-		// 입력 주입 정본은 MapleConfigMap::GetInput(emu 스레드 소비 지점)의 pjs->kcode override다
+		// 입력 주입은 MapleConfigMap::GetInput(emu 스레드 소비 지점)의 pjs->kcode override에서 이뤄진다
 		// (maple_cfg.cpp, build.sh 주입). 여기선 kcode[] 전역을 쓰지 않는다: 게임 입력엔 불필요(GetInput
-		// override가 항상 이김)하고 UI 스레드 gamepad 핸들러와 cross-thread 경합이다 — 정본은 emucap_kcode().
+		// override가 항상 이김)하고 UI 스레드 gamepad 핸들러와 경쟁하므로 주입 상태는 emucap_kcode()에서 합친다.
 		if (g_fd < 0) { emucap_connect(); return; }   // 매 프레임 재연결 시도
 		// step(frames)/run_frames: 카운트다운 — 이 프레임은 진행시킨다(return → vblank 반환 → 1프레임 진행).
 		if (g_step_remaining > 0) {

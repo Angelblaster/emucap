@@ -49,7 +49,7 @@ pub fn finalize(bundle_dir: &Path, rom_override: Option<&Path>) -> Result<Manife
     };
 
     // 아티팩트 경로 검증: 번들 디렉토리 안의 상대경로여야(자기완결성) + 파일 존재.
-    // ROM(rom_path)은 sha1이 정본이고 번들 밖 원본을 가리킬 수 있어 이 제약에서 제외한다.
+    // ROM(rom_path)은 sha1으로 식별하며 번들 밖 원본을 가리킬 수 있어 이 제약에서 제외한다.
     for slice in &raw.slices {
         for artifact in &slice.artifacts {
             let rel = artifact_path(artifact);

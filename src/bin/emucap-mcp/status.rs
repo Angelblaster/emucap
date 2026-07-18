@@ -34,7 +34,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "buttons": ["i", "ii", "run", "select", "up", "down", "left", "right"],
             "aliases": {"a": "i", "b": "ii", "start": "run", "enter": "run", "return": "run"},
             "six_button": ["iii", "iv", "v", "vi"],
-            "notes": "Prefer canonical PCE names i/ii/run/select. a/b/start are accepted aliases."
+            "notes": "Prefer PCE button names i/ii/run/select. a/b/start are accepted aliases."
         }),
         "md" | "genesis" | "megadrive" | "mega-drive" => serde_json::json!({
             "system": "md",
@@ -97,7 +97,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
     })
 }
 
-/// get_rom_info 응답에 균일 `rom_sha1` 필드를 삽입한다 — canonical 콘텐츠 해시(content_md5 우선,
+/// get_rom_info 응답에 균일 `rom_sha1` 필드를 삽입한다 — 정규화된 콘텐츠 해시(content_md5 우선,
 /// 없으면 sha1; 빈값·"skipped:too_large"는 무효로 보고 폴백). 어댑터가 어떤 해시를 쓰든 에이전트가
 /// 플랫폼별 필드를 고를 필요 없이 이 필드를 추적 MCP run_start에 넘긴다. 해시를 전혀 안 주는 백엔드는
 /// 무효라 필드가 안 생긴다(→ 호출자 shasum 폴백). 기존 필드는 보존하고 이미 있으면 덮어쓰지 않는다.
@@ -163,9 +163,9 @@ pub(crate) fn enrich_status_value(
     if !obj.contains_key("memory_types") && !memory_types.is_empty() {
         obj.insert("memory_types".into(), serde_json::json!(memory_types));
     }
-    // capability_notes: 어댑터가 직접 제공하면(PC-98은 dict) 그게 정본이라 *보존*한다. 제공이 없거나
+    // capability_notes: 어댑터가 직접 제공하면(PC-98은 dict) 그 값을 *보존*한다. 제공이 없거나
     // 배열이면, 메서드 부재에서 *신뢰 가능한* substitute만 도출해 덧붙인다(정적 capability 맵 아님 —
-    // capability는 methods가 정본). 어댑터가 직접 advertise하는 명령 단위 step 능력은 외부의 step(unit)에
+    // capability는 methods에서 판단한다). 어댑터가 직접 advertise하는 명령 단위 step 능력은 외부의 step(unit)에
     // 합쳐지므로 여기서 별도 capability note로 반복하지 않는다 — 여기선 *메서드로
     // 표현되지 않는 substitute*(트레이스 부재 시 콜체인 역추적 등)만 도출한다.
     {

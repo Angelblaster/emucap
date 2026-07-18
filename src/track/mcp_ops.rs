@@ -113,7 +113,7 @@ pub fn find_resumable_run(
 
 /// 명시 재바인딩용: run_id(전역 유일)로 running run을 찾아 resume binding을 만든다.
 /// 미존재면 Err, status가 running이 아니면 Err(이미 종료된 run은 resume 불가 — 새 run_start로).
-/// 디스크가 정본이라 in-memory active 상태와 무관하게 동작한다(서버 재시작/재연결 복구).
+/// 디스크 파일을 기준으로 삼아 in-memory active 상태와 무관하게 동작한다(서버 재시작/재연결 복구).
 pub fn resume_run_by_id(root: &Path, run_id: &str) -> Result<ResumeBinding, String> {
     let run = store::find_run_by_id(root, run_id)
         .map_err(|e| e.to_string())?
@@ -173,7 +173,7 @@ pub fn log_metric(
     Ok(serde_json::json!({ "ok": true }))
 }
 
-/// 활성 run에 게이트 1건 기록(kind 문자열 파싱 포함). 반환 `{ok:true}`.
+/// 활성 run에 판정 1건 기록(kind 문자열 파싱 포함). 반환 `{ok:true}`.
 #[allow(clippy::too_many_arguments)]
 pub fn log_gate(
     root: &Path,
@@ -330,7 +330,7 @@ pub fn query_runs(root: &Path, filter: RunFilter) -> Result<Value, String> {
     Ok(serde_json::json!({ "runs": arr, "skipped": skipped.len() }))
 }
 
-/// Run 상세(run.json 정본 + ledger_path)를 반환한다.
+/// 저장된 run.json 내용과 ledger_path를 반환한다.
 pub fn get_run(root: &Path, rom_sha1: &str, run_id: &str) -> Result<Value, String> {
     let run = store::load_run(root, rom_sha1, run_id).map_err(|e| e.to_string())?;
     let mut v = serde_json::to_value(&run).map_err(|e| e.to_string())?;

@@ -1,7 +1,7 @@
 use super::*;
 use emucap::track::observe::ObserveSpec;
 
-/// 결정론 게이트 구동기 테스트용 목. read_memory/screenshot 응답을 큐에서 순서대로
+/// 결정론 재현 판정 구동기 테스트용 목. read_memory/screenshot 응답을 큐에서 순서대로
 /// 돌려줘 "재생마다 다른 관측치"를 흉내낼 수 있다. probe도 큐로.
 pub(crate) struct DetReplayLink {
     caps: emucap::live::link::Capabilities,

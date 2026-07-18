@@ -66,7 +66,7 @@ fn start_run_creates_run_and_returns_ids() {
     let run_id = v["run_id"].as_str().unwrap();
     assert_eq!(v["rom_sha1"], "sha_a");
     assert_eq!(v["ledger_path"], root.display().to_string());
-    // 원장에 실제 run.json이 생겼는지 정본 확인
+    // 원장에 실제 run.json이 생겼는지 확인
     let run = store::load_run(root, "sha_a", run_id).unwrap();
     assert_eq!(run.status, RunStatus::Running);
     assert_eq!(run.goal.as_deref(), Some("font"));

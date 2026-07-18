@@ -167,7 +167,7 @@ const int32* g_last_lw = nullptr;
 // 레이어 enable 마스크 섀도: 코어에 getter가 없어(MDFNI_SetLayerEnableMask는 set 전용) 마지막 적용
 // 마스크를 보관해 set_layer_enable 조회에 쓴다. 코어 기본은 ~0(전체 enable). load_state/reset은 이
 // 마스크를 *건드리지 않는다*(UserLayerEnableMask는 세이브스테이트 미포함·MDFNI_Reset이 SetLayerEnableMask
-// 미호출 — 정본 확인). ~0 리셋은 게임 (재)로드 전용(mednafen.cpp:995)이고, 그건 포크 재시작=이 섀도도
+// 미호출임을 상류 코드에서 확인). ~0 리셋은 게임 (재)로드 전용(mednafen.cpp:995)이고, 그건 포크 재시작=이 섀도도
 // 재초기화다. 따라서 한 세션 안에서 섀도는 코어 실제 마스크와 정확히 일치한다.
 uint64_t g_layer_enable_mask = ~0ULL;
 
@@ -1818,12 +1818,12 @@ void handle_set_layer_enable(long id, const std::string& line) {
   reply_ok(id, resp);
 }
 
-// get_rom_info: 콘텐츠 신원을 반환한다(PC-98 bridge get_rom_info 미러 + Mednafen 정본 해시).
+// get_rom_info: 콘텐츠 신원을 반환한다(PC-98 bridge get_rom_info 미러 + Mednafen 콘텐츠 해시).
 //  - name/path/size/media_type: EMUCAP_CONTENT 파일(launch.sh가 export, hello 신원과 동일 출처).
-//  - content_md5: MDFNGameInfo->MD5(16B) hex. Mednafen이 계산하는 canonical 콘텐츠 해시 —
+//  - content_md5: MDFNGameInfo->MD5(16B) hex. Mednafen이 계산하는 경로 독립 콘텐츠 해시 —
 //    CD는 CalcDiscsLayoutMD5(TOC·트랙·LBA 기반, *경로 독립·디스크 레이아웃 인지*), Saturn은
 //    CalcGameID, 카트리지는 로더가 ROM 데이터로 채운다. 같은 디스크/ROM은 경로·파일명과 무관하게
-//    같은 값 → 추적 MCP run_start의 rom_sha1 그룹핑 키로 정본.
+//    같은 값 → 추적 MCP run_start의 rom_sha1 그룹핑 키로 사용한다.
 //  - sha1: sha1(EMUCAP_CONTENT 파일 바이트). 보조 — 단일파일 ROM/.chd엔 정확, .cue는 디스크립터-only
 //    (참조하는 .bin 미포함)라 충돌 가능. 컨트랙트 일관성(Mesen/PC-98이 sha1 반환) 위해 유지.
 // EMUCAP_CONTENT 미설정 → unsupported, MDFNGameInfo null(게임 미로드) → bad_state 에러.
@@ -1854,7 +1854,7 @@ void handle_get_rom_info(long id) {
   // size + sha1: EMUCAP_CONTENT 파일 바이트를 읽어 Mednafen sha1(one-shot). 파일 없음/IO 실패는 에러.
   // sha1 API가 one-shot(스트리밍은 상류 #if 0)이라 파일을 통째 읽으므로, 대형 단일파일 디스크
   // 이미지(.chd/.iso/.bin 직접 지정)의 메모리 스파이크를 막기 위해 64MB 초과면 sha1을 건너뛴다(보조
-  // 필드일 뿐 — canonical 정체성은 파일을 안 읽는 content_md5다). 건너뛰면 sha1="skipped:too_large".
+  // 필드일 뿐 — 콘텐츠 식별 기준은 파일을 안 읽는 content_md5다). 건너뛰면 sha1="skipped:too_large".
   static const uint64 kSha1MaxBytes = 64ull * 1024 * 1024;
   uint64 size = 0;
   std::string sha1hex;
@@ -1862,7 +1862,7 @@ void handle_get_rom_info(long id) {
     FileStream fs(path, FileStream::MODE_READ);
     size = fs.size();
     if (size > kSha1MaxBytes) {
-      sha1hex = "skipped:too_large";  // content_md5(아래)가 canonical이라 손실 없음
+      sha1hex = "skipped:too_large";  // content_md5(아래)가 식별 기준이므로 손실 없음
     } else {
       std::vector<uint8> buf(size);
       if (size) fs.read(buf.data(), size);
@@ -2070,7 +2070,7 @@ void handle(const std::string& line) {
           "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\"";
     }
     // Saturn 전용 VDP2 디코드 메서드. SS일 때만 advertise(다른 시스템엔 미advertise — 발견 표면 최소화).
-    // PeekRawReg는 ss 코어 심볼이라 ss 외엔 의미 없음. has_debugger와 함께 게이트.
+    // PeekRawReg는 ss 코어 심볼이라 ss 외엔 의미 없음. has_debugger와 함께 조건을 확인한다.
     // break_on_reset: 카트리지(MD/PCE)만 리셋 벡터가 있어 advertise한다 — 디스크(SS/PSX)는 "리셋"이 BIOS
     // 부팅이라 개념이 안 맞으므로 미advertise(status.methods가 현실 반영 — "보이는데 안 됨" 없음).
     if (has_debugger && (is_md() || is_pce())) {
@@ -2084,13 +2084,13 @@ void handle(const std::string& line) {
     if (MDFNGameInfo && MDFNGameInfo->LayerNames) {
       methods += ",\"set_layer_enable\"";
     }
-    // get_rom_info: 콘텐츠 신원(MDFNGameInfo->MD5 canonical 해시 + EMUCAP_CONTENT 파일). 디버거 불요 —
+    // get_rom_info: 콘텐츠 신원(MDFNGameInfo->MD5 해시 + EMUCAP_CONTENT 파일). 디버거 불요 —
     // 게임 로드(MDFNGameInfo 있음) 시 항상 가능하므로 그때만 advertise → status.methods에 노출.
     if (MDFNGameInfo) {
       methods += ",\"get_rom_info\"";
     }
     // memory_types: 이 게임의 debugger address space 이름들(없으면 빈 배열). read/write_memory의
-    // 유효 memory_type 정본이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
+    // 유효한 memory_type 목록이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
     std::string mtypes;
     if (has_debugger && CurGame->Debugger->AddressSpaces) {
       for (auto& as : *CurGame->Debugger->AddressSpaces) {
@@ -2439,7 +2439,7 @@ void handle(const std::string& line) {
       // WriteBP(debug.inc)가 그 주소를 bp.A[0..1]과 직접 비교한다. 따라서 RAM/메모리 region memory_type은
       // read_memory와 같은 offset이 아니라 실제 SH-2 외부버스 주소(base+off)로 잡아야 발화한다 — 변환이
       // 없으면 offset(예: workramh 0x537E0)이 실제 write 주소(0x060537E0)와 안 맞아 accept-but-never-fire.
-      // logical 플래그는 SS DBG_AddBreakPoint가 무시하므로 주소가 정본(logical은 값-read 경로 일관성용).
+      // logical 플래그는 SS DBG_AddBreakPoint가 무시하므로 주소가 비교 기준이다(logical은 값-read 경로 일관성용).
       // 미러 미커버: SH-2는 ea를 정규화 안 하므로, 다른 미러 영역으로만 접근하는 코드엔 안 잡힌다.
       // (용어 주의: 0x06000000대는 cacheable cache-area, 0x26000000대가 cache-through 미러다.) 우리 base는
       // cache-area form(0x06000000 등) — 사용자가 그 form으로 잡아 발화 확인했으므로 그게 기준이고,
