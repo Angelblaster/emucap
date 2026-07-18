@@ -215,7 +215,7 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
 authoritative, not this list)**:
 - `step(unit="frames")` — only instruction-based stepping exists today; no
   fork/PPSSPP primitive advances by video frame yet.
-- `run_frames`, and the MCP-composed `tap`/`tap_sequence`/`hold_until` — all depend on a
+- `run_frames`, and the MCP-composed `tap`/`hold_until` — all depend on a
   frame-level `step`, which this bridge doesn't dispatch.
 - `probe`, `find_pattern`, `watch_register`, `set_trace`/`get_trace`, `call_stack`,
   `break_on_reset` — no bridge/fork hook yet.

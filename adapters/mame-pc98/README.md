@@ -344,7 +344,7 @@ Aliases include `start`/`return` -> `enter`, `escape` -> `esc`, and `select` ->
 N88-BASIC boot prompt, and `press_buttons(["l"], frames=6)` typed `l` at the
 prompt.  `tap(["enter"], press_frames=2, after_frames=10)` was verified to
 advance from the boot prompt while returning to frozen state, and
-`tap_sequence([["l"], ["i"], ["s"], ["t"]], press_frames=2)` typed `list`.
+four sequential `tap` calls for `l`, `i`, `s`, and `t` typed `list`.
 
 `status`, `step(frames=N)`, and `run_frames(N)` include the MAME screen frame
 counter as `frame` when a screen is available.  `step(frames=N)` is a
@@ -353,7 +353,7 @@ screen frame counter reaches the target, then returns to debugger stop.
 `step(count=N, unit="instructions")` uses the GDB single-instruction path for
 CPU-level narrowing.  `run_frames(N)` waits for N
 frames and leaves the emulator running.  With frame-step available, MCP
-`tap`/`tap_sequence` can drive PC-98 keyboard input from a frozen state without
+repeated `tap` calls can drive PC-98 keyboard input from a frozen state without
 relying on host keyboard focus.
 
 `set_breakpoint` supports `exec`, `read`, `write`, and `access` (read+write).  The Lua plugin uses MAME

@@ -46,7 +46,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "system": "pc98",
             "buttons": ["enter", "esc", "space", "up", "down", "left", "right", "backspace", "tab", "del", "ins", "home", "help", "stop", "copy", "shift", "ctrl", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "vf1", "vf2", "vf3", "vf4", "vf5", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
             "aliases": {"start": "enter", "return": "enter", "escape": "esc", "select": "space"},
-            "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. step(frames) is frame-based, so tap/tap_sequence can drive deterministic frozen input."
+            "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. step(frames) is frame-based, so tap can drive deterministic frozen input."
         }),
         "dc" | "dreamcast" => serde_json::json!({
             "system": "dreamcast",
@@ -303,7 +303,6 @@ fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contract
 
     for (ready, method) in [
         (tap_ready, "tap"),
-        (tap_ready, "tap_sequence"),
         (hold_until_ready, "hold_until"),
         (replay_ready, "regression_run"),
         (replay_ready, "verify_determinism"),

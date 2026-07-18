@@ -212,16 +212,6 @@ pub(crate) struct TapArgs {
     pub(crate) after_frames: u64,
 }
 #[derive(Deserialize, JsonSchema)]
-pub(crate) struct TapSequenceArgs {
-    #[serde(default)]
-    pub(crate) port: u64,
-    /// 각 원소가 한 탭의 버튼셋. 예: [["down"],["down"],["a"]] = 세 탭을 순차로
-    #[serde(deserialize_with = "deser_tap_steps")]
-    pub(crate) steps: Vec<Vec<String>>,
-    #[serde(default = "two", deserialize_with = "deser_input_frames")]
-    pub(crate) press_frames: u64,
-}
-#[derive(Deserialize, JsonSchema)]
 pub(crate) struct HoldUntilArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -261,9 +251,6 @@ fn deser_frame_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::E
     Ok(n)
 }
 
-/// tap 시퀀스 최대 스텝 수 — 한 MCP 콜이 무한 탭 시리즈로 팽창해 deferred 실행을 붙잡는 것을 막는다.
-pub(crate) const MAX_TAP_STEPS: usize = 4096;
-
 /// 입력을 누른 채 진행하는 deferred 명령(press/tap/hold)의 프레임 상한. run_frames/step(입력 없음)과 달리
 /// 큰 값은 링크 deadline(300s)을 넘겨 — MCP가 포기해 timeout/drop한 뒤에도 어댑터가 버튼을 계속 눌러
 /// 게임 상태를 오염시킨다(취소 경로도 없다). deadline 안에 드는 작은 상한으로 둔다(어떤 정상 입력 hold도
@@ -278,19 +265,6 @@ fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::
         )));
     }
     Ok(n)
-}
-
-/// tap_sequence의 steps 길이 상한. deferred 데드라인이 총 벽시계를 이미 유한하게 하지만, 여기서도 초과를
-/// 조용히 자르지 않고 에러로 드러낸다.
-fn deser_tap_steps<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Vec<String>>, D::Error> {
-    let v = Vec::<Vec<String>>::deserialize(d)?;
-    if v.len() > MAX_TAP_STEPS {
-        return Err(serde::de::Error::custom(format!(
-            "tap 시퀀스 스텝 수 {}가 상한 {MAX_TAP_STEPS} 초과 — 나눠 호출하라",
-            v.len()
-        )));
-    }
-    Ok(v)
 }
 
 #[derive(Deserialize, JsonSchema)]

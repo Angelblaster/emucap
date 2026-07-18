@@ -38,8 +38,8 @@ work tree (no GDB bridge needed), and `emucap_service()` connects directly to th
 NDJSON from `vblank()`. Its advertised methods include status·read_memory·write_memory·get_state
 (SH-4 registers)·save_state·load_state·run_frames·screenshot (running or frozen)·set_input·pause·
 resume·step (frame)·reset·set_breakpoint·clear_breakpoint·clear_all_breakpoints·list_breakpoints·
-poll_events·find_pattern·disassemble·get_rom_info. Server-composed verbs such as `tap` and
-`tap_sequence` are available when their primitive dependencies exist. `status.methods` is
+poll_events·find_pattern·disassemble·get_rom_info. Server-composed verbs such as `tap` are
+available when their primitive dependencies exist. `status.methods` is
 authoritative; atomic frame-boundary search is unavailable because the native adapter has no `probe`.
 
 A replacement Control MCP can reconnect without restarting Flycast. Do not treat a disconnected

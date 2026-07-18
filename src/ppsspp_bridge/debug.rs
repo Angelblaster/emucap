@@ -378,7 +378,7 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// same `cpu.stepInto` logic as the `step_instructions` wire method.
     ///
     /// Advertisement: this wire method is *not* in `METHODS` (so the MCP's `has("step")` frame-step
-    /// composites — `tap`/`tap_sequence`/`hold_until` — stay correctly disabled on PSP, since they
+    /// composites — `tap`/`hold_until` — stay correctly disabled on PSP, since they
     /// drive frame `step` which PPSSPP cannot do), and it is *not* claimed as "planned" either
     /// (frame-step is a permanent gap, not a pending feature). The stepping that does work is
     /// advertised as `step_instructions` in `METHODS` plus `step_units == ["instructions"]`.

@@ -102,30 +102,6 @@ fn step_rejects_units_missing_from_adapter_capabilities() {
     assert!(link.calls.is_empty());
 }
 
-#[test]
-fn tap_sequence_does_each_tap_in_one_call() {
-    let mut l = Rec::new("frozen", &[]);
-    let steps = vec![vec!["down".to_string()], vec!["a".to_string()]];
-    tap_sequence(&mut l, 0, &steps, 2).unwrap();
-    // pause, 그 다음 탭마다 set_input·step·set_input·step
-    assert_eq!(
-        l.methods(),
-        vec![
-            "pause",
-            "set_input",
-            "step",
-            "set_input",
-            "step",
-            "set_input",
-            "step",
-            "set_input",
-            "step"
-        ]
-    );
-    assert_eq!(l.calls[1].1["buttons"], json!(["down"])); // 첫 탭 누름
-    assert_eq!(l.calls[5].1["buttons"], json!(["a"])); // 둘째 탭 누름
-}
-
 struct ProjectionLink {
     caps: Capabilities,
     delay: std::time::Duration,
@@ -182,12 +158,15 @@ impl EmulatorLink for ProjectionLink {
 
 #[test]
 fn frozen_tap_projection_is_independent_of_host_delay() {
-    let steps = vec![vec!["down".to_string()], vec!["a".to_string()]];
+    let down = vec!["down".to_string()];
+    let a = vec!["a".to_string()];
     let mut no_delay = ProjectionLink::new(std::time::Duration::ZERO);
     let mut delayed = ProjectionLink::new(std::time::Duration::from_millis(2));
 
-    tap_sequence(&mut no_delay, 0, &steps, 2).unwrap();
-    tap_sequence(&mut delayed, 0, &steps, 2).unwrap();
+    tap(&mut no_delay, 0, &down, 2, 0).unwrap();
+    tap(&mut no_delay, 0, &a, 2, 0).unwrap();
+    tap(&mut delayed, 0, &down, 2, 0).unwrap();
+    tap(&mut delayed, 0, &a, 2, 0).unwrap();
 
     assert_eq!(delayed.projection, no_delay.projection);
     assert!(delayed.buttons.is_empty());

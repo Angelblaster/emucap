@@ -271,7 +271,7 @@ pub fn touch(
     Ok(ToolOutput::Json(link.call("touch", params)?))
 }
 
-/// 한 번의 frozen 탭: set_input→step(press_frames)→해제→해제에지. tap·tap_sequence 공용.
+/// 한 번의 frozen 탭: set_input→step(press_frames)→해제→해제에지.
 fn one_tap(
     link: &mut dyn EmulatorLink,
     port: u64,
@@ -321,40 +321,6 @@ pub fn tap(
     }
     Ok(ToolOutput::Json(json!({
         "tapped": buttons, "press_frames": press_frames, "after_frames": after_frames, "state": "frozen"
-    })))
-}
-
-/// tap_sequence 총 프레임 상한. per-field cap(steps 4096 × press_frames 1M)을 각각 통과한 유효 요청이
-/// 곱으로 팽창해 SharedLink 뮤텍스를 쥔 채 수십억 프레임을 도는 것을 막는 집계 상한(args.rs MAX_FRAME_ARG
-/// 동취지).
-const MAX_TAP_SEQUENCE_FRAMES: u64 = 1_000_000;
-
-/// 여러 탭을 한 콜에 순차로(메뉴 네비게이션 왕복 절감). steps의 각 원소가 한 탭의 버튼셋이다.
-/// 예: [["down"],["down"],["a"]] = down·down·a 세 탭. 전부 frozen에서 결정론적. 호출 후 frozen 유지.
-pub fn tap_sequence(
-    link: &mut dyn EmulatorLink,
-    port: u64,
-    steps: &[Vec<String>],
-    press_frames: u64,
-) -> Result<ToolOutput, LinkError> {
-    // 탭 하나 = press_frames + 해제 1 + 해제에지 1. 집계가 상한을 넘으면 실행 전에 거부한다(뮤텍스 점유 폭주 방지).
-    let per_tap = press_frames.saturating_add(2);
-    let total = (steps.len() as u64).saturating_mul(per_tap);
-    if total > MAX_TAP_SEQUENCE_FRAMES {
-        return Err(LinkError::Emulator {
-            kind: "bad_params".into(),
-            message: format!(
-                "tap_sequence 총 프레임 {total}(steps {} × {per_tap})이 상한 {MAX_TAP_SEQUENCE_FRAMES} 초과 — 나눠 호출하라",
-                steps.len()
-            ),
-        });
-    }
-    link.call("pause", json!({}))?; // 멱등
-    for step in steps {
-        one_tap(link, port, step, press_frames)?;
-    }
-    Ok(ToolOutput::Json(json!({
-        "sequence_len": steps.len(), "press_frames": press_frames, "state": "frozen"
     })))
 }
 

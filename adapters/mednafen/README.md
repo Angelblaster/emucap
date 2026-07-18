@@ -206,7 +206,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `disassemble` (SH-2/MIPS/HuC6280/68000)/
   `find_pattern` (pattern search in 128KB units inside the debugger address space)/
   `reset`/`set_input` · `press_buttons` (controller injection — overwrites `mednafen.cpp`'s PortData[0] with the button
-  mask, active-high; tap/tap_sequence/hold_until are assembled in Rust from set_input+step)/
+  mask, active-high; tap/hold_until are assembled in Rust from set_input+step)/
   `screenshot` (right after MDFNI_Emulate, PNG-encode espec.surface via `PNGWrite` → base64)/
   `dump_memory` (bulk export the debugger AddressSpace as `.bin`+`regions.json` — a synthetic full-bus [PSX cpu 4GB ·
   SS physical 128MB] is skipped at a 64MB cap [reported in `reply.skipped`]; dedicated RAM/VRAM is exported)/ **Saturn only**:

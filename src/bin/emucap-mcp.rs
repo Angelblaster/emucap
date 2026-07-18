@@ -434,17 +434,6 @@ impl Emucap {
     }
 
     #[tool(
-        description = "여러 탭을 한 콜에 순차 입력한다(메뉴/텍스트 네비게이션 왕복 절감; 전부 frozen 결정론, 호출 후 frozen 유지)."
-    )]
-    async fn tap_sequence(&self, Parameters(a): Parameters<TapSequenceArgs>) -> CallToolResult {
-        let mut l = self.link();
-        match tools::tap_sequence(&mut *l, a.port, &a.steps, a.press_frames) {
-            Ok(o) => output_result(o),
-            Err(e) => err_result(e),
-        }
-    }
-
-    #[tool(
         description = "버튼을 누른 채 frozen 진행하며 watch 메모리가 바뀌면 멈추고 뗀다 — 타일/커서 이동을 결정론적으로(입력 효과 피드백)."
     )]
     async fn hold_until(&self, Parameters(a): Parameters<HoldUntilArgs>) -> CallToolResult {

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use super::{reset, tap_sequence, watch_register, LinkError, ToolOutput};
+use super::{reset, watch_register, LinkError, ToolOutput};
 use crate::live::link::{Capabilities, EmulatorLink, FakeLink};
 use serde_json::json;
 
@@ -86,33 +86,6 @@ fn watch_register_rejects_over_budget() {
     assert!(
         watch_register(&mut link2, "sp", 0, 0xffff, true, Some(1000)).is_ok(),
         "상한 이내 예산은 통과해야"
-    );
-}
-
-#[test]
-fn tap_sequence_rejects_over_aggregate_budget() {
-    // per-field cap을 통과해도(steps ≤ 4096, press_frames ≤ 1M) 곱이 상한(1M)을 넘으면 실행 전에
-    // 거부해야 한다 — 유효 요청이 뮤텍스를 쥔 채 수십억 프레임으로 팽창하는 것 방지.
-    let mut link = FakeLink::ok(json!({}));
-    let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 4000];
-    let r = tap_sequence(&mut link, 0, &steps, 1000); // 4000 × 1002 ≈ 4M > 1M
-    assert!(
-        matches!(r, Err(LinkError::Emulator { ref kind, .. }) if kind == "bad_params"),
-        "집계 예산 초과는 bad_params로 거부해야: {r:?}"
-    );
-    assert!(
-        link.last_method.is_none(),
-        "예산 초과는 어떤 링크 호출(pause 포함)도 하기 전에 거부해야"
-    );
-}
-
-#[test]
-fn tap_sequence_accepts_within_budget() {
-    let mut link = FakeLink::ok(json!({}));
-    let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 10];
-    assert!(
-        tap_sequence(&mut link, 0, &steps, 2).is_ok(),
-        "예산 이내는 통과해야"
     );
 }
 

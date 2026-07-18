@@ -101,7 +101,7 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
-- Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`tap_sequence`/`hold_until`/`save_state`/`load_state`/
+- Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`hold_until`/`save_state`/`load_state`/
   `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`.
   (⚠ `save_state`/`load_state` work **only while running**; a native halt is rejected because Mesen
   requires a main-CPU execution callback. A save requested after a breakpoint is not an atomic
@@ -118,7 +118,7 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 - Analysis: `dump_memory`/`probe`/`regression_run`.
 - `verify_determinism` — measures reproducibility by replaying a reproduction recipe N
   times and matching hashes (determinism_replay gate).
-- **Note**: of the above, `tap`/`tap_sequence`/`hold_until`/`regression_run`/
+- **Note**: of the above, `tap`/`hold_until`/`regression_run`/
   `verify_determinism` are not adapter-native — the MCP server (`emucap-mcp`) synthesizes
   them from primitive tools (set_input · step · read_memory, etc.). The native methods the
   adapter advertises directly are listed in `hello.methods`.

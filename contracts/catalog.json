@@ -363,9 +363,9 @@
     {
       "id": "input.tap",
       "surface": "public",
-      "methods": ["tap", "tap_sequence"],
+      "methods": ["tap"],
       "temporal_classes": ["T1"],
-      "disposition": "evaluate_remove",
+      "disposition": "retain",
       "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
     },
     {
@@ -373,7 +373,7 @@
       "surface": "public",
       "methods": ["hold_until"],
       "temporal_classes": ["T1"],
-      "disposition": "evaluate_remove",
+      "disposition": "retain",
       "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
     },
     {
@@ -501,7 +501,7 @@
       "surface": "public",
       "methods": ["break_on_reset"],
       "temporal_classes": ["T0/P"],
-      "disposition": "consolidate",
+      "disposition": "retain",
       "expectations": ["TIME.PERSISTENT.1"]
     },
     {
@@ -509,7 +509,7 @@
       "surface": "public",
       "methods": ["regression_run"],
       "temporal_classes": ["T5"],
-      "disposition": "migrate",
+      "disposition": "retain",
       "expectations": ["ANALYSIS.PROVENANCE.1"]
     },
     {
@@ -517,7 +517,7 @@
       "surface": "public",
       "methods": ["verify_determinism"],
       "temporal_classes": ["T5"],
-      "disposition": "migrate",
+      "disposition": "retain",
       "expectations": ["ANALYSIS.PROVENANCE.1"]
     }
   ]

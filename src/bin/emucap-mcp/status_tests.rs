@@ -56,13 +56,7 @@ fn composites_appear_when_deps_met() {
         "step_instructions",
         "set_trace",
     ]);
-    for c in [
-        "tap",
-        "tap_sequence",
-        "hold_until",
-        "regression_run",
-        "verify_determinism",
-    ] {
+    for c in ["tap", "hold_until", "regression_run", "verify_determinism"] {
         assert!(has_method(&v, c), "composite {c} missing");
     }
     // 의존 충족된 풀셋엔 substitute note가 없다.
@@ -582,7 +576,6 @@ fn instruction_only_step_does_not_admit_frame_composites() {
     assert!(has_method(&value, "step"));
     assert!(!has_method(&value, "step_instructions"));
     assert!(!has_method(&value, "tap"));
-    assert!(!has_method(&value, "tap_sequence"));
     assert!(!has_method(&value, "hold_until"));
     assert_eq!(value["contracts"]["state"], "validated");
 }
