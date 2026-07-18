@@ -1,4 +1,5 @@
 use super::*;
+use std::io::BufRead;
 use std::net::TcpListener;
 
 #[test]

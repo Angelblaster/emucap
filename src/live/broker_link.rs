@@ -1,5 +1,5 @@
 //! BrokerLink — broker 세션 포트에 접속해 attach 후 명령을 위임하는 EmulatorLink.
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use super::link::{Capabilities, EmulatorIdentity, EmulatorLink, LinkError};
 use super::protocol::{
-    parse_response, result_status, to_line, Request, PROTOCOL_VERSION, STATUS_WORKING,
+    parse_response, read_ndjson_frame, result_status, to_line, Request, PROTOCOL_VERSION,
+    STATUS_WORKING,
 };
 
 /// 세션 liveness heartbeat 주기. broker가 hang 세션을 stale로 판정하는 임계(기본 15초)보다
@@ -35,10 +36,8 @@ pub struct BrokerLink {
     next_id: u64,
     hb_stop: Arc<AtomicBool>,
     hb_handle: Option<JoinHandle<()>>,
-    /// 부분 수신한 응답 줄(영속). read 타임아웃이 줄 중간에 걸려도 여기 남겨 다음 호출이 이어 읽어
-    /// 스트림 desync를 막는다(TcpLink.Conn.pending과 동일 — 호출마다 새 String을 쓰면 타임아웃 시
-    /// 이미 읽은 바이트를 잃는다). 한 줄(끝 \n)이 완성되면 비운다.
-    pending: String,
+    /// 부분 수신한 응답 frame. read timeout 뒤에도 이어 읽되 protocol payload cap을 넘기지 않는다.
+    pending: Vec<u8>,
     /// 연속 read 타임아웃 횟수. Ok read 하나로 0 리셋, 임계치면 hung broker로 보고 NotConnected.
     consecutive_timeouts: u32,
     /// deferred 명령의 총 벽시계 상한(working keepalive가 끝없이 와도 유한하게 끊기 위함).
@@ -79,7 +78,7 @@ pub fn connect(
         next_id: 1,
         hb_stop: Arc::new(AtomicBool::new(false)),
         hb_handle: None,
-        pending: String::new(),
+        pending: Vec::new(),
         consecutive_timeouts: 0,
         deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
     };
@@ -177,14 +176,11 @@ impl BrokerLink {
             if Instant::now() > deadline {
                 return Err(LinkError::NotConnected);
             }
-            // 영속 버퍼(self.pending)로 읽는다 — 타임아웃이 줄 중간에 걸려도 이미 읽은 바이트가 보존돼
-            // 다음 호출이 이어 읽으므로 응답이 read 경계에 쪼개져도 desync가 없다(reader·pending은
-            // 서로 다른 필드라 disjoint borrow 허용).
-            match self.reader.read_line(&mut self.pending) {
-                Ok(0) => return Err(LinkError::NotConnected),
-                Ok(_) => {
-                    // read_line은 첫 \n까지 — pending에 완성된 한 줄. 꺼내 비운다(다음 줄 대비).
-                    let line = std::mem::take(&mut self.pending);
+            // 영속 버퍼로 읽어 timeout 경계의 부분 frame을 보존한다. protocol cap 초과나 불완전 EOF는
+            // 이 BrokerLink를 폐기할 수 있는 연결 오류로 반환한다.
+            match read_ndjson_frame(&mut self.reader, &mut self.pending) {
+                Ok(None) => return Err(LinkError::NotConnected),
+                Ok(Some(line)) => {
                     self.consecutive_timeouts = 0; // 응답 수신 = broker 살아있음 → 카운터 리셋
                     let resp = parse_response(line.trim())
                         .map_err(|e| LinkError::Protocol(e.to_string()))?;
@@ -328,10 +324,13 @@ impl EmulatorLink for LazyBrokerLink {
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
         let result = self.ensure_connected()?.raw_call(method, params);
-        // 연결이 죽었으면(NotConnected = EOF/write 실패) inner를 비워 다음 call이 재attach하게 한다.
+        // 연결이 죽었거나 protocol desync가 확인되면 inner를 비워 다음 call이 재attach하게 한다.
         // 그러지 않으면 stale BrokerLink로 영구 실패해 /mcp 재시작이 필요하다(TcpLink는 drop+재accept로
-        // 자가복구). Timeout은 일시적(느린 op)일 수 있어 같은 연결을 유지한다 — NotConnected만 끊는다.
-        if matches!(result, Err(LinkError::NotConnected)) {
+        // 자가복구). Timeout은 일시적(느린 op)일 수 있어 같은 연결을 유지한다.
+        if matches!(
+            result,
+            Err(LinkError::NotConnected | LinkError::Protocol(_))
+        ) {
             self.inner = None;
         }
         result

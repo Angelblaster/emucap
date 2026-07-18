@@ -29,7 +29,8 @@ adapters/desmume-nds/build.sh
 
 Clones TASEmulators/desmume into an emucap-owned work tree (`adapters/desmume-nds/work`) pinned to a
 known-good commit, applies the patch stack in order (`0001` headless → `0002` screenshot/input →
-`0003` savestate/disasm → `0004` reset → `0005` touch), and builds `desmume-cli` with meson
+`0003` savestate/disasm → `0004` reset → `0005` touch → `0006` GDB buffers → `0007` input status →
+`0008` GDB I/O deadlines → `0009` SIGPIPE suppression), and builds `desmume-cli` with meson
 (`-Dfrontend-cli -Dgdb-stub`; the gdb-stub build disables the JIT and runs the interpreter). Because
 later patches extend the same `gdbstub.cpp` regions, build.sh resets the tree and re-applies the whole
 stack every build. Point it at a read-only upstream checkout with `EMUCAP_DESMUME_SRC=/path/to/desmume`.
@@ -48,6 +49,11 @@ adapters/desmume-nds/launch.sh <rom.nds> <EMUCAP_PORT> [EMUCAP_NAME]
 The launcher starts desmume-cli headless (`--arm9gdb <p9> --arm7gdb <p7>`), waits for both GDB ports
 to open, then attaches the bridge. **No NDS BIOS or firmware is needed** — DeSmuME's HLE BIOS and
 direct-boot boot commercial ROMs.
+
+Each accepted GDB connection has bounded send/receive waits. Packet transmission and ACK handling
+share a two-second total deadline and at most three attempts; a timeout closes only that GDB
+connection and resets the packet reader so a replacement bridge can attach without restarting
+DeSmuME. Socket sends suppress `SIGPIPE`, so a peer reset also closes only the failed GDB connection.
 
 ## System and content
 

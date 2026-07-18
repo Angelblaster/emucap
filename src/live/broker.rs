@@ -1,11 +1,11 @@
 //! 에뮬레이터 연결 broker — 레지스트리·페어링·양방향 펌프. 페어링 후 줄을 무해석 전달한다.
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use super::protocol::{to_line, Request};
+use super::protocol::{read_ndjson_frame, to_line, Request};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -167,10 +167,11 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
     {
         return;
     }
-    let mut hello = String::new();
-    if reader.read_line(&mut hello).unwrap_or(0) == 0 {
-        return;
-    }
+    let mut pending = Vec::new();
+    let hello = match read_ndjson_frame(&mut reader, &mut pending) {
+        Ok(Some(frame)) => frame,
+        Ok(None) | Err(_) => return,
+    };
     let v: serde_json::Value = match serde_json::from_str(hello.trim()) {
         Ok(v) => v,
         Err(_) => return,
@@ -242,11 +243,7 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
     // 에뮬레이터-리더: 줄을 읽어 페어링 세션으로(없으면 드레인).
     // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖. 현재 세션 세대로 응답을 펜싱해, steal 이전
     // 옛 세션의 in-flight 응답이 신규 소유자에게 오배달되는 것을 막는다(fence_incoming).
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break; // EOF
-        }
+    while let Ok(Some(line)) = read_ndjson_frame(&mut reader, &mut pending) {
         let raw = line.trim_end();
         // lock 안에서는 값싼 스냅샷(writer clone + session_gen 복사)만 잡고, 값비싼 JSON 파싱/재직렬화
         // (fence_incoming)는 lock 밖에서 한다 — 안 그러면 emu→session 줄마다 두 번의 full JSON 패스가
@@ -298,10 +295,11 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
         Err(_) => return,
     });
     let mut to_sess = stream;
-    let mut attach = String::new();
-    if reader.read_line(&mut attach).unwrap_or(0) == 0 {
-        return;
-    }
+    let mut pending = Vec::new();
+    let attach = match read_ndjson_frame(&mut reader, &mut pending) {
+        Ok(Some(frame)) => frame,
+        Ok(None) | Err(_) => return,
+    };
     let av: serde_json::Value = match serde_json::from_str(attach.trim()) {
         Ok(v) => v,
         Err(_) => return,
@@ -412,11 +410,7 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
     }
     // 세션-리더: 줄을 읽어 페어링 에뮬레이터로 전달.
     // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖.
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break; // 세션 EOF
-        }
+    while let Ok(Some(line)) = read_ndjson_frame(&mut reader, &mut pending) {
         let trimmed = line.trim_end();
         let ping = is_ping_line(trimmed);
         let emu = {

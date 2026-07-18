@@ -1,0 +1,39 @@
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+index 62715b8..ac2017c 100644
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -596,6 +596,16 @@ getOutPacket( void) {
+ 
+ typedef std::chrono::steady_clock emucap_gdb_clock;
+ 
++static int emucap_socket_send(SOCKET_TYPE sock, const char *data, int len) {
++#if defined(WIN32)
++  return send(sock, (char *)data, len, 0);
++#elif defined(MSG_NOSIGNAL)
++  return send(sock, data, len, MSG_NOSIGNAL);
++#else
++  return send(sock, data, len, 0);
++#endif
++}
++
+ static int emucap_socket_retryable(void) {
+ #ifdef WIN32
+   int error = WSAGetLastError();
+@@ -627,7 +637,7 @@ static int emucap_send_all_until(
+     const emucap_gdb_clock::time_point &deadline) {
+   size_t sent = 0;
+   while (sent < len && emucap_gdb_clock::now() < deadline) {
+-    int n = send(sock, (char *)(data + sent), (int)(len - sent), 0);
++    int n = emucap_socket_send(sock, data + sent, (int)(len - sent));
+     if (n > 0) {
+       sent += (size_t)n;
+     } else if (n == 0 || !emucap_socket_retryable()) {
+@@ -1803,7 +1813,7 @@ WINAPI listenerThread_gdb( void *data) {
+                 }
+               }
+ 
+-              write_res = send( gdb_sock, (char*)&reply, 1, 0);
++              write_res = emucap_socket_send( gdb_sock, (char*)&reply, 1);
+               
+               if ( write_res != 1) {
+                 close_socket = 1;

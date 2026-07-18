@@ -24,6 +24,8 @@ PATCH4="$HERE/patches/0004-emucap-reset.patch"
 PATCH5="$HERE/patches/0005-emucap-touch.patch"
 PATCH6="$HERE/patches/0006-emucap-gdb-bufmax.patch"
 PATCH7="$HERE/patches/0007-emucap-input-status.patch"
+PATCH8="$HERE/patches/0008-emucap-gdb-io-deadline.patch"
+PATCH9="$HERE/patches/0009-emucap-gdb-no-sigpipe.patch"
 WORK="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 SRC="$WORK/src"
 POSIX="$SRC/desmume/src/frontend/posix"
@@ -37,6 +39,8 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH5" ] || { echo "ERROR: emucap touch patch not found: $PATCH5" >&2; exit 1; }
 [ -f "$PATCH6" ] || { echo "ERROR: emucap gdb-bufmax patch not found: $PATCH6" >&2; exit 1; }
 [ -f "$PATCH7" ] || { echo "ERROR: emucap input-status patch not found: $PATCH7" >&2; exit 1; }
+[ -f "$PATCH8" ] || { echo "ERROR: emucap gdb I/O deadline patch not found: $PATCH8" >&2; exit 1; }
+[ -f "$PATCH9" ] || { echo "ERROR: emucap gdb SIGPIPE patch not found: $PATCH9" >&2; exit 1; }
 
 for tool in meson ninja git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing build tool: $tool (macOS: brew install $tool)" >&2; exit 1; }
@@ -44,7 +48,7 @@ done
 
 mkdir -p "$WORK"
 
-# DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0005) is written
+# DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0009) is written
 # against exactly this tree. Cloning a moving HEAD would silently build an untested revision, and any
 # upstream edit near the patch hunks would break fresh installs with no repo change. Bump this
 # deliberately (and re-verify the patch stack) when moving to a newer DeSmuME.
@@ -73,9 +77,10 @@ fi
 # 2. Apply the repo-owned patch stack from the pristine upstream baseline.
 #    0001 = headless CLI (X11/window removal); 0002 = emucap GDB-stub hooks
 #    (screenshot + input custom RSP commands); 0003 = emucap state/disasm hooks
-#    (savestate + disassemble custom RSP commands). 0003 extends the same gdbstub.cpp
-#    regions 0002 adds, so the three form an ordered stack that must apply 0001→0002→0003.
-#    Because 0003's hunks sit adjacent to 0002's, a per-patch reverse-check cannot tell
+#    (savestate + disassemble custom RSP commands). Later patches add reset, touch, buffer bounds,
+#    input ownership, and bounded GDB socket I/O. They extend the same gdbstub.cpp regions, so the
+#    patches form one ordered stack.
+#    Because later hunks sit adjacent to earlier ones, a per-patch reverse-check cannot tell
 #    "already applied" from "conflict" once the stack is on disk. Instead we reset the
 #    tracked sources to the clone's HEAD (dropping any prior application; untracked
 #    build-headless/ artifacts are kept) and re-apply the whole stack forward. This is
@@ -89,7 +94,9 @@ for entry in \
   "$PATCH4|emucap reset patch (0004)" \
   "$PATCH5|emucap touch patch (0005)" \
   "$PATCH6|emucap gdb-bufmax patch (0006)" \
-  "$PATCH7|emucap input-status patch (0007)"; do
+  "$PATCH7|emucap input-status patch (0007)" \
+  "$PATCH8|emucap gdb I/O deadline patch (0008)" \
+  "$PATCH9|emucap gdb SIGPIPE patch (0009)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"

@@ -4,11 +4,11 @@
 //! socket EOF. Only the front-side TCP session is recreated, preserving emulator state across MCP
 //! restarts and consecutive-timeout connection drops.
 
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-use super::protocol::{ProtocolError, Request, Response};
+use super::protocol::{read_ndjson_frame, ProtocolError, Request, Response};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,13 +67,11 @@ where
 {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
-    let mut line = String::new();
+    let mut pending = Vec::new();
     loop {
-        line.clear();
-        let count = reader.read_line(&mut line)?;
-        if count == 0 {
+        let Some(line) = read_ndjson_frame(&mut reader, &mut pending)? else {
             return Ok(());
-        }
+        };
         if line.trim().is_empty() {
             continue;
         }

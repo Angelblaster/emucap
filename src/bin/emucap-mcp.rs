@@ -789,6 +789,22 @@ impl ServerHandler for Emucap {
     }
 }
 
+fn broker_session_accepting(address: &str) -> bool {
+    address
+        .parse()
+        .ok()
+        .and_then(|endpoint| {
+            std::net::TcpStream::connect_timeout(&endpoint, Duration::from_millis(100)).ok()
+        })
+        .is_some()
+}
+
+fn spawn_reaped(mut command: std::process::Command) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = command.status();
+    })
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let emu_port: u16 = std::env::var("EMUCAP_PORT")
@@ -808,9 +824,12 @@ async fn main() -> anyhow::Result<()> {
         let name = std::env::var("EMUCAP_NAME").ok();
         // broker 없으면 auto-spawn 후 lazy link로 접속을 미룬다.
         // 직접 모드로 폴백하지 않는다 — broker를 선택한 세션은 그 연결 경로만 사용한다.
-        if let Ok(exe) = std::env::current_exe() {
-            let broker_bin = exe.with_file_name("emucap-broker");
-            let _ = std::process::Command::new(broker_bin).spawn();
+        if !broker_session_accepting(&sess_addr) {
+            if let Ok(exe) = std::env::current_exe() {
+                let broker_bin = exe.with_file_name("emucap-broker");
+                let command = std::process::Command::new(broker_bin);
+                let _ = spawn_reaped(command);
+            }
         }
         Arc::new(Mutex::new(continuity::observed(broker_link::lazy(
             &sess_addr,

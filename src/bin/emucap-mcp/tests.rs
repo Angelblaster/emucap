@@ -26,6 +26,21 @@ fn server_info_identifies_the_control_binary() {
 }
 
 #[test]
+fn broker_probe_detects_a_listening_session_port() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    assert!(broker_session_accepting(
+        &listener.local_addr().unwrap().to_string()
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn broker_helper_child_is_waited_by_reaper_thread() {
+    let command = std::process::Command::new("true");
+    spawn_reaped(command).join().unwrap();
+}
+
+#[test]
 fn image_output_publishes_screenshot_provenance() {
     let result = output_result(ToolOutput::Image {
         png_base64: "QUJD".into(),

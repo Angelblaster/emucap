@@ -1,5 +1,5 @@
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use super::link::{Capabilities, EmulatorLink, LinkError};
-use super::protocol::{parse_response, to_line, Request, PROTOCOL_VERSION};
+use super::protocol::{parse_response, read_ndjson_frame, to_line, Request, PROTOCOL_VERSION};
 
 pub struct TcpLink {
     addr: String,
@@ -45,10 +45,8 @@ const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
 struct Conn {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
-    /// 부분 수신한 응답 줄(영속). 요청 타임아웃 시 여기 남겨 두면 다음 호출이 이어 읽어 스트림
-    /// desync를 막는다. 한 줄(끝 \n)이 완성되면 비운다. (read_line은 호출마다 새 String을 쓰면
-    /// 타임아웃이 줄 중간에 걸릴 때 이미 읽은 바이트를 잃어 desync가 나므로 영속화한다.)
-    pending: String,
+    /// 부분 수신한 응답 frame. 요청 타임아웃 뒤에도 이어 읽되 protocol payload cap을 넘기지 않는다.
+    pending: Vec<u8>,
 }
 
 type PreacceptResult = Result<(Conn, Capabilities, String), LinkError>;
@@ -335,12 +333,10 @@ fn handshake_stream(
         )
         .map_err(io_to_link)?;
 
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) => return Err(LinkError::NotConnected),
-        Ok(_) => {}
-        Err(e) => return Err(io_to_link(e)),
-    }
+    let mut pending = Vec::new();
+    let line = read_ndjson_frame(&mut reader, &mut pending)
+        .map_err(io_to_link)?
+        .ok_or(LinkError::NotConnected)?;
 
     let resp = parse_response(line.trim()).map_err(|e| LinkError::Protocol(e.to_string()))?;
     if !resp.ok {
@@ -402,7 +398,7 @@ fn handshake_stream(
         Conn {
             reader,
             writer,
-            pending: String::new(),
+            pending: Vec::new(),
         },
         Capabilities {
             protocol_version,
@@ -782,26 +778,26 @@ impl TcpLink {
                 self.drop_conn();
                 return Err(LinkError::Timeout);
             }
-            // 영속 버퍼(conn.pending)로 읽는다 — 타임아웃이 줄 중간에 걸려도 이미 읽은 바이트가 보존돼
-            // 다음 호출이 이어 읽는다. read_line 결과만 받고 conn 빌림을 끝내(아래 drop_conn과 충돌 방지).
+            // 영속 버퍼(conn.pending)로 읽는다 — 타임아웃이 frame 중간에 걸려도 이미 읽은 바이트가
+            // 보존된다. protocol cap 초과나 불완전 EOF는 연결을 폐기한다.
             let read_result = {
                 let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
-                conn.reader.read_line(&mut conn.pending)
+                read_ndjson_frame(&mut conn.reader, &mut conn.pending)
             };
             match read_result {
-                Ok(0) => {
+                Ok(None) => {
                     self.drop_conn();
                     return Err(LinkError::NotConnected);
                 }
-                Ok(_) => {
-                    // read_line은 첫 \n까지 — pending에 완성된 한 줄(+\n). 꺼내 비운다(다음 줄 대비).
-                    let line = {
-                        let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
-                        std::mem::take(&mut conn.pending)
-                    };
+                Ok(Some(line)) => {
                     self.consecutive_timeouts = 0; // 응답 수신 = 어댑터 살아있음 → 타임아웃 카운터 리셋
-                    let resp = parse_response(line.trim())
-                        .map_err(|e| LinkError::Protocol(e.to_string()))?;
+                    let resp = match parse_response(line.trim()) {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.drop_conn();
+                            return Err(LinkError::Protocol(error.to_string()));
+                        }
+                    };
                     if resp.id != id {
                         mismatch += 1;
                         if mismatch > MAX_ID_MISMATCH {

@@ -219,6 +219,52 @@ fn broker_link_maps_ambiguous_with_names() {
     h.join().unwrap();
 }
 
+#[test]
+fn lazy_broker_link_reattaches_after_protocol_desync() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        for connection in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+
+            let mut attach = String::new();
+            reader.read_line(&mut attach).unwrap();
+            let attach_id =
+                serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap()["id"].clone();
+            writeln!(
+                writer,
+                r#"{{"id":{attach_id},"ok":true,"result":{{"attached_name":"g","methods":["status"]}}}}"#
+            )
+            .unwrap();
+
+            let mut status = String::new();
+            reader.read_line(&mut status).unwrap();
+            let status_id =
+                serde_json::from_str::<serde_json::Value>(status.trim()).unwrap()["id"].clone();
+            if connection == 0 {
+                writeln!(writer, "malformed").unwrap();
+            } else {
+                writeln!(
+                    writer,
+                    r#"{{"id":{status_id},"ok":true,"result":{{"connected":true,"generation":2}}}}"#
+                )
+                .unwrap();
+            }
+        }
+    });
+
+    let mut link = broker_link::lazy(&addr, None, Duration::from_secs(2));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::Protocol(_))
+    ));
+    let recovered = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(recovered["generation"], 2);
+    h.join().unwrap();
+}
+
 // M1: 응답이 read 타임아웃 경계에 쪼개져 도착해도 pending 버퍼로 이어 읽어 스트림 desync가 없어야
 // 한다. 수정 전(호출마다 새 String)엔 앞 절반을 잃어, 뒤 절반이 다음 호출에서 깨진 줄로 읽혀 Protocol
 // desync가 난다.
