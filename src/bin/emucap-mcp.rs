@@ -16,6 +16,8 @@ mod args;
 mod instructions;
 #[path = "emucap-mcp/launch.rs"]
 mod launch;
+#[path = "emucap-mcp/memory_write.rs"]
+mod memory_write;
 #[path = "emucap-mcp/regression.rs"]
 mod regression;
 #[path = "emucap-mcp/result.rs"]
@@ -361,11 +363,28 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "메모리에 바이트(hex)를 쓴다")]
+    #[tool(
+        description = "메모리에 바이트를 쓴다. 짧은 값은 hex, raw binary 파일은 input_file(path, offset, length, sha256?)로 주며 둘 중 정확히 하나만 지정한다. 파일은 제어 MCP가 허용 범위 안에서 한 번 읽어 고정하고 SHA-256을 반환한다."
+    )]
     async fn write_memory(&self, Parameters(a): Parameters<WriteMemoryArgs>) -> CallToolResult {
+        let generation = if a.input_file.is_some() {
+            memory_write::generation_marker(self.link().capabilities())
+        } else {
+            None
+        };
+        let prepared = match memory_write::prepare_write(&a).await {
+            Ok(prepared) => prepared,
+            Err(error) => return err_result(error),
+        };
         let mut l = self.link();
-        match tools::write_memory(&mut *l, &a.memory_type, a.address.get(), &a.hex) {
-            Ok(o) => output_result(o),
+        if generation.is_some() && generation != memory_write::generation_marker(l.capabilities()) {
+            return err_result(LinkError::Emulator {
+                kind: "bad_state".into(),
+                message: "runtime generation changed while staging file input; retry against the current status".into(),
+            });
+        }
+        match tools::write_memory_bytes(&mut *l, &a.memory_type, a.address.get(), &prepared.bytes) {
+            Ok(o) => output_result(memory_write::with_provenance(o, &prepared)),
             Err(e) => err_result(e),
         }
     }

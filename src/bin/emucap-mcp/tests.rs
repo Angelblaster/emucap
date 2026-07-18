@@ -1,7 +1,8 @@
 use super::*;
 
-use crate::args::{Num, VerifyDeterminismArgs};
+use crate::args::{Num, VerifyDeterminismArgs, WriteMemoryArgs, WriteMemoryFileArgs};
 use crate::regression::tests::{det_input_case, DetReplayLink};
+use emucap::live::link::FakeLink;
 
 /// CallToolResult의 텍스트 본문을 추출한다(검증용).
 fn body_text(r: &CallToolResult) -> String {
@@ -120,4 +121,83 @@ fn verify_determinism_rejects_replays_below_two() {
     };
     let res = srv.verify_determinism_impl(args);
     assert_eq!(res.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn file_write_stages_bytes_before_calling_the_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("payload.bin");
+    std::fs::write(&path, [0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+
+    let concrete = Arc::new(Mutex::new(FakeLink::ok(serde_json::json!({"written": 2}))));
+    let shared: SharedLink = concrete.clone();
+    let srv = Emucap::new(shared);
+    let result = srv
+        .write_memory(Parameters(WriteMemoryArgs {
+            memory_type: "ram".into(),
+            address: Num(0x20),
+            hex: None,
+            input_file: Some(WriteMemoryFileArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: Some(Num(1)),
+                length: Num(2),
+                sha256: None,
+            }),
+        }))
+        .await;
+
+    assert_ne!(result.is_error, Some(true));
+    let body = body_text(&result);
+    assert!(body.contains("\"input_kind\":\"file\""), "{body}");
+    assert!(body.contains("\"input_bytes\":2"), "{body}");
+
+    let link = concrete.lock().unwrap();
+    assert_eq!(link.last_method.as_deref(), Some("write_memory"));
+    assert_eq!(
+        link.last_params,
+        Some(serde_json::json!({
+            "memory_type": "ram",
+            "address": 0x20,
+            "hex": "bbcc",
+        }))
+    );
+    assert!(
+        !link
+            .last_params
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains(path.to_string_lossy().as_ref()),
+        "host path must not cross the adapter protocol boundary"
+    );
+}
+
+#[tokio::test]
+async fn file_write_validation_failure_has_no_adapter_side_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("payload.bin");
+    std::fs::write(&path, [0xaa, 0xbb]).unwrap();
+
+    let concrete = Arc::new(Mutex::new(FakeLink::ok(serde_json::json!({"written": 2}))));
+    let shared: SharedLink = concrete.clone();
+    let srv = Emucap::new(shared);
+    let result = srv
+        .write_memory(Parameters(WriteMemoryArgs {
+            memory_type: "ram".into(),
+            address: Num(0x20),
+            hex: None,
+            input_file: Some(WriteMemoryFileArgs {
+                path: path.to_string_lossy().into_owned(),
+                offset: None,
+                length: Num(2),
+                sha256: Some("0".repeat(64)),
+            }),
+        }))
+        .await;
+
+    assert_eq!(result.is_error, Some(true));
+    assert!(body_text(&result).contains("sha256 mismatch"));
+    let link = concrete.lock().unwrap();
+    assert_eq!(link.last_method, None);
+    assert_eq!(link.last_params, None);
 }

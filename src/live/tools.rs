@@ -165,14 +165,59 @@ pub fn dismiss_failure(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkEr
     Ok(ToolOutput::Json(link.call("dismiss_failure", json!({}))?))
 }
 
+/// A single public memory write stays within the conservative 16 KiB chunk used by the PC-98
+/// bridge, keeping its hex-encoded NDJSON request bounded. Larger changes compose while frozen.
+pub const MAX_WRITE_BYTES: usize = 0x4_000;
+
 pub fn write_memory(
     link: &mut dyn EmulatorLink,
     memory_type: &str,
     address: u64,
     hex: &str,
 ) -> Result<ToolOutput, LinkError> {
-    let params = json!({ "memory_type": memory_type, "address": address, "hex": hex });
+    if hex.is_empty() {
+        return Err(bad_params("hex must contain at least one byte"));
+    }
+    if hex.len() & 1 != 0 {
+        return Err(bad_params("hex must have even length"));
+    }
+    let bytes = hex::decode(hex).map_err(|_| bad_params("hex decode failed"))?;
+    write_memory_bytes(link, memory_type, address, &bytes)
+}
+
+pub fn write_memory_bytes(
+    link: &mut dyn EmulatorLink,
+    memory_type: &str,
+    address: u64,
+    bytes: &[u8],
+) -> Result<ToolOutput, LinkError> {
+    if bytes.is_empty() {
+        return Err(bad_params(
+            "write_memory input must contain at least one byte",
+        ));
+    }
+    if bytes.len() > MAX_WRITE_BYTES {
+        return Err(bad_params(format!(
+            "write_memory input length {:#x} exceeds the {MAX_WRITE_BYTES:#x} byte cap",
+            bytes.len()
+        )));
+    }
+    address
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| bad_params("write_memory address+length overflows"))?;
+    let params = json!({
+        "memory_type": memory_type,
+        "address": address,
+        "hex": hex::encode(bytes),
+    });
     Ok(ToolOutput::Json(link.call("write_memory", params)?))
+}
+
+fn bad_params(message: impl Into<String>) -> LinkError {
+    LinkError::Emulator {
+        kind: "bad_params".into(),
+        message: message.into(),
+    }
 }
 
 pub fn set_input(

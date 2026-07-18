@@ -53,6 +53,34 @@ fn deser_num_int_and_hex_string() {
 }
 
 #[test]
+fn write_memory_accepts_inline_or_file_source_shapes() {
+    let inline: WriteMemoryArgs =
+        serde_json::from_str(r#"{"memory_type":"ram","address":"0x10","hex":"deadbeef"}"#).unwrap();
+    assert_eq!(inline.hex.as_deref(), Some("deadbeef"));
+    assert!(inline.input_file.is_none());
+
+    let file: WriteMemoryArgs = serde_json::from_str(
+        r#"{"memory_type":"ram","address":16,"input_file":{"path":"/path/to/payload.bin","offset":"0x20","length":"0x40","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#,
+    )
+    .unwrap();
+    assert!(file.hex.is_none());
+    let input = file.input_file.unwrap();
+    assert_eq!(input.offset.map(Num::get), Some(0x20));
+    assert_eq!(input.length.get(), 0x40);
+}
+
+#[test]
+fn write_memory_schema_exposes_both_input_sources() {
+    let schema = serde_json::to_string(&schemars::schema_for!(WriteMemoryArgs)).unwrap();
+    for field in ["hex", "input_file", "path", "offset", "length", "sha256"] {
+        assert!(
+            schema.contains(&format!("\"{field}\"")),
+            "write_memory schema must expose {field}: {schema}"
+        );
+    }
+}
+
+#[test]
 fn frame_args_reject_over_cap() {
     // 상한 초과는 deserialize 단계에서 거부(무한 deferred 루프·raw_call wedge 방지, H2).
     let over = MAX_FRAME_ARG + 1;

@@ -70,6 +70,25 @@ fn composites_appear_when_deps_met() {
 }
 
 #[test]
+fn write_memory_exposes_host_input_bounds() {
+    let value = enriched(&["write_memory"]);
+    assert_eq!(
+        value.pointer("/contracts/constraints/memory.write.input_sources"),
+        Some(&serde_json::json!(["hex", "file"]))
+    );
+    assert_eq!(
+        value.pointer("/contracts/constraints/memory.write.max_bytes"),
+        Some(&serde_json::json!(tools::MAX_WRITE_BYTES))
+    );
+    assert_eq!(
+        value.pointer("/contracts/constraints/memory.write.file_load_timeout_ms"),
+        Some(&serde_json::json!(
+            crate::memory_write::FILE_LOAD_TIMEOUT_MS
+        ))
+    );
+}
+
+#[test]
 fn composites_absent_without_deps_and_trace_note_present() {
     // MD류: set_input/step/pause 있으나 probe 없음 → tap O. trace 없음 → 콜체인 역추적 대체 note만.
     let v = enriched(&[

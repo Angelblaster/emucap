@@ -2,6 +2,14 @@
 
 Prerelease software — interfaces may still change.
 
+## Unreleased
+
+### Added
+- `write_memory` accepts a bounded raw-binary `input_file` slice as an alternative to inline hex. The Control MCP snapshots and hashes the slice before contacting the adapter, optionally enforces an expected SHA-256, and returns input provenance with the write result.
+
+### Changed
+- All Control MCP memory writes reject empty, malformed, overflowing, or over-limit payloads before transport. `status.contracts.constraints` reports the accepted input sources, byte cap, and file-load deadline.
+
 ## 0.9.0-alpha.1
 
 ### Fixed

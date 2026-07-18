@@ -109,13 +109,31 @@ fn default_disas_count() -> u64 {
     8
 }
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Debug, Deserialize, JsonSchema)]
+pub(crate) struct WriteMemoryFileArgs {
+    /// 읽을 raw binary 파일의 절대 경로. 에뮬레이터 어댑터가 아니라 제어 MCP가 읽는다.
+    pub(crate) path: String,
+    /// 파일 안에서 읽기 시작할 바이트 오프셋(기본 0).
+    #[serde(default)]
+    pub(crate) offset: Option<Num>,
+    /// 파일에서 읽을 바이트 수. `status.contracts.constraints["memory.write.max_bytes"]` 이하여야 한다.
+    pub(crate) length: Num,
+    /// 선택적 SHA-256 전제조건. 실제 slice의 hash가 다르면 메모리를 바꾸기 전에 거부한다.
+    #[serde(default)]
+    pub(crate) sha256: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub(crate) struct WriteMemoryArgs {
     pub(crate) memory_type: String,
     /// 시작 주소(10진 또는 '0x'/'$' 16진)
     pub(crate) address: Num,
-    /// 쓸 바이트(hex 문자열)
-    pub(crate) hex: String,
+    /// 직접 쓸 바이트(hex 문자열). `input_file`과 정확히 하나만 지정한다.
+    #[serde(default)]
+    pub(crate) hex: Option<String>,
+    /// raw binary 파일 slice. `hex`와 정확히 하나만 지정한다.
+    #[serde(default)]
+    pub(crate) input_file: Option<WriteMemoryFileArgs>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct FindPatternArgs {

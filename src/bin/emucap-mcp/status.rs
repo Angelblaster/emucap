@@ -240,12 +240,26 @@ pub(crate) fn enrich_contract_status(
                 .collect()
         })
         .unwrap_or_default();
-    let contracts = emucap::contracts::validate_advertisement(
+    let mut contracts = emucap::contracts::validate_advertisement(
         advertisement,
         identity.adapter.as_deref(),
         identity.system.as_deref(),
         &methods,
     );
+    if methods.iter().any(|method| method == "write_memory") {
+        contracts.constraints.insert(
+            "memory.write.input_sources".into(),
+            serde_json::json!(["hex", "file"]),
+        );
+        contracts.constraints.insert(
+            "memory.write.max_bytes".into(),
+            serde_json::json!(tools::MAX_WRITE_BYTES),
+        );
+        contracts.constraints.insert(
+            "memory.write.file_load_timeout_ms".into(),
+            serde_json::json!(crate::memory_write::FILE_LOAD_TIMEOUT_MS),
+        );
+    }
     if contracts.state == "validated" {
         add_composite_methods(v, &contracts);
     }

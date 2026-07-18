@@ -377,6 +377,24 @@ fn write_memory_forwards() {
 }
 
 #[test]
+fn write_memory_rejects_invalid_or_oversized_payload_before_transport() {
+    for hex in ["", "0", "zz"] {
+        let mut link = FakeLink::ok(json!({"written":0}));
+        assert!(write_memory(&mut link, "ram", 0, hex).is_err());
+        assert_eq!(link.last_method, None);
+    }
+
+    let mut link = FakeLink::ok(json!({"written":0}));
+    let oversized = vec![0u8; MAX_WRITE_BYTES + 1];
+    assert!(write_memory_bytes(&mut link, "ram", 0, &oversized).is_err());
+    assert_eq!(link.last_method, None);
+
+    let mut link = FakeLink::ok(json!({"written":0}));
+    assert!(write_memory_bytes(&mut link, "ram", u64::MAX, &[1]).is_err());
+    assert_eq!(link.last_method, None);
+}
+
+#[test]
 fn press_buttons_forwards_list_and_frames() {
     let mut link = FakeLink::ok(json!({"status":"completed"}));
     press_buttons(&mut link, 0, &["a".into(), "start".into()], 10).unwrap();
