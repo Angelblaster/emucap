@@ -10,6 +10,8 @@
 // 띄운다. EMUCAP_SESSION_TOKEN / EMUCAP_NAME / EMUCAP_CONTENT 를 hello 에 실어 보낸다.
 #pragma once
 
+#include "Common/CommonTypes.h"
+
 struct GCPadStatus;
 
 namespace Core
@@ -28,4 +30,8 @@ void Stop();
 // GCPad::GetStatus 폴 지점에서 호출. 해당 패드에 set_input 오버라이드가 걸려 있으면
 // status 를 덮어쓴다(결정론적 입력 주입). 걸려 있지 않으면 무동작.
 void ApplyInputOverride(int pad_num, GCPadStatus* status);
+
+// Called by the PowerPC breakpoint handler after it has confirmed a real hit.
+// The adapter filters this against breakpoints registered through emucap.
+void NotifyBreakpointHit(u32 address);
 }  // namespace EmuCap

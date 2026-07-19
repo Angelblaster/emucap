@@ -41,6 +41,7 @@ git -C "$SRC" checkout -- \
   Source/Core/Core/CMakeLists.txt \
   Source/Core/Core/Core.cpp \
   Source/Core/Core/HW/GCPad.cpp \
+  Source/Core/Core/PowerPC/PowerPC.cpp \
   Source/Core/DolphinLib.props
 git -C "$SRC" clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"

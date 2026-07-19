@@ -59,9 +59,9 @@ std::atomic<bool> s_started{false};
 std::mutex s_ev_mutex;
 std::deque<picojson::value> s_events;
 
+std::mutex s_bp_mutex;
 std::map<int, u32> s_breakpoints;  // id -> address
 int s_next_bp = 1;
-bool s_bp_reported = false;  // 현재 halt에 대해 이미 breakpoint_hit 를 보고했는지
 std::string s_handler_error;
 
 // set_input 오버라이드(패드별). engaged면 GCPad::GetStatus 결과를 이 값으로 덮는다.
@@ -255,9 +255,12 @@ picojson::object Status(Core::System& system, const picojson::object&)
   r["dbg_config"] = picojson::value(Config::Get(Config::MAIN_ENABLE_DEBUGGING));
   r["dbg_effective"] = picojson::value(Config::IsDebuggingEnabled());
   r["cpu_core"] = picojson::value(static_cast<double>(static_cast<int>(Config::Get(Config::MAIN_CPU_CORE))));
-  const auto& bps = system.GetPowerPC().GetBreakPoints();
-  r["breaking_enabled"] = picojson::value(bps.IsBreakingEnabled());
-  r["dolphin_bp_count"] = picojson::value(static_cast<double>(bps.GetBreakPoints().size()));
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    r["breaking_enabled"] = picojson::value(true);
+    r["dolphin_bp_count"] =
+        picojson::value(static_cast<double>(s_breakpoints.size()));
+  }
   return r;
 }
 
@@ -351,15 +354,20 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
   uint64_t addr = 0;
   if (!GetU64(p, "start", addr))
     return Fail("start required");
+  const int id = s_next_bp++;
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    s_breakpoints[id] = static_cast<u32>(addr);
+  }
   {
     SafeAccess sa(system);
-    system.GetPowerPC().GetBreakPoints().Add(static_cast<u32>(addr));
+    auto& breakpoints = system.GetPowerPC().GetBreakPoints();
+    breakpoints.EnableBreaking(true);
+    breakpoints.Add(static_cast<u32>(addr));
     // 캐시된 블록(JIT·CachedInterpreter)에는 BP 체크가 컴파일돼 있지 않으므로, 전체 캐시를
     // 비워 재컴파일 시 체크가 삽입되게 한다(4바이트 InvalidateICache 만으로는 불충분).
     system.GetJitInterface().ClearCache(sa.guard);
   }
-  const int id = s_next_bp++;
-  s_breakpoints[id] = static_cast<u32>(addr);
   picojson::object r;
   r["id"] = picojson::value(static_cast<double>(id));
   return r;
@@ -370,15 +378,35 @@ picojson::object ClearBreakpoint(Core::System& system, const picojson::object& p
   uint64_t id = 0;
   if (!GetU64(p, "id", id))
     return Fail("id required");
-  auto it = s_breakpoints.find(static_cast<int>(id));
-  if (it == s_breakpoints.end())
-    return Fail("breakpoint not found");
+  u32 address = 0;
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    const auto it = s_breakpoints.find(static_cast<int>(id));
+    if (it == s_breakpoints.end())
+      return Fail("breakpoint not found");
+    address = it->second;
+  }
   {
     SafeAccess sa(system);
-    system.GetPowerPC().GetBreakPoints().Remove(it->second);
-    system.GetJitInterface().ClearCache(sa.guard);
+    bool address_still_used = false;
+    {
+      std::lock_guard<std::mutex> lk(s_bp_mutex);
+      s_breakpoints.erase(static_cast<int>(id));
+      for (const auto& entry : s_breakpoints)
+      {
+        if (entry.second == address)
+        {
+          address_still_used = true;
+          break;
+        }
+      }
+    }
+    if (!address_still_used)
+    {
+      system.GetPowerPC().GetBreakPoints().Remove(address);
+      system.GetJitInterface().ClearCache(sa.guard);
+    }
   }
-  s_breakpoints.erase(it);
   picojson::object r;
   r["cleared"] = picojson::value(static_cast<double>(id));
   return r;
@@ -387,6 +415,7 @@ picojson::object ClearBreakpoint(Core::System& system, const picojson::object& p
 picojson::object ListBreakpoints(Core::System&, const picojson::object&)
 {
   picojson::array bps;
+  std::lock_guard<std::mutex> lk(s_bp_mutex);
   for (const auto& [id, addr] : s_breakpoints)
   {
     picojson::object b;
@@ -401,46 +430,8 @@ picojson::object ListBreakpoints(Core::System&, const picojson::object&)
   return r;
 }
 
-picojson::object PollEvents(Core::System& system, const picojson::object&)
+picojson::object PollEvents(Core::System&, const picojson::object&)
 {
-  // BP-히트 감지. 주의: read_memory/get_state가 쓰는 CPUThreadGuard(PauseAndLock)도 코어를
-  // 잠깐 State::Stepping 으로 만든다. 그래서 단순 stepping 에지는 오탐/누락이 난다.
-  // 코어가 halt(stepping) 이고 PC가 우리가 등록한 BP 주소일 때만 진짜 히트로 본다
-  // (CheckBreakpoint가 halt 직전 ppc_state.pc = current_pc 로 맞추므로 PC == BP 주소).
-  // 에지(!s_prev_stepping) 방식은 pause/step/CPUThreadGuard 가 IsStepping 을 true 로 만들면
-  // s_prev 가 고착돼 진짜 히트의 상승 에지를 놓친다. 대신 "코어가 halt 이고 PC 가 등록된 BP
-  // 주소면 이 halt 당 한 번만 보고"한다(에지 무의존). 코어가 다시 running 이 되면 리셋.
-  const bool stepping = system.GetCPU().IsStepping();
-  if (stepping)
-  {
-    u32 pc = 0;
-    {
-      SafeAccess sa(system);
-      pc = system.GetPPCState().pc;
-    }
-    bool at_bp = false;
-    for (const auto& [bp_id, bp_addr] : s_breakpoints)
-    {
-      if (bp_addr == pc)
-      {
-        at_bp = true;
-        break;
-      }
-    }
-    if (at_bp && !s_bp_reported)
-    {
-      picojson::object ev;
-      ev["type"] = picojson::value(std::string("breakpoint_hit"));
-      ev["pc"] = picojson::value(static_cast<double>(pc));
-      PushEvent(picojson::value(ev));
-      s_bp_reported = true;
-    }
-  }
-  else
-  {
-    s_bp_reported = false;
-  }
-
   picojson::array out;
   {
     std::lock_guard<std::mutex> lk(s_ev_mutex);
@@ -688,6 +679,30 @@ void ApplyInputOverride(int pad_num, GCPadStatus* status)
   std::lock_guard<std::mutex> lk(s_input_mutex);
   if (s_input[pad_num].engaged)
     *status = s_input[pad_num].status;
+}
+
+void NotifyBreakpointHit(u32 address)
+{
+  std::vector<int> ids;
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    for (const auto& [id, breakpoint_address] : s_breakpoints)
+    {
+      if (breakpoint_address == address)
+        ids.push_back(id);
+    }
+  }
+
+  for (const int id : ids)
+  {
+    picojson::object event;
+    event["type"] = picojson::value(std::string("breakpoint_hit"));
+    event["breakpoint_id"] = picojson::value(static_cast<double>(id));
+    event["kind"] = picojson::value(std::string("exec"));
+    event["address"] = picojson::value(static_cast<double>(address));
+    event["pc"] = picojson::value(static_cast<double>(address));
+    PushEvent(picojson::value(event));
+  }
 }
 
 void Start(Core::System& system)
