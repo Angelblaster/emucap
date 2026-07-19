@@ -40,12 +40,16 @@ git -C "$SRC" config -f .gitmodules --get-regexp path |
 git -C "$SRC" checkout -- \
   Source/Core/Core/CMakeLists.txt \
   Source/Core/Core/Core.cpp \
+  Source/Core/Core/Core.h \
+  Source/Core/Core/HW/CPU.cpp \
+  Source/Core/Core/HW/CPU.h \
   Source/Core/Core/HW/GCPad.cpp \
   Source/Core/Core/PowerPC/PowerPC.cpp \
   Source/Core/Core/State.cpp \
   Source/Core/Core/State.h \
   Source/Core/VideoCommon/FrameDumper.cpp \
   Source/Core/VideoCommon/FrameDumper.h \
+  Source/Core/DolphinQt/Settings.cpp \
   Source/Core/DolphinLib.props
 git -C "$SRC" clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"

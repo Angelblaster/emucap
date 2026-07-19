@@ -8,8 +8,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cctype>
+#include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -17,6 +20,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -42,11 +46,14 @@ using SOCKET = int;
 #include "Common/SocketContext.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
+#include "Core/Debugger/Debugger_SymbolMap.h"
+#include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/JitInterface.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/State.h"
 #include "Core/System.h"
@@ -73,6 +80,15 @@ int s_next_bp = 1;
 std::atomic<u64> s_file_sequence{0};
 std::string s_handler_error_kind;
 std::string s_handler_error;
+
+constexpr uint64_t MAX_SYNC_ADVANCE_COUNT = 15;
+constexpr uint64_t MAX_MEMORY_READ_BYTES = 16 * 1024 * 1024;
+constexpr uint64_t MAX_MEMORY_WRITE_BYTES = 16 * 1024;
+
+std::mutex s_frame_step_mutex;
+std::condition_variable s_frame_step_cv;
+u64 s_frame_step_completions = 0;
+u64 s_breakpoint_interruptions = 0;
 
 // Per-controller set_input override. An engaged override replaces GCPad::GetStatus output.
 std::mutex s_input_mutex;
@@ -187,13 +203,41 @@ bool GetU64(const picojson::object& p, const char* key, uint64_t& out)
     return false;
   if (it->second.is<double>())
   {
-    out = static_cast<uint64_t>(it->second.get<double>());
+    const double value = it->second.get<double>();
+    if (!std::isfinite(value) || value < 0 || std::floor(value) != value ||
+        value >= 18446744073709551616.0)
+    {
+      return false;
+    }
+    out = static_cast<uint64_t>(value);
     return true;
   }
   if (it->second.is<std::string>())
   {
     const std::string& s = it->second.get<std::string>();
-    out = std::strtoull(s.c_str(), nullptr, s.rfind("0x", 0) == 0 ? 16 : 0);
+    if (s.empty() || s.front() == '+' || s.front() == '-')
+      return false;
+    size_t offset = 0;
+    int base = 10;
+    if (s.front() == '$')
+    {
+      offset = 1;
+      base = 16;
+    }
+    else if (s.size() >= 2 && s.front() == '0' && (s[1] == 'x' || s[1] == 'X'))
+    {
+      offset = 2;
+      base = 16;
+    }
+    if (offset == s.size())
+      return false;
+    errno = 0;
+    char* end = nullptr;
+    const char* begin = s.c_str() + offset;
+    const unsigned long long value = std::strtoull(begin, &end, base);
+    if (errno == ERANGE || end == begin || *end != '\0')
+      return false;
+    out = static_cast<uint64_t>(value);
     return true;
   }
   return false;
@@ -237,6 +281,28 @@ struct SafeAccess
   explicit SafeAccess(Core::System& sys) : system(sys), guard(sys) {}
 };
 
+picojson::object CpuState(const auto& ppc)
+{
+  picojson::object state;
+  state["cpu.pc"] = picojson::value(static_cast<double>(ppc.pc));
+  for (int i = 0; i < 32; ++i)
+    state["cpu.r" + std::to_string(i)] = picojson::value(static_cast<double>(ppc.gpr[i]));
+  state["cpu.lr"] = picojson::value(static_cast<double>(ppc.spr[SPR_LR]));
+  state["cpu.ctr"] = picojson::value(static_cast<double>(ppc.spr[SPR_CTR]));
+  state["cpu.xer"] = picojson::value(static_cast<double>(ppc.spr[SPR_XER]));
+  state["cpu.msr"] = picojson::value(static_cast<double>(ppc.msr.Hex));
+  state["cpu.cr"] = picojson::value(static_cast<double>(ppc.cr.Get()));
+  return state;
+}
+
+void AddExecutionLimits(picojson::object& result)
+{
+  picojson::object limits;
+  limits["max_sync_advance_count"] =
+      picojson::value(static_cast<double>(MAX_SYNC_ADVANCE_COUNT));
+  result["execution_limits"] = picojson::value(limits);
+}
+
 picojson::object Hello(Core::System&, const picojson::object&)
 {
   const std::string system = EnvOr("EMUCAP_SYSTEM", "gamecube");
@@ -249,8 +315,9 @@ picojson::object Hello(Core::System&, const picojson::object&)
   picojson::array methods;
   for (const char* m :
        {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
-        "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
-        "poll_events", "save_state", "load_state", "screenshot"})
+        "step", "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
+        "clear_all_breakpoints", "poll_events", "disassemble", "call_stack", "save_state",
+        "load_state", "screenshot"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
@@ -259,9 +326,9 @@ picojson::object Hello(Core::System&, const picojson::object&)
   r["methods"] = picojson::value(methods);
   picojson::array active_exceptions;
   for (const char* id :
-       {"dolphin.execution.frame-step-absent", "dolphin.breakpoint.exact-exec-only",
-        "dolphin.state-save.frozen-only", "dolphin.state-load.frozen-only",
-        "dolphin.screenshot.running-only"})
+       {"dolphin.breakpoint.exact-exec-only", "dolphin.state-save.frozen-only",
+        "dolphin.state-load.frozen-only", "dolphin.screenshot.running-only",
+        "dolphin.call-stack.best-effort"})
   {
     active_exceptions.push_back(picojson::value(std::string(id)));
   }
@@ -275,9 +342,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
       picojson::value(std::string("emucap-feature-contracts/v3"));
   contracts["active_exceptions"] = picojson::value(active_exceptions);
   r["contracts"] = picojson::value(contracts);
-  picojson::object limits;
-  limits["max_sync_advance_count"] = picojson::value(10000.0);
-  r["execution_limits"] = picojson::value(limits);
+  AddExecutionLimits(r);
   picojson::array mt;
   mt.push_back(picojson::value(std::string("main")));
   r["memory_types"] = picojson::value(mt);
@@ -312,6 +377,17 @@ picojson::object Status(Core::System& system, const picojson::object&)
     r["dolphin_bp_count"] =
         picojson::value(static_cast<double>(s_breakpoints.size()));
   }
+  {
+    std::lock_guard<std::mutex> lk(s_input_mutex);
+    picojson::object input_override;
+    input_override["observable"] = picojson::value(true);
+    input_override["authority"] = picojson::value(std::string("adapter_local"));
+    input_override["engaged"] = picojson::value(s_input[0].engaged);
+    input_override["mode"] =
+        picojson::value(std::string(s_input[0].engaged ? "persistent" : "native"));
+    r["input_override"] = picojson::value(input_override);
+  }
+  AddExecutionLimits(r);
   return r;
 }
 
@@ -319,10 +395,20 @@ picojson::object ReadMemory(Core::System& system, const picojson::object& p)
 {
   uint64_t addr = 0, len = 0;
   if (!GetU64(p, "address", addr) || !GetU64(p, "length", len))
-    return Fail("address/length required");
+    return Fail("bad_params", "read_memory requires integer address and length");
+  if (addr > UINT32_MAX || len > MAX_MEMORY_READ_BYTES ||
+      len > 0x100000000ULL - addr)
+  {
+    return Fail("bad_params", "read_memory range is outside the bounded 32-bit memory space");
+  }
   std::vector<uint8_t> buf(static_cast<size_t>(len));
   {
     SafeAccess sa(system);
+    if (len != 0 &&
+        system.GetMemory().GetPointerForRange(static_cast<u32>(addr), buf.size()) == nullptr)
+    {
+      return Fail("bad_params", "read_memory range is not mapped Dolphin memory");
+    }
     system.GetMemory().CopyFromEmu(buf.data(), static_cast<u32>(addr), buf.size());
   }
   picojson::object r;
@@ -335,12 +421,22 @@ picojson::object WriteMemory(Core::System& system, const picojson::object& p)
   uint64_t addr = 0;
   auto it = p.find("hex");
   if (!GetU64(p, "address", addr) || it == p.end() || !it->second.is<std::string>())
-    return Fail("address/hex required");
+    return Fail("bad_params", "write_memory requires an integer address and hex bytes");
   std::vector<uint8_t> data;
   if (!FromHex(it->second.get<std::string>(), data))
-    return Fail("invalid hex");
+    return Fail("bad_params", "write_memory hex must contain complete hexadecimal bytes");
+  if (addr > UINT32_MAX || data.size() > MAX_MEMORY_WRITE_BYTES ||
+      data.size() > 0x100000000ULL - addr)
+  {
+    return Fail("bad_params", "write_memory range is outside the bounded 32-bit memory space");
+  }
   {
     SafeAccess sa(system);
+    if (!data.empty() &&
+        system.GetMemory().GetPointerForRange(static_cast<u32>(addr), data.size()) == nullptr)
+    {
+      return Fail("bad_params", "write_memory range is not mapped Dolphin memory");
+    }
     system.GetMemory().CopyToEmu(static_cast<u32>(addr), data.data(), data.size());
   }
   picojson::object r;
@@ -353,18 +449,82 @@ picojson::object GetState(Core::System& system, const picojson::object&)
   picojson::object state;
   {
     SafeAccess sa(system);
-    const auto& ppc = system.GetPPCState();
-    state["cpu.pc"] = picojson::value(static_cast<double>(ppc.pc));
-    for (int i = 0; i < 32; ++i)
-      state["cpu.r" + std::to_string(i)] = picojson::value(static_cast<double>(ppc.gpr[i]));
-    state["cpu.lr"] = picojson::value(static_cast<double>(ppc.spr[SPR_LR]));
-    state["cpu.ctr"] = picojson::value(static_cast<double>(ppc.spr[SPR_CTR]));
-    state["cpu.xer"] = picojson::value(static_cast<double>(ppc.spr[SPR_XER]));
-    state["cpu.msr"] = picojson::value(static_cast<double>(ppc.msr.Hex));
-    state["cpu.cr"] = picojson::value(static_cast<double>(ppc.cr.Get()));
+    state = CpuState(system.GetPPCState());
   }
   picojson::object r;
   r["state"] = picojson::value(state);
+  return r;
+}
+
+picojson::object Disassemble(Core::System& system, const picojson::object& p)
+{
+  uint64_t address = 0;
+  uint64_t count = 8;
+  if (!GetU64(p, "address", address))
+    return Fail("bad_params", "disassemble requires an address");
+  if (p.count("count") && !GetU64(p, "count", count))
+    return Fail("bad_params", "disassemble count must be an integer");
+  if (address > UINT32_MAX || (address & 3) != 0)
+    return Fail("bad_params", "PowerPC disassembly address must be an aligned 32-bit address");
+  if (count == 0 || count > 256)
+    return Fail("bad_params", "disassemble count must be in 1..256");
+  if (address + (count - 1) * 4 > UINT32_MAX)
+    return Fail("bad_params", "disassemble range exceeds the 32-bit address space");
+
+  picojson::array instructions;
+  {
+    SafeAccess sa(system);
+    const auto& debug = system.GetPowerPC().GetDebugInterface();
+    for (uint64_t index = 0; index < count; ++index)
+    {
+      const u32 current = static_cast<u32>(address + index * 4);
+      if (!PowerPC::MMU::HostIsRAMAddress(sa.guard, current))
+        return Fail("bad_params", "disassemble address is not mapped PowerPC RAM");
+      const u32 opcode = debug.ReadInstruction(sa.guard, current);
+      const uint8_t bytes[] = {
+          static_cast<uint8_t>(opcode >> 24),
+          static_cast<uint8_t>(opcode >> 16),
+          static_cast<uint8_t>(opcode >> 8),
+          static_cast<uint8_t>(opcode),
+      };
+      picojson::object instruction;
+      instruction["addr"] = picojson::value(static_cast<double>(current));
+      instruction["bytes"] = picojson::value(ToHex(bytes, sizeof(bytes)));
+      instruction["text"] = picojson::value(debug.Disassemble(&sa.guard, current));
+      instructions.push_back(picojson::value(instruction));
+    }
+  }
+
+  picojson::object r;
+  r["instructions"] = picojson::value(instructions);
+  return r;
+}
+
+picojson::object CallStack(Core::System& system, const picojson::object&)
+{
+  std::vector<Dolphin_Debugger::CallstackEntry> entries;
+  bool valid = false;
+  {
+    SafeAccess sa(system);
+    valid = Dolphin_Debugger::GetCallstack(sa.guard, entries);
+  }
+
+  picojson::array frames;
+  for (auto entry = entries.rbegin(); entry != entries.rend(); ++entry)
+  {
+    picojson::object frame;
+    frame["pc"] = picojson::value(static_cast<double>(entry->vAddress));
+    std::string text = entry->Name;
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r'))
+      text.pop_back();
+    frame["text"] = picojson::value(text);
+    frames.push_back(picojson::value(frame));
+  }
+
+  picojson::object r;
+  r["call_stack"] = picojson::value(frames);
+  r["depth"] = picojson::value(static_cast<double>(entries.size()));
+  r["valid"] = picojson::value(valid);
   return r;
 }
 
@@ -388,9 +548,9 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
 {
   uint64_t count = 1;
   if (p.count("count") && !GetU64(p, "count", count))
-    return Fail("count must be an integer");
-  if (count == 0 || count > 10000)
-    return Fail("count must be in 1..10000");
+    return Fail("bad_params", "count must be an integer");
+  if (count == 0 || count > MAX_SYNC_ADVANCE_COUNT)
+    return Fail("bad_params", "instruction count must be in 1..15");
 
   auto& cpu = system.GetCPU();
   cpu.SetStepping(true);
@@ -398,22 +558,130 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
   const PowerPC::CoreMode old_mode = power_pc.GetMode();
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
   bool completed_all = true;
+  bool can_restore_mode = true;
   for (uint64_t i = 0; i < count; ++i)
   {
     Common::Event completed;
     cpu.StepOpcode(&completed);
     if (!completed.WaitFor(std::chrono::seconds(1)))
     {
+      can_restore_mode = cpu.CancelStepOpcode(&completed);
       completed_all = false;
       break;
     }
   }
-  power_pc.SetMode(old_mode);
+  if (can_restore_mode)
+    power_pc.SetMode(old_mode);
   if (!completed_all)
     return Fail("instruction step did not complete within 1 second");
   picojson::object r;
   r["status"] = picojson::value(std::string("completed"));
   r["count"] = picojson::value(static_cast<double>(count));
+  r["state"] = picojson::value(std::string("frozen"));
+  return r;
+}
+
+picojson::object StepFrames(Core::System& system, const picojson::object& p)
+{
+  uint64_t count = 1;
+  if (p.count("frames"))
+  {
+    if (!GetU64(p, "frames", count))
+      return Fail("bad_params", "frames must be an integer");
+  }
+  else if (p.count("count") && !GetU64(p, "count", count))
+  {
+    return Fail("bad_params", "count must be an integer");
+  }
+  if (count == 0 || count > MAX_SYNC_ADVANCE_COUNT)
+    return Fail("bad_params", "frame count must be in 1..15");
+  if (Core::GetState(system) != Core::State::Paused)
+    return Fail("bad_state", "frame step requires a frozen core");
+
+  struct FrameStart
+  {
+    Common::Event dispatched;
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> accepted{false};
+  };
+  const auto cancel_frame_step = [] {
+    auto cancelled = std::make_shared<Common::Event>();
+    Core::QueueHostJob([cancelled](Core::System& host_system) {
+      Core::CancelFrameStep(host_system);
+      cancelled->Set();
+    });
+    return cancelled->WaitFor(std::chrono::seconds(1));
+  };
+
+  const auto operation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  uint64_t completed = 0;
+  for (; completed < count; ++completed)
+  {
+    u64 completion_before = 0;
+    u64 interruption_before = 0;
+    {
+      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+      completion_before = s_frame_step_completions;
+      interruption_before = s_breakpoint_interruptions;
+    }
+
+    auto start = std::make_shared<FrameStart>();
+    Core::QueueHostJob([start](Core::System& host_system) {
+      if (!start->cancelled.load())
+        start->accepted.store(Core::DoFrameStep(host_system));
+      start->dispatched.Set();
+    });
+
+    const auto dispatch_remaining = operation_deadline - std::chrono::steady_clock::now();
+    if (dispatch_remaining <= std::chrono::steady_clock::duration::zero() ||
+        !start->dispatched.WaitFor(
+            std::min(std::chrono::duration_cast<std::chrono::milliseconds>(dispatch_remaining),
+                     std::chrono::milliseconds(1000))))
+    {
+      start->cancelled.store(true);
+      if (!cancel_frame_step())
+      {
+        return Fail("timeout",
+                    "frame step dispatch timed out and cleanup did not complete on the host thread");
+      }
+      return Fail("timeout", "frame step was not dispatched before the operation deadline");
+    }
+    if (!start->accepted.load())
+      return Fail("bad_state", "Dolphin did not accept frame step from the frozen state");
+
+    std::unique_lock<std::mutex> lock(s_frame_step_mutex);
+    const auto completion_deadline =
+        std::min(operation_deadline, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    const bool signaled = s_frame_step_cv.wait_until(lock, completion_deadline, [&] {
+      return s_frame_step_completions != completion_before ||
+             s_breakpoint_interruptions != interruption_before || s_stop.load();
+    });
+    const bool frame_completed = s_frame_step_completions != completion_before;
+    const bool interrupted = s_breakpoint_interruptions != interruption_before;
+    lock.unlock();
+
+    if (frame_completed)
+      continue;
+
+    if (!cancel_frame_step())
+      return Fail("timeout", "frame step stopped but cleanup did not complete on the host thread");
+    if (interrupted)
+    {
+      picojson::object r;
+      r["status"] = picojson::value(std::string("interrupted"));
+      r["count"] = picojson::value(static_cast<double>(completed));
+      r["requested"] = picojson::value(static_cast<double>(count));
+      r["state"] = picojson::value(std::string("frozen"));
+      return r;
+    }
+    if (!signaled || std::chrono::steady_clock::now() >= operation_deadline)
+      return Fail("timeout", "frame step did not reach a new presented frame");
+    return Fail("not_connected", "Dolphin stopped while frame step was in progress");
+  }
+
+  picojson::object r;
+  r["status"] = picojson::value(std::string("completed"));
+  r["count"] = picojson::value(static_cast<double>(completed));
   r["state"] = picojson::value(std::string("frozen"));
   return r;
 }
@@ -434,6 +702,8 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
     return Fail("bad_params", "end must be an integer");
   if (end != addr)
     return Fail("bad_params", "only exact-address breakpoints are supported");
+  if (addr > UINT32_MAX || (addr & 3) != 0)
+    return Fail("bad_params", "PowerPC exec breakpoint address must be aligned and 32-bit");
   const auto pause_it = p.find("pause_on_hit");
   if (pause_it != p.end() &&
       (!pause_it->second.is<bool>() || !pause_it->second.get<bool>()))
@@ -528,6 +798,35 @@ picojson::object ListBreakpoints(Core::System&, const picojson::object&)
   return r;
 }
 
+picojson::object ClearAllBreakpoints(Core::System& system, const picojson::object&)
+{
+  std::vector<u32> addresses;
+  size_t cleared = 0;
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    cleared = s_breakpoints.size();
+    addresses.reserve(s_breakpoints.size());
+    for (const auto& [id, address] : s_breakpoints)
+    {
+      (void)id;
+      if (std::find(addresses.begin(), addresses.end(), address) == addresses.end())
+        addresses.push_back(address);
+    }
+    s_breakpoints.clear();
+  }
+  {
+    SafeAccess sa(system);
+    auto& breakpoints = system.GetPowerPC().GetBreakPoints();
+    for (const u32 address : addresses)
+      breakpoints.Remove(address);
+    if (!addresses.empty())
+      system.GetJitInterface().ClearCache(sa.guard);
+  }
+  picojson::object r;
+  r["cleared"] = picojson::value(static_cast<double>(cleared));
+  return r;
+}
+
 picojson::object PollEvents(Core::System&, const picojson::object&)
 {
   picojson::array out;
@@ -615,14 +914,23 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
 {
   int port = 0;
   uint64_t v = 0;
-  if (GetU64(p, "port", v) || GetU64(p, "pad", v))
+  const char* port_field = p.count("port") ? "port" : (p.count("pad") ? "pad" : nullptr);
+  if (port_field)
+  {
+    if (!GetU64(p, port_field, v))
+      return Fail("bad_params", "controller port must be an integer");
+    if (v > 3)
+      return Fail("bad_params", "controller port must be in 0..3");
     port = static_cast<int>(v);
+  }
   if (port != 0)
     return Fail("bad_params", "only controller port 0 is supported");
 
   std::lock_guard<std::mutex> lk(s_input_mutex);
   auto engaged = p.find("engaged");
   const auto buttons = p.find("buttons");
+  if (buttons != p.end() && !buttons->second.is<picojson::array>())
+    return Fail("bad_params", "buttons must be an array");
   const bool empty_buttons =
       buttons != p.end() && buttons->second.is<picojson::array>() &&
       buttons->second.get<picojson::array>().empty();
@@ -651,12 +959,20 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
     }
     st.button = bits;
   }
-  if (GetU64(p, "stickX", v)) st.stickX = static_cast<u8>(v);
-  if (GetU64(p, "stickY", v)) st.stickY = static_cast<u8>(v);
-  if (GetU64(p, "substickX", v)) st.substickX = static_cast<u8>(v);
-  if (GetU64(p, "substickY", v)) st.substickY = static_cast<u8>(v);
-  if (GetU64(p, "triggerL", v)) st.triggerLeft = static_cast<u8>(v);
-  if (GetU64(p, "triggerR", v)) st.triggerRight = static_cast<u8>(v);
+  const auto set_axis = [&](const char* name, u8& destination) {
+    if (!p.count(name))
+      return true;
+    if (!GetU64(p, name, v) || v > UINT8_MAX)
+      return false;
+    destination = static_cast<u8>(v);
+    return true;
+  };
+  if (!set_axis("stickX", st.stickX) || !set_axis("stickY", st.stickY) ||
+      !set_axis("substickX", st.substickX) || !set_axis("substickY", st.substickY) ||
+      !set_axis("triggerL", st.triggerLeft) || !set_axis("triggerR", st.triggerRight))
+  {
+    return Fail("bad_params", "controller axes and triggers must be integers in 0..255");
+  }
   s_input[port].status = st;
   s_input[port].engaged = true;
 
@@ -746,12 +1062,16 @@ Handler Lookup(const std::string& m)
   if (m == "read_memory") return ReadMemory;
   if (m == "write_memory") return WriteMemory;
   if (m == "get_state") return GetState;
+  if (m == "disassemble") return Disassemble;
+  if (m == "call_stack") return CallStack;
   if (m == "pause") return Pause;
   if (m == "resume") return Resume;
+  if (m == "step") return StepFrames;
   if (m == "step_instructions") return StepInstructions;
   if (m == "set_breakpoint") return SetBreakpoint;
   if (m == "clear_breakpoint") return ClearBreakpoint;
   if (m == "list_breakpoints") return ListBreakpoints;
+  if (m == "clear_all_breakpoints") return ClearAllBreakpoints;
   if (m == "poll_events") return PollEvents;
   if (m == "save_state") return SaveState;
   if (m == "load_state") return LoadState;
@@ -893,7 +1213,7 @@ void ApplyInputOverride(int pad_num, GCPadStatus* status)
     *status = s_input[pad_num].status;
 }
 
-void NotifyBreakpointHit(u32 address)
+void NotifyBreakpointHit(Core::System& system, u32 address)
 {
   std::vector<int> ids;
   {
@@ -913,8 +1233,26 @@ void NotifyBreakpointHit(u32 address)
     event["kind"] = picojson::value(std::string("exec"));
     event["address"] = picojson::value(static_cast<double>(address));
     event["pc"] = picojson::value(static_cast<double>(address));
+    event["registers"] = picojson::value(CpuState(system.GetPPCState()));
     PushEvent(picojson::value(event));
   }
+  if (!ids.empty())
+  {
+    {
+      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+      ++s_breakpoint_interruptions;
+    }
+    s_frame_step_cv.notify_all();
+  }
+}
+
+void NotifyFrameStepComplete()
+{
+  {
+    std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+    ++s_frame_step_completions;
+  }
+  s_frame_step_cv.notify_all();
 }
 
 void Start(Core::System& system)
@@ -937,6 +1275,7 @@ void Start(Core::System& system)
 void Stop()
 {
   s_stop.store(true);
+  s_frame_step_cv.notify_all();
   {
     std::lock_guard<std::mutex> lk(s_socket_mutex);
     if (s_active_socket != INVALID_SOCKET)

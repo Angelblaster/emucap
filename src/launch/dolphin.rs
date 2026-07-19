@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::spec::{dolphin_spec, SpecOpts};
 
-pub const REQUIRED_HOST_API: u32 = 1;
+pub const REQUIRED_HOST_API: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -223,11 +223,40 @@ pub struct PreparedRuntime {
     pub user_dir: PathBuf,
 }
 
+fn prepare_owned_directories(
+    home: &Path,
+    runtime_dir: &Path,
+    user_dir: &Path,
+) -> std::io::Result<()> {
+    let base = super::emu_home_base();
+    let reject_symlinks = || {
+        for path in [home, runtime_dir, user_dir] {
+            if super::has_symlink_component_under(&base, path) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "portable Dolphin directory contains a symlink, refusing to launch: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    };
+
+    // Dolphin writes configuration, saves, cache data, and GUI state below --user. Check both
+    // before and after creation so an existing redirect cannot escape the emucap-owned tree.
+    reject_symlinks()?;
+    std::fs::create_dir_all(runtime_dir)?;
+    std::fs::create_dir_all(user_dir)?;
+    reject_symlinks()
+}
+
 pub fn prepare_runtime_binary(source_binary: &Path, port: u16) -> std::io::Result<PreparedRuntime> {
     let home = super::emu_home_dir("dolphin", port);
     let runtime_dir = home.join("runtime");
     let user_dir = home.join("user");
-    std::fs::create_dir_all(&user_dir)?;
+    prepare_owned_directories(&home, &runtime_dir, &user_dir)?;
 
     if source_binary.starts_with(&home) {
         if super::has_symlink_component_under(&home, source_binary) {

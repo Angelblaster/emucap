@@ -1,0 +1,14 @@
+diff --git a/Source/Core/Core/Core.h b/Source/Core/Core/Core.h
+index 7dff8e1..7cbdb14 100644
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -184,5 +184,6 @@ void HostDispatchJobs(Core::System& system);
+ void HostDispatchJobs(Core::System& system);
+-
+-void DoFrameStep(Core::System& system);
+-
++
++bool DoFrameStep(Core::System& system);
++void CancelFrameStep(Core::System& system);
++
+ void UpdateInputGate(bool require_focus, bool require_full_focus = false);

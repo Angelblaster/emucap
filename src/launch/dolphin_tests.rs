@@ -158,3 +158,51 @@ fn runtime_refuses_symlinked_binary_inside_owned_home() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(&target).unwrap(), b"user dolphin");
 }
+
+#[cfg(unix)]
+#[test]
+fn runtime_refuses_symlinked_user_directory_without_touching_target() {
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let source = tempfile::tempdir().unwrap();
+    let emu_home = tempfile::tempdir().unwrap();
+    let real_user = tempfile::tempdir().unwrap();
+    let marker = real_user.path().join("Dolphin.ini");
+    std::fs::write(&marker, b"user settings").unwrap();
+    let binary = source.path().join("dolphin-emu-nogui");
+    std::fs::write(&binary, b"fake dolphin").unwrap();
+    make_executable(&binary);
+    let home = emu_home.path().join("dolphin/47923");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(real_user.path(), home.join("user")).unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", emu_home.path());
+
+    let error = prepare_runtime_binary(&binary, 47923).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(marker).unwrap(), b"user settings");
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_refuses_symlinked_runtime_directory_without_touching_target() {
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let source = tempfile::tempdir().unwrap();
+    let emu_home = tempfile::tempdir().unwrap();
+    let installed = tempfile::tempdir().unwrap();
+    let marker = installed.path().join("Dolphin");
+    std::fs::write(&marker, b"installed dolphin").unwrap();
+    let binary = source.path().join("dolphin-emu-nogui");
+    std::fs::write(&binary, b"fake dolphin").unwrap();
+    make_executable(&binary);
+    let home = emu_home.path().join("dolphin/47924");
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink(installed.path(), home.join("runtime")).unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", emu_home.path());
+
+    let error = prepare_runtime_binary(&binary, 47924).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(marker).unwrap(), b"installed dolphin");
+}

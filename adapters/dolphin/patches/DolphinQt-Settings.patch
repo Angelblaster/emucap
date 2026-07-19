@@ -1,0 +1,16 @@
+diff --git a/Source/Core/DolphinQt/Settings.cpp b/Source/Core/DolphinQt/Settings.cpp
+index 618a2b5..9be6055 100644
+--- a/Source/Core/DolphinQt/Settings.cpp
++++ b/Source/Core/DolphinQt/Settings.cpp
+@@ -877,4 +877,4 @@ void Settings::SetShowDemangledNames(bool enabled)
+     return;
+-  QSettings().setValue(QStringLiteral("debugger/showdemanglednames"), enabled);
+-
++  GetQSettings().setValue(QStringLiteral("debugger/showdemanglednames"), enabled);
++
+   emit ShowDemangledNamesChanged(enabled);
+@@ -884,3 +884,3 @@ bool Settings::IsShowDemangledNames() const
+ {
+-  return QSettings().value(QStringLiteral("debugger/showdemanglednames")).toBool();
++  return GetQSettings().value(QStringLiteral("debugger/showdemanglednames")).toBool();
+ }

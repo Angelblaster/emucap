@@ -32,5 +32,8 @@ void ApplyInputOverride(int pad_num, GCPadStatus* status);
 
 // Called by the PowerPC breakpoint handler after it has confirmed a real hit.
 // The adapter filters this against breakpoints registered through emucap.
-void NotifyBreakpointHit(u32 address);
+void NotifyBreakpointHit(Core::System& system, u32 address);
+
+// Called after Dolphin has presented a non-duplicate frame and returned the CPU to stepping mode.
+void NotifyFrameStepComplete();
 }  // namespace EmuCap

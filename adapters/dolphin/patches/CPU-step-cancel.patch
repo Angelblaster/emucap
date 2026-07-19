@@ -1,0 +1,39 @@
+diff --git a/Source/Core/Core/HW/CPU.cpp b/Source/Core/Core/HW/CPU.cpp
+index abd632d..45871dd 100644
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -288,4 +288,19 @@ void CPUManager::StepOpcode(Common::Event* event)
+ }
+-
+-// Requires m_state_change_lock
++bool CPUManager::CancelStepOpcode(Common::Event* event)
++{
++  std::lock_guard state_lock(m_state_change_lock);
++
++  // A completed or superseded request no longer retains this event. In that case the caller may
++  // restore the previous core mode only after the CPU thread has also become idle.
++  if (m_state_cpu_step_instruction_sync != event)
++    return !m_state_cpu_thread_active;
++
++  // Detach the caller-owned event before it leaves scope. If SingleStep is already executing, it
++  // may still finish later, so report that the caller must leave the interpreter selected.
++  m_state_cpu_step_instruction_sync = nullptr;
++  m_state_cpu_step_instruction = false;
++  return !m_state_cpu_thread_active;
++}
++
++// Requires m_state_change_lock
+ bool CPUManager::SetStateLocked(State s)
+diff --git a/Source/Core/Core/HW/CPU.h b/Source/Core/Core/HW/CPU.h
+index 1cd5905..d387c2e 100644
+--- a/Source/Core/Core/HW/CPU.h
++++ b/Source/Core/Core/HW/CPU.h
+@@ -63,4 +63,7 @@ public:
+   // StepOpcode (Steps one Opcode)
+   void StepOpcode(Common::Event* event = nullptr);
+-
++  // Detaches a caller-owned completion event if the step has not completed. Returns true only
++  // when it is safe for the caller to restore CPU execution mode immediately.
++  bool CancelStepOpcode(Common::Event* event);
++
+   // Enable or Disable Stepping.

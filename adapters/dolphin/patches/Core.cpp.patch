@@ -1,5 +1,5 @@
 diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
-index 1b50796..7cee94e 100644
+index 1b50796..177b72f 100644
 --- a/Source/Core/Core/Core.cpp
 +++ b/Source/Core/Core/Core.cpp
 @@ -45,6 +45,7 @@
@@ -21,4 +21,46 @@ index 1b50796..7cee94e 100644
 +
    // Become the CPU thread.
    cpu_thread_func(system, savestate_path, delete_savestate);
+ }
+@@ -889,5 +895,6 @@ void Callback_NewField(Core::System& system)
+       s_frame_step = false;
+       system.GetCPU().Break();
+       NotifyStateChanged(Core::GetState(system));
++      EmuCap::NotifyFrameStepComplete();
+     }
+   }
+@@ -1006,8 +1013,8 @@ void HostDispatchJobs(Core::System& system)
+ // NOTE: Host Thread
+-void DoFrameStep(Core::System& system)
++bool DoFrameStep(Core::System& system)
+ {
+   if (AchievementManager::GetInstance().IsHardcoreModeActive())
+   {
+     OSD::AddMessage("Frame stepping is disabled in RetroAchievements hardcore mode");
+-    return;
++    return false;
+   }
+@@ -1020,10 +1027,23 @@ void DoFrameStep(Core::System& system)
+     s_stop_frame_step = false;
+     s_frame_step = true;
+     SetState(system, State::Running, false);
++    return true;
+   }
+   else if (!s_frame_step)
+   {
+     // if not paused yet, pause immediately instead
+     SetState(system, State::Paused);
+   }
++  return false;
++}
++
++// NOTE: Host Thread
++void CancelFrameStep(Core::System& system)
++{
++  std::lock_guard lock(s_core_mutex);
++  if (!s_frame_step)
++    return;
++
++  s_frame_step = false;
++  SetState(system, State::Paused);
  }

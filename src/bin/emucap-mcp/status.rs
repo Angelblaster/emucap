@@ -193,13 +193,18 @@ pub(crate) fn enrich_status_value(
             // 명령단위 추적·콜스택·레지스터워치 부재 → exec BP 콜체인 역추적 대체. watch_register/set_trace는
             // Mesen·PC-98만 보유하는 일관된 토큰이라 부재 도출이 신뢰 가능(Mednafen·Flycast에서만 발화).
             if !has("watch_register") && !has("set_trace") && has("set_breakpoint") {
+                let mut missing = vec!["set_trace/get_trace"];
+                if !has("call_stack") {
+                    missing.push("call_stack");
+                }
+                missing.push("watch_register");
                 // step 입자는 플랫폼별: Mednafen은 명령 단위, Flycast는 프레임 단위만 지원한다.
                 let step_kind = if has("step_instructions") {
                     "frozen step(unit=instructions)"
                 } else {
                     "frozen step(unit=frames)"
                 };
-                notes.push(format!("set_trace/get_trace·call_stack·watch_register 없음 — exec BP를 호출자로 한 홉씩 옮겨 콜체인 역추적 + {step_kind} + disassemble로 부분 대체(간접점프·자기수정·점프테이블 동적복구는 정적 disasm 병행)"));
+                notes.push(format!("{} 없음 — exec BP를 호출자로 한 홉씩 옮겨 콜체인 역추적 + {step_kind} + disassemble로 부분 대체(간접점프·자기수정·점프테이블 동적복구는 정적 disasm 병행)", missing.join("·")));
             }
             if !notes.is_empty() {
                 obj.insert("capability_notes".into(), serde_json::json!(notes));

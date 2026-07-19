@@ -54,22 +54,24 @@ fn known_scoped_advertisement_validates() {
 #[test]
 fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let value = advertisement_value(&[
-        "dolphin.execution.frame-step-absent",
         "dolphin.breakpoint.exact-exec-only",
         "dolphin.input-hold.port-zero-only",
         "dolphin.state-save.frozen-only",
         "dolphin.state-load.frozen-only",
         "dolphin.screenshot.running-only",
+        "dolphin.call-stack.best-effort",
     ]);
     let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
     let methods = [
         "status",
+        "step",
         "step_instructions",
         "set_breakpoint",
         "set_input",
         "save_state",
         "load_state",
         "screenshot",
+        "call_stack",
     ]
     .into_iter()
     .map(str::to_string)
@@ -77,10 +79,7 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let status = validate_advertisement(&ad, Some("dolphin-native"), Some("gamecube"), &methods);
 
     assert_eq!(status.state, "validated", "{:?}", status.errors);
-    assert_eq!(
-        status.constraints["execution.step.units"],
-        json!(["instructions"])
-    );
+    assert!(!status.constraints.contains_key("execution.step.units"));
     assert_eq!(
         status.constraints["state.save.execution_states.allowed"],
         json!(["frozen"])
@@ -89,6 +88,7 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
         status.constraints["state.load.execution_states.allowed"],
         json!(["frozen"])
     );
+    assert_eq!(status.authority["debug.call-stack"], json!("best_effort"));
     assert_eq!(
         status.constraints["video.capture.execution_states.allowed"],
         json!(["running"])

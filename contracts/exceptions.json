@@ -340,20 +340,6 @@
       ]
     },
     {
-      "id": "dolphin.execution.frame-step-absent",
-      "feature": "execution.step",
-      "kind": "capability_absent",
-      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
-      "scope": {
-        "adapter": "dolphin-native",
-        "systems": ["gamecube", "gc", "ngc", "wii"]
-      },
-      "activation": {"native_frame_step": false},
-      "constraints": {"execution.step.units": ["instructions"]},
-      "public_behavior": {"invalid": "unsupported"},
-      "verification": ["contract-test:dolphin-step-units"]
-    },
-    {
       "id": "dolphin.breakpoint.exact-exec-only",
       "feature": "debug.breakpoint",
       "kind": "parameter_constraint",
@@ -445,6 +431,20 @@
         "runtime-test:dolphin-screenshot-running-current",
         "runtime-test:dolphin-screenshot-frozen-rejected"
       ]
+    },
+    {
+      "id": "dolphin.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:dolphin-call-stack-authority"]
     }
   ]
 }

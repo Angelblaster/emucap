@@ -37,12 +37,16 @@ if ($LASTEXITCODE -ne 0) { throw "failed to update Dolphin submodules" }
 $owned = @(
   "Source/Core/Core/CMakeLists.txt",
   "Source/Core/Core/Core.cpp",
+  "Source/Core/Core/Core.h",
+  "Source/Core/Core/HW/CPU.cpp",
+  "Source/Core/Core/HW/CPU.h",
   "Source/Core/Core/HW/GCPad.cpp",
   "Source/Core/Core/PowerPC/PowerPC.cpp",
   "Source/Core/Core/State.cpp",
   "Source/Core/Core/State.h",
   "Source/Core/VideoCommon/FrameDumper.cpp",
   "Source/Core/VideoCommon/FrameDumper.h",
+  "Source/Core/DolphinQt/Settings.cpp",
   "Source/Core/DolphinLib.props"
 )
 git -C $Src checkout -- $owned
