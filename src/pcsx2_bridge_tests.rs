@@ -95,6 +95,10 @@ fn hello_reports_the_host_api_three_surface() {
         &methods,
     );
     assert_eq!(contract_status.state, "validated");
+    assert_eq!(
+        contract_status.constraints["breakpoint.memory.same_kind_min_separation"],
+        16
+    );
     assert!(result["methods"]
         .as_array()
         .unwrap()
@@ -579,6 +583,67 @@ fn exec_breakpoint_requires_ee_and_rejects_a_canonical_alias_duplicate() {
 
     let cleared = bridge.handle_request(Request::new(37, "clear_breakpoint", json!({"id":1})));
     assert_eq!(cleared.result.unwrap()["cleared"], 1);
+}
+
+#[test]
+fn access_breakpoints_reject_ambiguous_same_kind_ranges_before_mutation() {
+    fn set_command(kind: u32, start: u32, end: u32) -> Vec<u8> {
+        let mut command = vec![MSG_EMUCAP_SET_BREAKPOINT];
+        command.extend_from_slice(&kind.to_le_bytes());
+        command.extend_from_slice(&start.to_le_bytes());
+        command.extend_from_slice(&end.to_le_bytes());
+        command
+    }
+
+    let mut bridge = bridge(vec![
+        (set_command(1, 0x100, 0x1ff), Ok(vec![])),
+        (set_command(2, 0x180, 0x18f), Ok(vec![])),
+        (set_command(1, 0x20f, 0x21e), Ok(vec![])),
+    ]);
+    let armed = bridge.handle_request(Request::new(
+        38,
+        "set_breakpoint",
+        json!({"kind":"read", "memory_type":"ee", "start":0x100, "end":0x1ff}),
+    ));
+    assert_eq!(armed.result.unwrap()["id"], 1);
+
+    for (start, end) in [
+        (0x100, 0x1ff),
+        (0x120, 0x13f),
+        (0x080, 0x220),
+        (0x080, 0x100),
+        (0x1ff, 0x220),
+        (0x200, 0x20e),
+    ] {
+        let rejected = bridge.handle_request(Request::new(
+            39,
+            "set_breakpoint",
+            json!({"kind":"read", "memory_type":"ee", "start":start, "end":end}),
+        ));
+        let error = rejected.error.unwrap();
+        assert_eq!(error.kind, "bad_params");
+        assert!(error.message.contains("id 1"));
+        assert!(error.message.contains("same EE memory access"));
+    }
+
+    let unchanged = bridge.handle_request(Request::new(40, "list_breakpoints", json!({})));
+    let listed = unchanged.result.unwrap();
+    assert_eq!(listed["breakpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["breakpoints"][0]["id"], 1);
+
+    let other_kind = bridge.handle_request(Request::new(
+        41,
+        "set_breakpoint",
+        json!({"kind":"write", "memory_type":"ee", "start":0x180, "end":0x18f}),
+    ));
+    assert_eq!(other_kind.result.unwrap()["id"], 2);
+
+    let separated = bridge.handle_request(Request::new(
+        42,
+        "set_breakpoint",
+        json!({"kind":"read", "memory_type":"ee", "start":0x20f, "end":0x21e}),
+    ));
+    assert_eq!(separated.result.unwrap()["id"], 3);
 }
 
 #[test]

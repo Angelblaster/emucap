@@ -114,7 +114,9 @@ decoder.
 `set_breakpoint` supports exact EE execution addresses and read/write ranges in `memory_type="ee"`.
 Read/write ranges are inclusive and limited to 64 KiB. PCSX2's native debugger always pauses on a
 hit, so `pause_on_hit=false`, value or PC conditions, automatic savestates, and memory snapshots are
-rejected before a breakpoint is armed.
+rejected before a breakpoint is armed. Read or write ranges of the same kind must be at least 16
+addresses apart so one maximum-width EE access cannot match both; an ambiguous registration is
+rejected before the native breakpoint set changes.
 
 `poll_events` drains a bounded native queue. Each hit includes its kind, accessing PC, exact access
 address and width, and the low 64-bit EE register snapshot captured at the hit. The queue retains up

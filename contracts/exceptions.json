@@ -354,11 +354,13 @@
         "breakpoint.pause_on_hit.allowed": [true],
         "breakpoint.conditions.supported": false,
         "breakpoint.snapshot.supported": false,
-        "breakpoint.memory.max_span": 65536
+        "breakpoint.memory.max_span": 65536,
+        "breakpoint.memory.same_kind_min_separation": 16
       },
       "public_behavior": {"invalid": "bad_params"},
       "verification": [
         "contract-test:pcsx2-breakpoint-subset-rejected-before-mutation",
+        "contract-test:pcsx2-breakpoint-ambiguous-same-kind-range-rejected-before-mutation",
         "runtime-test:pcsx2-breakpoint-hit-freezes-with-registers"
       ]
     },

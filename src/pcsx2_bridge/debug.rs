@@ -1,6 +1,7 @@
 use super::*;
 
 const MAX_BREAKPOINT_SPAN: u64 = 0x1_0000;
+const MAX_BREAKPOINT_ACCESS_WIDTH: u32 = 16;
 const BREAKPOINT_REGISTER_COUNT: usize = 34;
 const MAX_EVENT_COUNT: usize = 256;
 const MAX_STACK_DEPTH: usize = 256;
@@ -33,6 +34,12 @@ impl Pcsx2Breakpoint {
     fn overlaps(&self, address: u32, length: u32) -> bool {
         let access_end = address.saturating_add(length.saturating_sub(1));
         address <= self.end && self.start <= access_end
+    }
+
+    fn can_match_same_access(&self, start: u32, end: u32) -> bool {
+        let ambiguity_margin = MAX_BREAKPOINT_ACCESS_WIDTH - 1;
+        start <= self.end.saturating_add(ambiguity_margin)
+            && self.start <= end.saturating_add(ambiguity_margin)
     }
 
     fn matches_exec(&self, address: u32) -> bool {
@@ -139,17 +146,24 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             )
         };
 
-        if self.breakpoints.values().any(|breakpoint| {
+        if let Some((&conflicting_id, _)) = self.breakpoints.iter().find(|(_, breakpoint)| {
             breakpoint.kind == kind
                 && if kind == "exec" {
                     breakpoint.matches_exec(start)
                 } else {
-                    breakpoint.start == start && breakpoint.end == end
+                    breakpoint.can_match_same_access(start, end)
                 }
         }) {
-            return Err(Pcsx2BridgeError::BadParams(
-                "an identical PCSX2 breakpoint is already armed".into(),
-            ));
+            let message = if kind == "exec" {
+                format!(
+                    "an equivalent PCSX2 exec breakpoint is already armed with id {conflicting_id}"
+                )
+            } else {
+                format!(
+                    "same-kind PCSX2 breakpoint id {conflicting_id} could match the same EE memory access"
+                )
+            };
+            return Err(Pcsx2BridgeError::BadParams(message));
         }
 
         let id = self.next_breakpoint_id;
