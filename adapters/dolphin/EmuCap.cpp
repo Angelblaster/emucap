@@ -364,13 +364,23 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
 
   auto& cpu = system.GetCPU();
   cpu.SetStepping(true);
+  auto& power_pc = system.GetPowerPC();
+  const PowerPC::CoreMode old_mode = power_pc.GetMode();
+  power_pc.SetMode(PowerPC::CoreMode::Interpreter);
+  bool completed_all = true;
   for (uint64_t i = 0; i < count; ++i)
   {
     Common::Event completed;
     cpu.StepOpcode(&completed);
     if (!completed.WaitFor(std::chrono::seconds(1)))
-      return Fail("instruction step did not complete within 1 second");
+    {
+      completed_all = false;
+      break;
+    }
   }
+  power_pc.SetMode(old_mode);
+  if (!completed_all)
+    return Fail("instruction step did not complete within 1 second");
   picojson::object r;
   r["status"] = picojson::value(std::string("completed"));
   r["count"] = picojson::value(static_cast<double>(count));
