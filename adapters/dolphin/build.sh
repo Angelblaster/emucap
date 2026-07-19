@@ -42,6 +42,8 @@ git -C "$SRC" checkout -- \
   Source/Core/Core/Core.cpp \
   Source/Core/Core/HW/GCPad.cpp \
   Source/Core/Core/PowerPC/PowerPC.cpp \
+  Source/Core/Core/State.cpp \
+  Source/Core/Core/State.h \
   Source/Core/VideoCommon/FrameDumper.cpp \
   Source/Core/VideoCommon/FrameDumper.h \
   Source/Core/DolphinLib.props

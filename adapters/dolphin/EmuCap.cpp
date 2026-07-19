@@ -71,7 +71,7 @@ std::deque<picojson::value> s_events;
 std::mutex s_bp_mutex;
 std::map<int, u32> s_breakpoints;  // id -> address
 int s_next_bp = 1;
-std::atomic<u64> s_screenshot_sequence{0};
+std::atomic<u64> s_file_sequence{0};
 std::string s_handler_error_kind;
 std::string s_handler_error;
 
@@ -251,7 +251,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
   for (const char* m :
        {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
         "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
-        "poll_events", "screenshot"})
+        "poll_events", "save_state", "load_state", "screenshot"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
@@ -508,31 +508,67 @@ picojson::object PollEvents(Core::System&, const picojson::object&)
 
 picojson::object SaveState(Core::System& system, const picojson::object& p)
 {
-  uint64_t slot = 0;
-  auto fn = p.find("filename");
-  if (fn != p.end() && fn->second.is<std::string>())
-    State::SaveAs(system, fn->second.get<std::string>());
-  else if (GetU64(p, "slot", slot))
-    State::Save(system, static_cast<int>(slot));
-  else
-    State::Save(system, 1);
+  const auto path_value = p.find("path");
+  if (path_value == p.end() || !path_value->second.is<std::string>() ||
+      path_value->second.get<std::string>().empty())
+  {
+    return Fail("bad_params", "save_state requires a non-empty path");
+  }
+  if (Core::GetState(system) != Core::State::Paused)
+    return Fail("bad_state", "save_state requires a frozen core");
+
+  const std::string path = path_value->second.get<std::string>();
+  if (!File::CreateFullPath(path))
+    return Fail("io_error", "failed to create the savestate directory");
+  const std::string staging =
+      path + ".emucap-" + std::to_string(s_file_sequence.fetch_add(1)) + ".stage";
+  std::remove(staging.c_str());
+  if (!State::SaveAsSynchronous(system, staging))
+  {
+    std::remove(staging.c_str());
+    return Fail("emulator_error", "Dolphin failed to create a complete savestate");
+  }
+  if (!File::MoveWithOverwrite(staging, path) || !File::IsFile(path))
+  {
+    std::remove(staging.c_str());
+    return Fail("io_error", "failed to publish the completed savestate");
+  }
+
   picojson::object r;
   r["status"] = picojson::value(std::string("saved"));
+  r["path"] = picojson::value(path);
+  r["bytes"] = picojson::value(static_cast<double>(File::GetSize(path)));
+  r["state"] = picojson::value(std::string("frozen"));
+  const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+  if (!launch_id.empty())
+    r["generation"] = picojson::value(launch_id);
   return r;
 }
 
 picojson::object LoadState(Core::System& system, const picojson::object& p)
 {
-  uint64_t slot = 0;
-  auto fn = p.find("filename");
-  if (fn != p.end() && fn->second.is<std::string>())
-    State::LoadAs(system, fn->second.get<std::string>());
-  else if (GetU64(p, "slot", slot))
-    State::Load(system, static_cast<int>(slot));
-  else
-    State::Load(system, 1);
+  const auto path_value = p.find("path");
+  if (path_value == p.end() || !path_value->second.is<std::string>() ||
+      path_value->second.get<std::string>().empty())
+  {
+    return Fail("bad_params", "load_state requires a non-empty path");
+  }
+  if (Core::GetState(system) != Core::State::Paused)
+    return Fail("bad_state", "load_state requires a frozen core");
+
+  const std::string path = path_value->second.get<std::string>();
+  if (!File::IsFile(path))
+    return Fail("bad_params", "savestate path is not a file");
+  if (!State::LoadAsSynchronous(system, path))
+    return Fail("emulator_error", "Dolphin failed to load a coherent savestate");
+
   picojson::object r;
   r["status"] = picojson::value(std::string("loaded"));
+  r["path"] = picojson::value(path);
+  r["state"] = picojson::value(std::string("frozen"));
+  const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+  if (!launch_id.empty())
+    r["generation"] = picojson::value(launch_id);
   return r;
 }
 
@@ -601,7 +637,7 @@ picojson::object Screenshot(Core::System& system, const picojson::object&)
   if (!g_frame_dumper)
     return Fail("bad_state", "frame dumper is not initialized");
 
-  const u64 sequence = s_screenshot_sequence.fetch_add(1);
+  const u64 sequence = s_file_sequence.fetch_add(1);
   const std::string path =
       File::GetUserPath(D_CACHE_IDX) + "emucap-screenshot-" + std::to_string(sequence) + ".png";
   if (!File::CreateFullPath(path))

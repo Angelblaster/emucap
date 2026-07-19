@@ -73,11 +73,12 @@ The native adapter currently advertises:
 - `get_state`, `status`;
 - `pause`, `resume`, instruction-unit `step`;
 - `set_breakpoint`, `clear_breakpoint`, `list_breakpoints`, `poll_events`;
+- frozen core only: `save_state`, `load_state`;
 - running core only: `screenshot`;
 - GameCube only: `set_input`.
 
-It does not currently advertise savestates, frame stepping, read/write watchpoints, tracing, call
-stacks, or Wii input injection. These methods must not be inferred from dormant handler code.
+It does not currently advertise frame stepping, read/write watchpoints, tracing, call stacks, or
+Wii input injection. These methods must not be inferred from dormant handler code.
 
 The adapter does not yet publish a feature-contract declaration, so the Control MCP reports its
 contract state as `unreported`. Its atomic methods remain available, but contract-gated composite
@@ -107,6 +108,13 @@ GameCube controller port 0 accepts lowercase `a`, `b`, `x`, `y`, `z`, `l`, `r`, 
 native input path. Other ports and unknown buttons fail before changing the active override.
 
 Wii input is not advertised.
+
+### Savestates
+
+`save_state` and `load_state` require a frozen core and preserve that state on return. Save captures
+one CPU/device snapshot, completes compression to a same-directory staging file, validates the
+result, and publishes it only after all work is complete. Load rejects missing files before
+mutation and acknowledges success only after Dolphin has restored the complete snapshot.
 
 ### Screenshots
 

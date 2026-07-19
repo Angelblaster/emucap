@@ -1,0 +1,84 @@
+diff --git a/Source/Core/Core/State.cpp b/Source/Core/Core/State.cpp
+index 765e0d6..2040ba9 100644
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -504,6 +504,30 @@ void SaveAs(Core::System& system, std::string filename)
+       });
+ }
+ 
++bool SaveAsSynchronous(Core::System& system, std::string filename)
++{
++  const auto buffer_size_estimate = std::size_t(s_last_state_size) * 110 / 100;
++  Common::UniqueBuffer<u8> buffer{buffer_size_estimate};
++  std::size_t actual_size = 0;
++  {
++    Core::CPUThreadGuard guard(system);
++    actual_size = SaveToBuffer(system, buffer);
++  }
++  if (actual_size == 0)
++    return false;
++
++  buffer.assign(buffer.extract().first, actual_size);
++  CompressAndDumpStateArgs dump_args{
++      .buffer = std::move(buffer),
++      .filename = filename,
++      .task_lock = GetStateSaveTaskLock(),
++  };
++  CompressAndDumpState(system, dump_args);
++
++  StateHeader header;
++  return ReadHeader(filename, header);
++}
++
+ static bool GetVersionFromLZO(StateHeader& header, File::IOFile& f)
+ {
+   // Just read the first block, since it will contain the full revision string
+@@ -807,7 +831,7 @@ static void LoadFileStateData(const std::string& filename, Common::UniqueBuffer<
+   ret_data.swap(buffer);
+ }
+ 
+-static void LoadAsFromCore(Core::System& system, std::string filename)
++static bool LoadAsFromCore(Core::System& system, std::string filename)
+ {
+   // Ensure all data has reached the filesystem before trying to use it.
+   s_compress_and_dump_thread.WaitForCompletion();
+@@ -867,6 +891,7 @@ static void LoadAsFromCore(Core::System& system, std::string filename)
+ 
+   if (s_on_after_load_callback)
+     s_on_after_load_callback();
++  return was_file_read && loaded_successfully;
+ }
+ 
+ void LoadAs(Core::System& system, std::string filename)
+@@ -879,6 +904,15 @@ void LoadAs(Core::System& system, std::string filename)
+   });
+ }
+ 
++bool LoadAsSynchronous(Core::System& system, std::string filename)
++{
++  if (!CheckIfStateLoadIsAllowed(system))
++    return false;
++
++  Core::CPUThreadGuard guard(system);
++  return LoadAsFromCore(system, std::move(filename));
++}
++
+ void SetOnAfterLoadCallback(AfterLoadCallbackFunc callback)
+ {
+   s_on_after_load_callback = std::move(callback);
+diff --git a/Source/Core/Core/State.h b/Source/Core/Core/State.h
+index 1c4eeb0..47f4ff7 100644
+--- a/Source/Core/Core/State.h
++++ b/Source/Core/Core/State.h
+@@ -98,6 +98,11 @@ void Load(Core::System& system, int slot);
+ void SaveAs(Core::System& system, std::string filename);
+ void LoadAs(Core::System& system, std::string filename);
+ 
++// Synchronous variants for control surfaces that must not acknowledge completion while CPU-thread
++// capture/restore or background compression is still pending.
++bool SaveAsSynchronous(Core::System& system, std::string filename);
++bool LoadAsSynchronous(Core::System& system, std::string filename);
++
+ void LoadLastSaved(Core::System& system, int i = 1);
+ void SaveFirstSaved(Core::System& system);
+ void UndoSaveState(Core::System& system);
