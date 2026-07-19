@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
@@ -34,6 +35,7 @@ using SOCKET = int;
 #include <picojson.h>
 
 #include "Common/Config/Config.h"
+#include "Common/Event.h"
 #include "Common/SocketContext.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
@@ -55,6 +57,9 @@ namespace
 std::thread s_thread;
 std::atomic<bool> s_stop{false};
 std::atomic<bool> s_started{false};
+
+std::mutex s_socket_mutex;
+SOCKET s_active_socket = INVALID_SOCKET;
 
 std::mutex s_ev_mutex;
 std::deque<picojson::value> s_events;
@@ -106,21 +111,27 @@ std::string Base64(const uint8_t* data, size_t n)
   return out;
 }
 
-u16 ButtonBit(const std::string& name)
+bool ButtonBit(const std::string& name, u16& bit)
 {
-  if (name == "A") return PAD_BUTTON_A;
-  if (name == "B") return PAD_BUTTON_B;
-  if (name == "X") return PAD_BUTTON_X;
-  if (name == "Y") return PAD_BUTTON_Y;
-  if (name == "START" || name == "Start") return PAD_BUTTON_START;
-  if (name == "Z") return PAD_TRIGGER_Z;
-  if (name == "L") return PAD_TRIGGER_L;
-  if (name == "R") return PAD_TRIGGER_R;
-  if (name == "UP" || name == "Up") return PAD_BUTTON_UP;
-  if (name == "DOWN" || name == "Down") return PAD_BUTTON_DOWN;
-  if (name == "LEFT" || name == "Left") return PAD_BUTTON_LEFT;
-  if (name == "RIGHT" || name == "Right") return PAD_BUTTON_RIGHT;
-  return 0;
+  std::string normalized;
+  normalized.reserve(name.size());
+  for (const unsigned char character : name)
+    normalized.push_back(static_cast<char>(std::tolower(character)));
+
+  if (normalized == "a") bit = PAD_BUTTON_A;
+  else if (normalized == "b") bit = PAD_BUTTON_B;
+  else if (normalized == "x") bit = PAD_BUTTON_X;
+  else if (normalized == "y") bit = PAD_BUTTON_Y;
+  else if (normalized == "start") bit = PAD_BUTTON_START;
+  else if (normalized == "z") bit = PAD_TRIGGER_Z;
+  else if (normalized == "l") bit = PAD_TRIGGER_L;
+  else if (normalized == "r") bit = PAD_TRIGGER_R;
+  else if (normalized == "up") bit = PAD_BUTTON_UP;
+  else if (normalized == "down") bit = PAD_BUTTON_DOWN;
+  else if (normalized == "left") bit = PAD_BUTTON_LEFT;
+  else if (normalized == "right") bit = PAD_BUTTON_RIGHT;
+  else return false;
+  return true;
 }
 
 std::string EnvOr(const char* key, const char* fallback)
@@ -215,20 +226,27 @@ struct SafeAccess
 
 picojson::object Hello(Core::System&, const picojson::object&)
 {
+  const std::string system = EnvOr("EMUCAP_SYSTEM", "gamecube");
+  const bool gamecube = system == "gamecube" || system == "gc" || system == "ngc";
   picojson::object r;
   r["protocol_version"] = picojson::value(1.0);
   r["name"] = picojson::value(EnvOr("EMUCAP_NAME", "dolphin"));
-  r["system"] = picojson::value(std::string("gc"));
+  r["system"] = picojson::value(system);
   r["adapter"] = picojson::value(std::string("dolphin-native"));
   picojson::array methods;
   for (const char* m :
-       {"read_memory", "write_memory", "get_state", "status", "pause", "resume", "step",
-        "set_breakpoint", "clear_breakpoint", "list_breakpoints", "poll_events", "save_state",
-        "load_state", "screenshot", "set_input"})
+       {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
+        "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
+        "poll_events"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
+  if (gamecube)
+    methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
+  picojson::object limits;
+  limits["max_sync_advance_count"] = picojson::value(10000.0);
+  r["execution_limits"] = picojson::value(limits);
   picojson::array mt;
   mt.push_back(picojson::value(std::string("main")));
   r["memory_types"] = picojson::value(mt);
@@ -238,6 +256,9 @@ picojson::object Hello(Core::System&, const picojson::object&)
   const std::string content = EnvOr("EMUCAP_CONTENT", "");
   if (!content.empty())
     r["content"] = picojson::value(content);
+  const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+  if (!launch_id.empty())
+    r["launch_id"] = picojson::value(launch_id);
   return r;
 }
 
@@ -333,13 +354,27 @@ picojson::object Resume(Core::System& system, const picojson::object&)
   return r;
 }
 
-picojson::object Step(Core::System& system, const picojson::object&)
+picojson::object StepInstructions(Core::System& system, const picojson::object& p)
 {
+  uint64_t count = 1;
+  if (p.count("count") && !GetU64(p, "count", count))
+    return Fail("count must be an integer");
+  if (count == 0 || count > 10000)
+    return Fail("count must be in 1..10000");
+
   auto& cpu = system.GetCPU();
   cpu.SetStepping(true);
-  cpu.StepOpcode();
+  for (uint64_t i = 0; i < count; ++i)
+  {
+    Common::Event completed;
+    cpu.StepOpcode(&completed);
+    if (!completed.WaitFor(std::chrono::seconds(1)))
+      return Fail("instruction step did not complete within 1 second");
+  }
   picojson::object r;
   r["status"] = picojson::value(std::string("completed"));
+  r["count"] = picojson::value(static_cast<double>(count));
+  r["state"] = picojson::value(std::string("frozen"));
   return r;
 }
 
@@ -479,30 +514,42 @@ picojson::object LoadState(Core::System& system, const picojson::object& p)
 
 picojson::object SetInput(Core::System&, const picojson::object& p)
 {
-  int pad = 0;
+  int port = 0;
   uint64_t v = 0;
-  if (GetU64(p, "pad", v))
-    pad = static_cast<int>(v);
-  if (pad < 0 || pad > 3)
-    return Fail("pad must be in 0..3");
+  if (GetU64(p, "port", v) || GetU64(p, "pad", v))
+    port = static_cast<int>(v);
+  if (port != 0)
+    return Fail("only controller port 0 is supported");
 
   std::lock_guard<std::mutex> lk(s_input_mutex);
   auto engaged = p.find("engaged");
-  if (engaged != p.end() && engaged->second.is<bool>() && !engaged->second.get<bool>())
+  const auto buttons = p.find("buttons");
+  const bool empty_buttons =
+      buttons != p.end() && buttons->second.is<picojson::array>() &&
+      buttons->second.get<picojson::array>().empty();
+  if ((engaged != p.end() && engaged->second.is<bool>() && !engaged->second.get<bool>()) ||
+      empty_buttons)
   {
-    s_input[pad].engaged = false;
+    s_input[port].engaged = false;
     picojson::object r;
     r["engaged"] = picojson::value(false);
+    r["port"] = picojson::value(static_cast<double>(port));
     return r;
   }
 
   GCPadStatus st;  // 중립 기본값
-  if (auto it = p.find("buttons"); it != p.end() && it->second.is<picojson::array>())
+  if (buttons != p.end() && buttons->second.is<picojson::array>())
   {
     u16 bits = 0;
-    for (const auto& b : it->second.get<picojson::array>())
-      if (b.is<std::string>())
-        bits |= ButtonBit(b.get<std::string>());
+    for (const auto& button : buttons->second.get<picojson::array>())
+    {
+      if (!button.is<std::string>())
+        return Fail("buttons must contain strings");
+      u16 bit = 0;
+      if (!ButtonBit(button.get<std::string>(), bit))
+        return Fail("unsupported GameCube button: " + button.get<std::string>());
+      bits |= bit;
+    }
     st.button = bits;
   }
   if (GetU64(p, "stickX", v)) st.stickX = static_cast<u8>(v);
@@ -511,12 +558,12 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   if (GetU64(p, "substickY", v)) st.substickY = static_cast<u8>(v);
   if (GetU64(p, "triggerL", v)) st.triggerLeft = static_cast<u8>(v);
   if (GetU64(p, "triggerR", v)) st.triggerRight = static_cast<u8>(v);
-  s_input[pad].status = st;
-  s_input[pad].engaged = true;
+  s_input[port].status = st;
+  s_input[port].engaged = true;
 
   picojson::object r;
   r["engaged"] = picojson::value(true);
-  r["pad"] = picojson::value(static_cast<double>(pad));
+  r["port"] = picojson::value(static_cast<double>(port));
   return r;
 }
 
@@ -569,7 +616,7 @@ Handler Lookup(const std::string& m)
   if (m == "get_state") return GetState;
   if (m == "pause") return Pause;
   if (m == "resume") return Resume;
-  if (m == "step") return Step;
+  if (m == "step_instructions") return StepInstructions;
   if (m == "set_breakpoint") return SetBreakpoint;
   if (m == "clear_breakpoint") return ClearBreakpoint;
   if (m == "list_breakpoints") return ListBreakpoints;
@@ -581,10 +628,24 @@ Handler Lookup(const std::string& m)
   return nullptr;
 }
 
-void SendLine(SOCKET sock, const std::string& line)
+bool SendLine(SOCKET sock, const std::string& line)
 {
-  std::string out = line + "\n";
-  send(sock, out.data(), static_cast<int>(out.size()), 0);
+  const std::string out = line + "\n";
+  size_t offset = 0;
+  while (offset < out.size())
+  {
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL;
+#else
+    constexpr int flags = 0;
+#endif
+    const int sent =
+        send(sock, out.data() + offset, static_cast<int>(out.size() - offset), flags);
+    if (sent <= 0)
+      return false;
+    offset += static_cast<size_t>(sent);
+  }
+  return true;
 }
 
 void ServeSession(Core::System& system, SOCKET sock)
@@ -638,7 +699,8 @@ void ServeSession(Core::System& system, SOCKET sock)
           resp["error"] = MakeError("emulator_error", s_handler_error);
         }
       }
-      SendLine(sock, picojson::value(resp).serialize());
+      if (!SendLine(sock, picojson::value(resp).serialize()))
+        return;
     }
 
     const int got = recv(sock, chunk, sizeof(chunk), 0);
@@ -659,12 +721,27 @@ void ThreadMain(Core::System& system, unsigned short port)
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
       continue;
     }
+#ifdef __APPLE__
+    int no_sigpipe = 1;
+    setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     if (connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0)
+    {
+      {
+        std::lock_guard<std::mutex> lk(s_socket_mutex);
+        s_active_socket = sock;
+      }
       ServeSession(system, sock);
+      {
+        std::lock_guard<std::mutex> lk(s_socket_mutex);
+        if (s_active_socket == sock)
+          s_active_socket = INVALID_SOCKET;
+      }
+    }
     closesocket(sock);
     if (!s_stop.load())
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -725,6 +802,17 @@ void Start(Core::System& system)
 void Stop()
 {
   s_stop.store(true);
+  {
+    std::lock_guard<std::mutex> lk(s_socket_mutex);
+    if (s_active_socket != INVALID_SOCKET)
+    {
+#ifdef _WIN32
+      shutdown(s_active_socket, SD_BOTH);
+#else
+      shutdown(s_active_socket, SHUT_RDWR);
+#endif
+    }
+  }
   if (s_thread.joinable())
     s_thread.join();
   s_started.store(false);
