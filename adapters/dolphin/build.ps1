@@ -1,58 +1,138 @@
-# emucap Dolphin(GameCube/Wii) 네이티브 어댑터 빌드.
+# Build the pinned Dolphin native adapter on Windows.
 #
-# Dolphin 소스를 클론(핀 커밋)해 emucap 서버(EmuCap.cpp/h)를 심고 3개 파일을 패치한 뒤
-# Visual Studio 솔루션을 MSBuild 로 빌드한다. 산출물: <src>\Binary\x64\Dolphin.exe.
+# Requirements: Visual Studio 2022 with MSVC and a Windows SDK, plus Git.
 #
-# 전제: Visual Studio 2022(또는 Build Tools, 최신 MSVC + Windows SDK), Git. Qt 는 Dolphin
-# 이 Externals 서브모듈(Qt6.8.3 prebuilt)로 가져오므로 별도 설치 불필요.
-#
-#   build.ps1 [-Src C:\dolphin-build\dolphin-src] [-Jobs N]
+#   build.ps1 [-Src C:\dolphin-build\dolphin-src]
 param(
-  [string]$Src = "C:\dolphin-build\dolphin-src",
-  [string]$DolphinCommit = "415ec4de182034179143231e84c17dbcdf8be8aa"
+  [string]$Src = "C:\dolphin-build\dolphin-src"
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-# 1) 소스 확보(얕은 클론 + 서브모듈). 이미 있으면 재사용.
-if (-not (Test-Path "$Src\Source\dolphin-emu.sln")) {
+$lock = @{}
+foreach ($line in Get-Content -LiteralPath (Join-Path $here "upstream.lock")) {
+  if ($line -match '^([^=]+)=(.*)$') {
+    $lock[$matches[1]] = $matches[2]
+  }
+}
+foreach ($key in @("DOLPHIN_REPO", "DOLPHIN_COMMIT", "DOLPHIN_HOST_API", "DOLPHIN_PATCHSET_SHA256")) {
+  if (-not $lock.ContainsKey($key) -or -not $lock[$key]) {
+    throw "upstream.lock is missing $key"
+  }
+}
+
+if (-not (Test-Path -LiteralPath (Join-Path $Src ".git") -PathType Container)) {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Src) | Out-Null
-  git clone --recurse-submodules --shallow-submodules --jobs 4 `
-    https://github.com/dolphin-emu/dolphin.git $Src
-  git -C $Src checkout $DolphinCommit
-  git -C $Src submodule update --init --recursive --depth 1
+  git clone --filter=blob:none $lock.DOLPHIN_REPO $Src
+  if ($LASTEXITCODE -ne 0) { throw "failed to clone Dolphin" }
 }
 
-# 2) emucap 서버 소스를 Core 에 배치.
-Copy-Item "$here\EmuCap.cpp" "$Src\Source\Core\Core\EmuCap.cpp" -Force
-Copy-Item "$here\EmuCap.h"   "$Src\Source\Core\Core\EmuCap.h"   -Force
+git -C $Src fetch --depth 1 origin $lock.DOLPHIN_COMMIT
+if ($LASTEXITCODE -ne 0) { throw "failed to fetch the pinned Dolphin revision" }
+git -C $Src checkout --detach $lock.DOLPHIN_COMMIT
+if ($LASTEXITCODE -ne 0) { throw "failed to check out the pinned Dolphin revision" }
+git -C $Src submodule update --init --recursive --depth 1 --jobs 4
+if ($LASTEXITCODE -ne 0) { throw "failed to update Dolphin submodules" }
 
-# 3) 3개 파일 패치(멱등: 이미 적용됐으면 건너뜀).
-#    - DolphinLib.props : EmuCap.cpp/h 를 프로젝트에 등록
-#    - Core/Core.cpp    : EmuThread 에서 EmuCap::Start/Stop 훅
-#    - Core/HW/GCPad.cpp: GetStatus 폴 지점에 입력 오버라이드 훅
-foreach ($p in @("DolphinLib.props", "Core.cpp", "GCPad.cpp")) {
-  $patch = "$here\patches\$p.patch"
-  # --forward 는 이미 적용된 패치를 조용히 건너뛴다. Git bash 의 git apply 사용.
-  git -C $Src apply --3way --whitespace=nowarn $patch 2>$null
-  if ($LASTEXITCODE -ne 0) {
-    git -C $Src apply --reverse --check $patch 2>$null
-    if ($LASTEXITCODE -eq 0) { Write-Output "[patch] $p already applied" }
-    else { throw "patch 적용 실패: $p (Dolphin 소스 버전이 핀 커밋과 다를 수 있음)" }
-  } else { Write-Output "[patch] applied $p" }
+$owned = @(
+  "Source/Core/Core/CMakeLists.txt",
+  "Source/Core/Core/Core.cpp",
+  "Source/Core/Core/HW/GCPad.cpp",
+  "Source/Core/Core/PowerPC/PowerPC.cpp",
+  "Source/Core/Core/State.cpp",
+  "Source/Core/Core/State.h",
+  "Source/Core/VideoCommon/FrameDumper.cpp",
+  "Source/Core/VideoCommon/FrameDumper.h",
+  "Source/Core/DolphinLib.props"
+)
+git -C $Src checkout -- $owned
+if ($LASTEXITCODE -ne 0) { throw "failed to restore files owned by the patch stack" }
+git -C $Src clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h
+if ($LASTEXITCODE -ne 0) { throw "failed to clean stale adapter sources" }
+
+Copy-Item -LiteralPath (Join-Path $here "EmuCap.cpp") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCap.cpp") -Force
+Copy-Item -LiteralPath (Join-Path $here "EmuCap.h") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCap.h") -Force
+
+foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
+    Sort-Object Name) {
+  Write-Output "[patch] applying $($patch.Name)"
+  git -C $Src apply --check $patch.FullName
+  if ($LASTEXITCODE -ne 0) { throw "patch does not apply cleanly: $($patch.Name)" }
+  git -C $Src apply $patch.FullName
+  if ($LASTEXITCODE -ne 0) { throw "failed to apply patch: $($patch.Name)" }
 }
 
-# 4) 빌드(vcvars64 + MSBuild Release x64).
-$vcvars = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
-if (-not (Test-Path $vcvars)) { throw "vcvars64.bat 없음 — VS2022 설치 경로 확인" }
+$vcvarsCandidates = @(
+  "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
+  "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+  "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
+  "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+)
+$vcvars = $vcvarsCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+  Select-Object -First 1
+if (-not $vcvars) { throw "Visual Studio 2022 vcvars64.bat was not found" }
+
 $bat = @"
 @echo off
 call "$vcvars"
 cd /d "$Src"
 msbuild Source\dolphin-emu.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
-echo BUILD_EXIT_CODE=%ERRORLEVEL%
+exit /b %ERRORLEVEL%
 "@
-$tmp = Join-Path $env:TEMP "emucap_dolphin_build.bat"
-$bat | Out-File -Encoding ascii $tmp
-& cmd /c $tmp
-Write-Output "[build] 완료 → $Src\Binary\x64\Dolphin.exe"
+$tmp = Join-Path $env:TEMP "emucap-dolphin-build-$PID.bat"
+try {
+  [System.IO.File]::WriteAllText($tmp, $bat, [System.Text.Encoding]::ASCII)
+  & cmd /c $tmp
+  if ($LASTEXITCODE -ne 0) { throw "Dolphin MSBuild failed with exit code $LASTEXITCODE" }
+} finally {
+  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+}
+
+function Get-LowerSha256([string]$Path) {
+  (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+$digestInputs = @("EmuCap.cpp", "EmuCap.h")
+$digestInputs += Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
+  Sort-Object Name |
+  ForEach-Object { "patches/$($_.Name)" }
+$manifestLines = foreach ($relative in $digestInputs) {
+  $nativePath = Join-Path $here ($relative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
+  "$(Get-LowerSha256 $nativePath)  $relative"
+}
+$manifestBytes = [System.Text.UTF8Encoding]::new($false).GetBytes(
+  (($manifestLines -join "`n") + "`n")
+)
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+  $patchset = (
+    [System.BitConverter]::ToString($sha.ComputeHash($manifestBytes)) -replace '-', ''
+  ).ToLowerInvariant()
+} finally {
+  $sha.Dispose()
+}
+if ($lock.DOLPHIN_PATCHSET_SHA256 -ne "pending" -and
+    $patchset -ne $lock.DOLPHIN_PATCHSET_SHA256) {
+  throw "patchset digest differs from upstream.lock"
+}
+
+$binary = Join-Path $Src "Binary\x64\Dolphin.exe"
+if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+  throw "Dolphin build completed without the expected binary: $binary"
+}
+$metadata = [ordered]@{
+  upstream = $lock.DOLPHIN_REPO
+  commit = $lock.DOLPHIN_COMMIT
+  host_api = [int]$lock.DOLPHIN_HOST_API
+  patchset_sha256 = $patchset
+} | ConvertTo-Json
+$metadataPath = Join-Path (Split-Path -Parent $binary) "emucap-dolphin-build.json"
+[System.IO.File]::WriteAllText(
+  $metadataPath,
+  "$metadata`n",
+  [System.Text.UTF8Encoding]::new($false)
+)
+Write-Output "[build] completed: $binary"
+Write-Output "[build] metadata: $metadataPath"

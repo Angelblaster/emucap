@@ -2,7 +2,7 @@
 
 The Dolphin adapter adds live PowerPC debugging for GameCube and Wii. The supported path is a
 repo-owned native fork: a small emucap service runs inside Dolphin and connects directly to the
-Control MCP listener over NDJSON. A legacy GDB-stub bridge remains available for manual use.
+Control MCP listener over NDJSON.
 
 `status.methods` and `status.memory_types` are authoritative for every live session.
 
@@ -17,6 +17,8 @@ The patch stack adds:
 - native service startup and shutdown hooks;
 - GameCube controller override support;
 - exact PowerPC exec-breakpoint events;
+- bounded current-frame screenshot capture;
+- synchronous savestate capture and restore;
 - build-system entries for the native service.
 
 The upstream revision and patchset digest are pinned in `upstream.lock`. The launcher accepts only a
@@ -39,8 +41,9 @@ stack, and builds:
 The headless target is required. The GUI target is best-effort and may be skipped with
 `EMUCAP_DOLPHIN_BUILD_GUI=0`.
 
-`build.ps1` is a legacy Windows build helper. It is not yet part of the metadata-checked native
-launcher path; Windows native launch therefore remains unverified.
+On Windows, `build.ps1` applies the same pinned patch stack with Visual Studio 2022 and writes the
+same metadata sidecar expected by the native launcher. This source path is kept in sync, but its
+runtime behavior has not been verified in this repository's current macOS test environment.
 
 ## Launch
 
@@ -80,9 +83,9 @@ The native adapter currently advertises:
 It does not currently advertise frame stepping, read/write watchpoints, tracing, call stacks, or
 Wii input injection. These methods must not be inferred from dormant handler code.
 
-The adapter does not yet publish a feature-contract declaration, so the Control MCP reports its
-contract state as `unreported`. Its atomic methods remain available, but contract-gated composite
-tools are not admitted.
+The adapter publishes its feature-contract declaration. The Control MCP validates the declared
+instruction-only step, exact exec breakpoint, GameCube port 0 input, frozen savestate, and running
+screenshot limits before admitting composite tools.
 
 ### Memory and registers
 
@@ -121,13 +124,3 @@ mutation and acknowledges success only after Dolphin has restored the complete s
 `screenshot` captures the next frame presented after the request and returns a PNG with dimensions,
 launch generation, and `freshness="current"` provenance. It is bounded to two seconds. A frozen
 core is rejected before a capture is armed; the adapter never resumes guest execution implicitly.
-
-## Legacy GDB-stub bridge
-
-`emucap-gdb-bridge.py` can relay Dolphin's built-in PowerPC GDB stub to the emucap wire protocol.
-This path does not require the native fork, but it forces a non-JIT CPU core and exposes a smaller,
-less precise surface. It is not integrated with the preferred cross-platform MCP launcher.
-
-The PowerShell launch scripts are retained for this manual Windows workflow. They must be given the
-current listener port; do not assume a fixed port, and do not attach another GDB client because
-Dolphin's stub accepts a single persistent debugger connection.
