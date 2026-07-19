@@ -62,6 +62,7 @@ std::deque<picojson::value> s_events;
 std::map<int, u32> s_breakpoints;  // id -> address
 int s_next_bp = 1;
 bool s_bp_reported = false;  // 현재 halt에 대해 이미 breakpoint_hit 를 보고했는지
+std::string s_handler_error;
 
 // set_input 오버라이드(패드별). engaged면 GCPad::GetStatus 결과를 이 값으로 덮는다.
 std::mutex s_input_mutex;
@@ -198,6 +199,12 @@ picojson::value MakeError(const std::string& kind, const std::string& msg)
   return picojson::value(e);
 }
 
+picojson::object Fail(const std::string& message)
+{
+  s_handler_error = message;
+  return {};
+}
+
 // CPU 스레드와 경합 없이 PowerPC/메모리에 접근하기 위한 가드. 코어가 안 떠 있으면 실패.
 struct SafeAccess
 {
@@ -258,7 +265,7 @@ picojson::object ReadMemory(Core::System& system, const picojson::object& p)
 {
   uint64_t addr = 0, len = 0;
   if (!GetU64(p, "address", addr) || !GetU64(p, "length", len))
-    throw std::string("address/length 필요");
+    return Fail("address/length required");
   std::vector<uint8_t> buf(static_cast<size_t>(len));
   {
     SafeAccess sa(system);
@@ -274,10 +281,10 @@ picojson::object WriteMemory(Core::System& system, const picojson::object& p)
   uint64_t addr = 0;
   auto it = p.find("hex");
   if (!GetU64(p, "address", addr) || it == p.end() || !it->second.is<std::string>())
-    throw std::string("address/hex 필요");
+    return Fail("address/hex required");
   std::vector<uint8_t> data;
   if (!FromHex(it->second.get<std::string>(), data))
-    throw std::string("잘못된 hex");
+    return Fail("invalid hex");
   {
     SafeAccess sa(system);
     system.GetMemory().CopyToEmu(static_cast<u32>(addr), data.data(), data.size());
@@ -339,11 +346,11 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
   if (kind_it != p.end() && kind_it->second.is<std::string>() &&
       kind_it->second.get<std::string>() != "exec")
   {
-    throw std::string("exec BP만 지원(read/write watch는 미구현)");
+    return Fail("only exec breakpoints are supported");
   }
   uint64_t addr = 0;
   if (!GetU64(p, "start", addr))
-    throw std::string("start 필요");
+    return Fail("start required");
   {
     SafeAccess sa(system);
     system.GetPowerPC().GetBreakPoints().Add(static_cast<u32>(addr));
@@ -362,10 +369,10 @@ picojson::object ClearBreakpoint(Core::System& system, const picojson::object& p
 {
   uint64_t id = 0;
   if (!GetU64(p, "id", id))
-    throw std::string("id 필요");
+    return Fail("id required");
   auto it = s_breakpoints.find(static_cast<int>(id));
   if (it == s_breakpoints.end())
-    throw std::string("그런 breakpoint 없음");
+    return Fail("breakpoint not found");
   {
     SafeAccess sa(system);
     system.GetPowerPC().GetBreakPoints().Remove(it->second);
@@ -486,7 +493,7 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   if (GetU64(p, "pad", v))
     pad = static_cast<int>(v);
   if (pad < 0 || pad > 3)
-    throw std::string("pad 는 0..3");
+    return Fail("pad must be in 0..3");
 
   std::lock_guard<std::mutex> lk(s_input_mutex);
   auto engaged = p.find("engaged");
@@ -530,7 +537,7 @@ picojson::object Screenshot(Core::System&, const picojson::object&)
   std::string path = (tmpdir ? std::string(tmpdir) : std::string(".")) + "/emucap_shot.png";
   std::remove(path.c_str());
   if (!g_frame_dumper)
-    throw std::string("frame dumper 미초기화(비디오 백엔드 없음)");
+    return Fail("frame dumper is not initialized");
   // Core::SaveScreenShot 은 name 을 "<폴더>/<name>.png" 로 조합해버리므로, 전체 경로를 그대로
   // 쓰도록 FrameDumper 를 직접 호출한다. 다음 present 에 이 경로로 PNG 가 써진다.
   g_frame_dumper->SaveScreenshot(path);
@@ -552,7 +559,7 @@ picojson::object Screenshot(Core::System&, const picojson::object&)
   }
   std::remove(path.c_str());
   if (bytes.empty())
-    throw std::string("screenshot 캡처 실패(코어가 present 안 함 — 일시정지 중이면 먼저 resume)");
+    return Fail("screenshot failed because the core did not present a frame");
 
   picojson::object r;
   r["png_base64"] = picojson::value(Base64(bytes.data(), bytes.size()));
@@ -627,20 +634,17 @@ void ServeSession(Core::System& system, SOCKET sock)
       }
       else
       {
-        try
+        s_handler_error.clear();
+        picojson::object result = h(system, params);
+        if (s_handler_error.empty())
         {
           resp["ok"] = picojson::value(true);
-          resp["result"] = picojson::value(h(system, params));
+          resp["result"] = picojson::value(result);
         }
-        catch (const std::string& e)
+        else
         {
           resp["ok"] = picojson::value(false);
-          resp["error"] = MakeError("emulator_error", e);
-        }
-        catch (const std::exception& e)
-        {
-          resp["ok"] = picojson::value(false);
-          resp["error"] = MakeError("adapter_error", e.what());
+          resp["error"] = MakeError("emulator_error", s_handler_error);
         }
       }
       SendLine(sock, picojson::value(resp).serialize());
