@@ -33,12 +33,15 @@ using SOCKET = int;
 
 #include <picojson.h>
 
+#include "Common/Config/Config.h"
 #include "Common/SocketContext.h"
+#include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/Gekko.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/State.h"
 #include "Core/System.h"
@@ -58,7 +61,7 @@ std::deque<picojson::value> s_events;
 
 std::map<int, u32> s_breakpoints;  // id -> address
 int s_next_bp = 1;
-bool s_prev_stepping = false;  // BP-히트 에지 감지용
+bool s_bp_reported = false;  // 현재 halt에 대해 이미 breakpoint_hit 를 보고했는지
 
 // set_input 오버라이드(패드별). engaged면 GCPad::GetStatus 결과를 이 값으로 덮는다.
 std::mutex s_input_mutex;
@@ -238,6 +241,16 @@ picojson::object Status(Core::System& system, const picojson::object&)
   r["connected"] = picojson::value(true);
   r["state"] = picojson::value(std::string(st == Core::State::Paused ? "frozen" : "running"));
   r["adapter"] = picojson::value(std::string("dolphin-native"));
+  // exec BP 진단 필드(경량 — CPUThreadGuard 없이 읽는다): 브레이크포인트가 왜 히트/미히트
+  // 하는지 런타임 근거로 확인한다. dbg_effective 는 Config::IsDebuggingEnabled()(=
+  // MAIN_ENABLE_DEBUGGING && !achievements-hardcore) 로, 코어가 BP 를 체크하려면 true 여야 한다.
+  // cpu_core: 0=Interpreter, 1=JIT64, 4=JITARM64, 5=CachedInterpreter.
+  r["dbg_config"] = picojson::value(Config::Get(Config::MAIN_ENABLE_DEBUGGING));
+  r["dbg_effective"] = picojson::value(Config::IsDebuggingEnabled());
+  r["cpu_core"] = picojson::value(static_cast<double>(static_cast<int>(Config::Get(Config::MAIN_CPU_CORE))));
+  const auto& bps = system.GetPowerPC().GetBreakPoints();
+  r["breaking_enabled"] = picojson::value(bps.IsBreakingEnabled());
+  r["dolphin_bp_count"] = picojson::value(static_cast<double>(bps.GetBreakPoints().size()));
   return r;
 }
 
@@ -334,6 +347,9 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
   {
     SafeAccess sa(system);
     system.GetPowerPC().GetBreakPoints().Add(static_cast<u32>(addr));
+    // 캐시된 블록(JIT·CachedInterpreter)에는 BP 체크가 컴파일돼 있지 않으므로, 전체 캐시를
+    // 비워 재컴파일 시 체크가 삽입되게 한다(4바이트 InvalidateICache 만으로는 불충분).
+    system.GetJitInterface().ClearCache(sa.guard);
   }
   const int id = s_next_bp++;
   s_breakpoints[id] = static_cast<u32>(addr);
@@ -353,6 +369,7 @@ picojson::object ClearBreakpoint(Core::System& system, const picojson::object& p
   {
     SafeAccess sa(system);
     system.GetPowerPC().GetBreakPoints().Remove(it->second);
+    system.GetJitInterface().ClearCache(sa.guard);
   }
   s_breakpoints.erase(it);
   picojson::object r;
@@ -379,19 +396,43 @@ picojson::object ListBreakpoints(Core::System&, const picojson::object&)
 
 picojson::object PollEvents(Core::System& system, const picojson::object&)
 {
-  // BP-히트 에지 감지: 실행 중이던 코어가 Stepping/Paused 로 바뀌었으면 히트로 본다.
+  // BP-히트 감지. 주의: read_memory/get_state가 쓰는 CPUThreadGuard(PauseAndLock)도 코어를
+  // 잠깐 State::Stepping 으로 만든다. 그래서 단순 stepping 에지는 오탐/누락이 난다.
+  // 코어가 halt(stepping) 이고 PC가 우리가 등록한 BP 주소일 때만 진짜 히트로 본다
+  // (CheckBreakpoint가 halt 직전 ppc_state.pc = current_pc 로 맞추므로 PC == BP 주소).
+  // 에지(!s_prev_stepping) 방식은 pause/step/CPUThreadGuard 가 IsStepping 을 true 로 만들면
+  // s_prev 가 고착돼 진짜 히트의 상승 에지를 놓친다. 대신 "코어가 halt 이고 PC 가 등록된 BP
+  // 주소면 이 halt 당 한 번만 보고"한다(에지 무의존). 코어가 다시 running 이 되면 리셋.
   const bool stepping = system.GetCPU().IsStepping();
-  if (stepping && !s_prev_stepping)
+  if (stepping)
   {
-    picojson::object ev;
-    ev["type"] = picojson::value(std::string("breakpoint_hit"));
+    u32 pc = 0;
     {
       SafeAccess sa(system);
-      ev["pc"] = picojson::value(static_cast<double>(system.GetPPCState().pc));
+      pc = system.GetPPCState().pc;
     }
-    PushEvent(picojson::value(ev));
+    bool at_bp = false;
+    for (const auto& [bp_id, bp_addr] : s_breakpoints)
+    {
+      if (bp_addr == pc)
+      {
+        at_bp = true;
+        break;
+      }
+    }
+    if (at_bp && !s_bp_reported)
+    {
+      picojson::object ev;
+      ev["type"] = picojson::value(std::string("breakpoint_hit"));
+      ev["pc"] = picojson::value(static_cast<double>(pc));
+      PushEvent(picojson::value(ev));
+      s_bp_reported = true;
+    }
   }
-  s_prev_stepping = stepping;
+  else
+  {
+    s_bp_reported = false;
+  }
 
   picojson::array out;
   {
@@ -655,6 +696,9 @@ void Start(Core::System& system)
   const unsigned short port = static_cast<unsigned short>(std::atoi(port_env));
   if (port == 0)
     return;
+  // exec 브레이크포인트는 IsDebuggingEnabled() 일 때만 코어가 체크한다(config 의존 제거 —
+  // emucap 어댑터가 붙으면 항상 디버깅을 켠다). CachedInterpreter/JIT 모두 이 플래그를 본다.
+  Config::SetBaseOrCurrent(Config::MAIN_ENABLE_DEBUGGING, true);
   s_stop.store(false);
   s_thread = std::thread([&system, port] { ThreadMain(system, port); });
 }

@@ -10,15 +10,30 @@ param(
   [Parameter(Mandatory=$true)][int]$EmucapPort,
   [string]$Name = "dolphin",
   [string]$Dolphin = "C:\dolphin-build\dolphin-src\Binary\x64\Dolphin.exe",
-  [string]$User = "$env:LOCALAPPDATA\emucap\dolphin\user"
+  [string]$User = "$env:LOCALAPPDATA\emucap\dolphin\user",
+  # exec breakpoint 는 JIT 에서 신뢰성이 떨어진다(이미 컴파일된 블록엔 체크가 없음).
+  # BP 를 쓸 작업이면 -Interpreter 로 CachedInterpreter(=5)를 강제한다.
+  [switch]$Interpreter
 )
 $ErrorActionPreference = "Stop"
 
+# -Interpreter: 순수 Interpreter(CPUCore=0) + 디버깅 모드. exec BP 신뢰성을 위해 CachedInterpreter(5)
+# 가 아니라 순수 Interpreter(0)를 쓴다 — Interpreter.cpp 는 매 명령마다 런타임에
+# `if (Config::IsDebuggingEnabled()) CheckAndHandleBreakPoints()` 를 실행하므로(컴파일 게이트·블록
+# 재컴파일 타이밍 무관) BP 가 확실히 히트한다. CachedInterpreter(5)는 컴파일 시점에만 CheckBreakpoint
+# 를 삽입해 이미 컴파일된 블록엔 체크가 없어 히트하지 않는 문제가 있었다. 느리지만 set_input 으로
+# 컷신을 건너뛰면 되고, 덤프엔 정확성이 속도보다 중요하다.
+$cpuCore = if ($Interpreter) { "CPUCore = 0`n" } else { "" }
+$dbg = if ($Interpreter) { "DebugModeEnabled = True`n" } else { "" }
 New-Item -ItemType Directory -Force -Path "$User\Config" | Out-Null
 @"
-[Interface]
-ConfirmStop = False
+[Core]
+$cpuCore[Interface]
+${dbg}ConfirmStop = False
 UsePanicHandlers = False
+[DSP]
+Backend = No Audio Output
+Volume = 0
 [Analytics]
 Enabled = False
 PermissionAsked = True

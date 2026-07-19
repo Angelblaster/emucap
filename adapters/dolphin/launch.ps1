@@ -30,6 +30,9 @@ CPUThread = False
 ConfirmStop = False
 UsePanicHandlers = False
 OnScreenDisplayMessages = False
+[DSP]
+Backend = No Audio Output
+Volume = 0
 [Analytics]
 Enabled = False
 PermissionAsked = True
