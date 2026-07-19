@@ -8,8 +8,8 @@
 PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), Dolphin 포크(GameCube·Wii), MAME PC-98.
 
-**v0.9.0-alpha.5 — 알파.** 이 저장소는 계속 개발 중이며, 인터페이스·동작은 프리릴리스마다
-바뀔 수 있다.
+**v0.9.0.** 안정판 소스 릴리스. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가
+실제로 사용할 수 있는 기능을 보고한다.
 
 ## 플랫폼
 

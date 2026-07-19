@@ -1,74 +1,29 @@
 # Changelog
 
-Prerelease software — interfaces may still change.
-
-## 0.9.0-alpha.5
+## 0.9.0
 
 ### Added
-- Dolphin now exposes exact frame stepping, PowerPC disassembly, best-effort ABI call stacks, full register context on exec-breakpoint hits, and atomic cleanup of all emucap-owned breakpoints.
+- Added a source-built Dolphin adapter for GameCube and Wii, including isolated per-session profiles, screenshots, memory and register access, input, synchronous savestates, exact frame and instruction stepping, PowerPC disassembly, best-effort ABI call stacks, and execution breakpoints ([#4](https://github.com/mcpads/emucap/pull/4), thanks @uzucore).
+- `write_memory` accepts a bounded raw-binary `input_file` slice as an alternative to inline hex. The Control MCP snapshots and hashes the slice before contacting an adapter and can enforce an expected SHA-256.
+- `status.continuity.runtime_diagnostics` reports damaged or unreadable runtime evidence without guessing an exact crash cause, while keeping `bootstrap` and `status` available.
 
 ### Changed
-- Host-composed frozen input operations can reconnect only to the same control session and launch generation when a cleanup response is lost. The replacement connection must confirm its `launch_id` before an idempotent input release, breakpoint cleanup, or frozen-state restoration is retried; explicit persistent input holds are not released by reconnect alone.
-- NDS, PSP, and PC-98 instruction stepping apply one wall-clock deadline across preparation, every backend step, and terminal CPU-state collection. Each blocking GDB or WebSocket exchange is limited to the remaining budget, and the transport's ordinary timeout is restored afterward.
-- Dolphin limits each synchronous frame or instruction step request to 15 units. Its launcher uses an isolated per-port user directory for both core and Qt state and rejects symlink redirection out of that portable tree.
+- Frame and instruction stepping now share `step(count, unit, cpu?)`; unit and count limits are reported through feature-contract catalog v3 and rejected before emulator mutation.
+- Host-composed temporal operations use bounded backend deadlines and generation-checked terminal cleanup. A lost front connection cannot silently strand transient input, resume past a stop, or clean up a different launch.
+- Rust debugger bridges send progress responses during long backend work and finish in-flight cleanup before accepting a replacement front session.
+- Fork builds are pinned and serialized. Dolphin uses an isolated portable profile, Flycast records its submodule revisions, Mednafen verifies its source archive, and shared work trees use process-safe build locks.
+- NDS and PC-98 now share one bounded GDB-RSP transport implementation. A raw interrupt consumes and acknowledges its asynchronous stop reply before any new request packet is sent.
+- DeSmuME's two GDB endpoints now follow its single execution scheduler: resume, pause, breakpoint stops, instruction steps, and reset keep ARM9 and ARM7 in one coherent running or frozen state.
+- Mesen native halt remains serviceable across reset and same-process reconnects, and supported instruction-boundary freezes can save or load state without releasing the halt.
 
 ### Fixed
-- `tap`, `hold_until`, and input replay no longer strand request-scoped input merely because the front TCP connection disappears after an operation took effect. A replacement generation, an unverifiable legacy connection, or unconfirmed terminal cleanup fails loudly instead of mutating an unrelated emulator or reporting completion.
-- A delayed final debugger exchange can no longer outlive the instruction-step budget and still return `completed`. Deadline errors report the number of acknowledged steps and leave the CPU halted or frozen.
-- Dolphin rejects malformed input, unaligned exec breakpoints, and memory requests that overflow or cross mapped ranges before mutation. Timed-out frame or instruction steps now detach their pending completion state before returning, preventing a late callback from accessing expired request memory.
-
-## 0.9.0-alpha.4
-
-### Changed
-- A single synchronous frame or instruction advance is limited to 5,000 units and rejected before emulator mutation when it exceeds the active limit. Longer advances must be split into terminally acknowledged calls; `status.contracts.constraints` reports the public `step` and `run_frames` limits, including PC-98's smaller trace-mode frame limit.
-- Rust debugger bridges emit `working` responses while a backend request is active, preventing a slow GDB or WebSocket operation from appearing disconnected. If the front session disappears, the bridge finishes the current backend cleanup before accepting a replacement session.
-
-### Fixed
-- `tap` and `hold_until` now attempt input release and frozen-state restoration even when the initial input response, a step, a read, or the release edge times out after taking effect. Cleanup failure remains an error and is never reported as completion.
-- NDS, PSP, and PC-98 instruction stepping have a backend deadline below the outer request deadline. PC-98 frame operations also reject requests whose current trace-mode time estimate cannot finish within that budget.
-- Mesen2, Mednafen, and Flycast enforce the synchronous advance limit in their adapter wire handlers, so direct or older clients cannot bypass the Control MCP check.
-
-## 0.9.0-alpha.3
-
-### Added
-- `status.continuity.runtime_diagnostics` reports invalid, oversized, inaccessible, or otherwise unreadable runtime artifacts without promoting damaged adapter evidence to an exact crash. `bootstrap` and `status` remain usable and return a safe next action.
-
-### Changed
-- Direct-mode compatibility tokens and preferred listener ports now live under the private emucap runtime directory. Existing files must be regular, user-owned, and private on Unix; read and write failures are surfaced instead of silently ignored.
-- Flycast builds use a pinned commit and recursive submodule manifest, while Mednafen builds verify the pinned release archive SHA-256 before every extraction. Adapter build identities now include both the emucap and upstream revisions.
-- Shared POSIX adapter work trees use kernel advisory locks for the complete reset, patch, and build critical section. Windows Mesen builds use a work-tree-specific named mutex.
-
-### Fixed
-- Parallel adapter builds can no longer steal a live build lock based on file age or mutate the same work tree concurrently. Kernel locks are released automatically after failure or process exit, so an immediate retry is safe.
-- Launch and direct-session tests now share one process-wide environment lock and restore changed values, preventing parallel tests from leaking emulator paths or session identities into one another.
-
-## 0.9.0-alpha.2
-
-### Added
-- `write_memory` accepts a bounded raw-binary `input_file` slice as an alternative to inline hex. The Control MCP snapshots and hashes the slice before contacting the adapter, optionally enforces an expected SHA-256, and returns input provenance with the write result.
-
-### Changed
-- All Control MCP memory writes reject empty, malformed, overflowing, or over-limit payloads before transport. `status.contracts.constraints` reports the accepted input sources, byte cap, and file-load deadline.
-
-### Fixed
-- Direct, broker, and reconnecting bridge transports now enforce one bounded NDJSON frame size while preserving partial frames across read timeouts. Oversized, truncated, or invalid UTF-8 frames close their connection; direct and broker clients also discard malformed or ID-desynchronized response streams before reconnecting.
-- Broker mode probes for an existing broker before auto-spawning one, and a reaper waits for every spawned broker child so fast bind failures cannot accumulate as zombies.
-- DeSmuME GDB packet transmission and ACK handling now have a two-second total deadline and at most three attempts. Slow readers, missing ACKs, and peer resets close only that GDB connection; subsequent bridge connections can attach without restarting the emulator.
+- Direct, broker, reconnecting bridge, GDB, and WebSocket paths bound frames and blocking exchanges, reject malformed or ID-desynchronized traffic, and fail loudly when terminal cleanup cannot be confirmed.
+- Memory writes reject empty, malformed, overflowing, cross-region, and over-limit payloads before transport; adapter-specific breakpoint and input parameters are likewise validated before mutation.
+- Dolphin detaches timed-out step callbacks, reports native breakpoint hits with full register context, and atomically clears all emucap-owned breakpoints.
+- Legacy Mesen launchers select the normalized system entry, so Game Boy Color and other non-SNES media cannot silently load the wrong Lua adapter.
 
 ### Removed
-- Removed the Control MCP `tap_sequence` convenience method. Call `tap` repeatedly instead; each call releases input and returns frozen, so host latency between calls does not advance emulator time.
-
-## 0.9.0-alpha.1
-
-### Fixed
-- Legacy Mesen launchers now select the per-system Lua entry from the normalized `SYSTEM` supplied by `launch_plan`, or from an unambiguous ROM extension during direct use. Game Boy Color no longer silently falls back to the SNES entry; ambiguous media fail loudly unless `EMUCAP_MESEN_LUA` explicitly selects an entry.
-- Host-specific launch helpers and their tests now compile only on the platforms that use them, so source builds do not pull in unsupported platform paths.
-
-### Changed
-- Frame and instruction stepping now share `step(count, unit, cpu?)`. The separate Control MCP `step_instructions` method was removed, while adapter wire compatibility remains internal. Runtime unit constraints and feature contracts moved to catalog v3.
-
-### Removed
-- The Control MCP no longer exposes the host-composed `bisect` tool. Agents can binary-search the frame boundary with repeated atomic `probe` calls, preserving emulator-time semantics without a dedicated MCP method.
+- Removed the Control MCP `bisect`, `step_instructions`, and `tap_sequence` convenience methods. Agents compose the remaining bounded primitives without allowing host latency to advance frozen emulator time.
 
 ## 0.8.0
 
