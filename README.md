@@ -8,7 +8,8 @@ problem a human described in plain language. A common Core plus per-emulator
 adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
 GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
-(Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
+(Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a Dolphin fork
+(GameCube · Wii), and MAME (PC-98).
 
 **v0.9.0-alpha.5 — alpha.** This repository is under active, continuous development;
 interfaces and behavior may change between prereleases.
@@ -192,6 +193,12 @@ debugger halt to service requests without advancing the guest.
   CMake and a C++ toolchain). No PSP firmware is needed. The adapter is a pure
   WebSocket client against PPSSPP's own debugger protocol, so it's a single
   headless process plus the bridge — no GDB stub. → `adapters/ppsspp/README.md`
+- **Dolphin (GameCube · Wii)** — build the pinned native fork with
+  `adapters/dolphin/build.sh` (Windows: `build.ps1`). The default launch is
+  headless; `display: true` uses DolphinQt when the GUI build is available. The
+  adapter provides PowerPC memory and registers, exact instruction stepping,
+  exec breakpoints, bounded screenshots, and synchronous savestates. GameCube
+  also supports controller input injection. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
 

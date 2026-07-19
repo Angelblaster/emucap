@@ -1,5 +1,5 @@
 /// Self-contained runtime guidance returned to MCP clients.
-pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), PPSSPP 포크(PSP), MAME(PC-98).
+pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), PPSSPP 포크(PSP), Dolphin 포크(GameCube·Wii), MAME(PC-98).
 
 **[사용 가능 기능] 연결한 뒤 `status.methods`에 나온 도구만 사용하고, read/write_memory에는 `status.memory_types`에 나온 memory_type만 쓴다. 예를 들어 PCE가 `pce_fast`로 실행되어 디버거를 쓸 수 없으면 메모리·브레이크포인트 도구가 목록에서 빠진다. 이때는 Mednafen `status.debugger`를 확인하고 필요하면 `force_module=pce`로 다시 실행한다. PC-98 실행 방식별 차이는 `status.backend`와 `status.capability_notes`에 나온다. 시스템별 버튼명과 제한도 status 및 도구 오류에 나온 값을 따른다. hello는 어댑터와 서버가 연결될 때 쓰는 메시지이므로 직접 호출하지 않는다.**
 
