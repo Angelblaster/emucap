@@ -714,7 +714,10 @@ impl EmulatorLink for DumpLink {
         match method {
             "dump_memory" => {
                 let path = std::path::PathBuf::from(params["path"].as_str().unwrap());
-                std::fs::create_dir_all(&path).unwrap();
+                assert!(
+                    path.is_dir(),
+                    "host must create the staging directory before the adapter dump"
+                );
                 std::fs::write(path.join("main.bin"), b"NEWDUMP").unwrap();
                 std::fs::write(path.join("regions.json"), br#"[{"name":"main"}]"#).unwrap();
                 if self.sabotage_state_write {
@@ -757,6 +760,24 @@ fn dump_memory_publishes_region_files_and_state_together() {
     assert!(
         staging_leftovers(tmp.path()).is_empty(),
         "no staging/backup dirs may be left behind on success"
+    );
+}
+
+#[test]
+fn dump_memory_treats_shell_metacharacters_as_literal_path_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("dump with spaces $() ; ' literal");
+    let mut link = DumpLink::new(false);
+    let result = dump_memory(&mut link, out.to_str().unwrap()).unwrap();
+
+    assert_eq!(std::fs::read(out.join("main.bin")).unwrap(), b"NEWDUMP");
+    match result {
+        ToolOutput::Json(value) => assert_eq!(value["path"], out.to_str().unwrap()),
+        _ => panic!("Json 기대"),
+    }
+    assert!(
+        staging_leftovers(tmp.path()).is_empty(),
+        "literal metacharacter path must leave no staging directories"
     );
 }
 

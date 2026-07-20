@@ -3,8 +3,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 The Mesen adapter has two license boundaries:
 
-- Runtime Lua (`emucap-core.lua` and the per-system entry scripts) is loaded as
-  a separate script and is licensed GPL-2.0-or-later, the project default.
+- Runtime Lua (the shared modules and per-system entry scripts) is loaded as a
+  separate script and is licensed GPL-2.0-or-later, the project default.
 - `patches/*.patch` modifies and is compiled into MesenCE. That patch stack is a
   derivative of MesenCE and is licensed GPL-3.0-or-later.
 

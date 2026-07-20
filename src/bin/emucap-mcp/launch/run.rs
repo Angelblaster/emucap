@@ -802,6 +802,7 @@ pub(super) fn launch_mednafen(
     };
     let log = adapter_log_path("mednafen", port, "mednafen.log");
     let sound = a.sound.unwrap_or(false);
+    let display = a.display.unwrap_or(false);
     let spec = emucap::launch::mednafen::Launch {
         binary: &binary,
         explicit_binary: explicit,
@@ -812,7 +813,7 @@ pub(super) fn launch_mednafen(
         name: a.name.as_deref(),
         session_token: token,
         runtime: Some(runtime),
-        headless: false,
+        headless: !display,
         sound,
     };
     match emucap::launch::mednafen::launch(&spec) {
@@ -820,6 +821,7 @@ pub(super) fn launch_mednafen(
             "launched": true,
             "adapter": "mednafen",
             "module": module,
+            "display": display,
             "sound": sound,
             "pid": pid,
             "port": port,

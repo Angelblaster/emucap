@@ -27,8 +27,16 @@ pub fn mednafen_spec(
     sound: bool,
     opts: &SpecOpts,
 ) -> LaunchSpec {
-    let mut spec =
-        LaunchSpec::new(binary, log_path).args(["-sound", if sound { "1" } else { "0" }]);
+    let mut spec = LaunchSpec::new(binary, log_path);
+    // Homebrew's current `sdl2` is SDL3-backed sdl2-compat. Its macOS OpenGL swap can wait
+    // indefinitely before Mednafen releases the first video sync, which also prevents the
+    // emulation-thread adapter from connecting. The software framebuffer avoids that startup
+    // deadlock and works for both the visible Cocoa and headless SDL providers.
+    #[cfg(target_os = "macos")]
+    {
+        spec = spec.args(["-video.driver", "softfb"]);
+    }
+    spec = spec.args(["-sound", if sound { "1" } else { "0" }]);
     if module == Some("md") {
         spec = spec.args(["-md.input.auto", "0", "-md.input.port1", "gamepad6"]);
     }

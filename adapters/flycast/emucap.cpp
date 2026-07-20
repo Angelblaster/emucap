@@ -5,6 +5,7 @@
 #include "emulator.h"
 #include "emucap_failure.h"
 #include "emucap_input.h"
+#include "emucap_native_failure.h"
 #include "hw/sh4/sh4_if.h"
 #include "hw/sh4/sh4_opcode_list.h"  // OpDesc[]·Disassemble (disassemble)
 #include "hw/mem/addrspace.h"
@@ -33,6 +34,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 #ifdef _WIN32
 #include <winsock2.h>   // Windows 소켓(MinGW) — POSIX sys/socket.h 대체
 #include <ws2tcpip.h>   // inet_pton
@@ -93,6 +95,7 @@ size_t g_tx_pos = 0;      // g_tx의 다음 전송 byte
 static const size_t TX_CAP = 8 * 1024 * 1024;
 static const long MAX_SYNC_ADVANCE = 5000;
 uint64_t g_frame = 0;     // vblank 카운터(우리 기준)
+std::atomic<uint64_t> g_observed_frame{0};  // UI-thread diagnostics read this snapshot.
 bool g_frozen = false;    // freeze 상태(스핀으로 프레임 진행 차단)
 long g_step_id = -1;      // step(frames) 완료 응답 대기 id
 long g_step_remaining = 0;
@@ -142,15 +145,21 @@ static const size_t CALLSTACK_CAP = 256;
 // Fatal state is captured on the emulation thread before the upstream throw. While active, the
 // same thread remains at that exact point and serves only read-only diagnostic methods.
 bool g_failure_active = false;
-bool g_failure_captured = false;
+std::atomic<bool> g_failure_captured{false};
 bool g_failure_file_written = false;
 bool g_failure_dismissed = false;
 bool g_failure_synthetic = false;
 bool g_synthetic_fatal_pending = false;
+long g_test_adapter_exception_id = -1;
 std::atomic<bool> g_failure_shutdown_requested{false};
 std::string g_failure_reason;
 uint32_t g_failure_epc = 0;
 uint32_t g_failure_event = 0;
+bool g_internal_failure_active = false;
+char g_internal_failure_operation[128]{};
+char g_internal_failure_reason[512]{};
+std::atomic<bool> g_capture_disabled{false};
+std::mutex g_failure_artifact_mtx;
 
 const char* PROTOCOL_NAME = "flycast";
 
@@ -213,6 +222,7 @@ void emucap_disconnect() {
 	g_step_id = -1;
 	g_step_remaining = 0;
 	g_synthetic_fatal_pending = false;
+	g_test_adapter_exception_id = -1;
 	if (g_fd >= 0) emucap_closesock(g_fd);
 	g_fd = -1;
 	g_rx.clear();
@@ -431,6 +441,82 @@ void reply_err(long id, const char* kind, const char* msg) {
 	char head[96];
 	snprintf(head, sizeof(head), "{\"id\":%ld,\"ok\":false,\"error\":{\"kind\":\"%s\",\"message\":\"", id, kind);
 	send_line(std::string(head) + json_escape(msg) + "\"}}");
+}
+
+bool publish_native_failure(
+	const char* operation,
+	const char* reason,
+	bool active,
+	const char* execution_state) noexcept {
+	try {
+		std::lock_guard<std::mutex> lock(g_failure_artifact_mtx);
+		if (g_failure_captured.load()) return false;
+		std::string error;
+		const bool written = emucap_publish_native_failure(
+			"flycast-native",
+			EMUCAP_BUILD_HASH,
+			g_observed_frame.load(std::memory_order_relaxed),
+			operation,
+			reason,
+			active,
+			execution_state,
+			&error);
+		if (!written)
+			fprintf(stderr, "emucap: cannot persist native adapter failure: %s\n", error.c_str());
+		return written;
+	} catch (const std::exception& error) {
+		fprintf(stderr, "emucap: native adapter failure serialization failed: %s\n", error.what());
+	} catch (...) {
+		fprintf(stderr, "emucap: native adapter failure serialization failed\n");
+	}
+	return false;
+}
+
+void remember_active_native_failure(const char* operation, const char* reason) noexcept {
+	g_internal_failure_active = true;
+	snprintf(
+		g_internal_failure_operation,
+		sizeof(g_internal_failure_operation),
+		"%s",
+		operation != nullptr ? operation : "unknown");
+	snprintf(
+		g_internal_failure_reason,
+		sizeof(g_internal_failure_reason),
+		"%s",
+		reason != nullptr ? reason : "unknown native adapter exception");
+	(void)publish_native_failure(
+		g_internal_failure_operation, g_internal_failure_reason, true, "unknown");
+}
+
+void recover_native_failure_after_status() noexcept {
+	if (!g_internal_failure_active) return;
+	const char* state = g_frozen ? "frozen" : "running";
+	if (publish_native_failure(
+			g_internal_failure_operation, g_internal_failure_reason, false, state)) {
+		g_internal_failure_active = false;
+	}
+}
+
+void flush_pending_internal_error(long id, const char* reason) noexcept {
+	if (id < 0 || g_fd < 0) return;
+	try {
+		reply_err(id, "internal_error", reason);
+		for (int guard = 0; guard < 16 && g_fd >= 0 && !g_tx.empty(); guard++) {
+			const TxFlush status = flush_tx_once();
+			if (status == TX_COMPLETE || status == TX_IDLE || status == TX_ERROR) break;
+			emucap_sock_wait_ms(1);
+		}
+	} catch (...) {
+	}
+}
+
+void contain_service_exception(const char* operation, const char* reason) noexcept {
+	const long pending_id =
+		g_test_adapter_exception_id >= 0 ? g_test_adapter_exception_id : g_step_id;
+	g_frozen = true;
+	flush_pending_internal_error(pending_id, reason);
+	remember_active_native_failure(operation, reason);
+	emucap_disconnect();
 }
 
 bool normalize_sync_advance(long id, long& count) {
@@ -873,7 +959,7 @@ void handle_get_trace(long id, const std::string& line) {
 	long count = 256;
 	json_num(line, "count", count);
 	if (count < 1) count = 1;
-	const bool crash_ring = g_failure_captured;
+	const bool crash_ring = g_failure_captured.load();
 	const uint64_t crash_sequence = g_emucap_crash_pc_sequence;
 	const size_t crash_count = (size_t)std::min<uint64_t>(crash_sequence, EMUCAP_CRASH_PC_CAP);
 	const size_t available = crash_ring ? crash_count : g_trace_count;
@@ -963,6 +1049,8 @@ void handle(const std::string& line) {
 			     "\"find_pattern\",\"disassemble\",\"get_rom_info\","
 			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\",\"dismiss_failure\"";
 			if (env_enabled("EMUCAP_ENABLE_TEST_FATAL")) r += ",\"test_fatal\"";
+			if (env_enabled("EMUCAP_ENABLE_TEST_ADAPTER_EXCEPTION"))
+				r += ",\"test_adapter_exception\"";
 			r += "],"
 			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
@@ -994,7 +1082,7 @@ void handle(const std::string& line) {
 			}
 			reply_ok(id, r);
 		} else if (method == "status") {
-			std::string state = g_failure_captured ? "crashed" : (g_frozen ? "frozen" : "running");
+			std::string state = g_failure_captured.load() ? "crashed" : (g_frozen ? "frozen" : "running");
 			std::string result = "{\"connected\":true,\"frame\":" + std::to_string(g_frame)
 				+ ",\"state\":\"" + state + "\",\"adapter\":\"flycast\""
 				+ ",\"input_override\":{\"observable\":true,\"engaged\":"
@@ -1006,7 +1094,7 @@ void handle(const std::string& line) {
 				std::lock_guard<std::mutex> lk(g_fb_mtx);
 				result += std::string(",\"framebuffer_fresh\":") + (g_fb_fresh ? "true" : "false");
 			}
-			if (g_failure_captured) {
+			if (g_failure_captured.load()) {
 				result += ",\"reason\":\"" + json_escape(g_failure_reason) + "\""
 					+ std::string(",\"failure_context_available\":")
 					+ (g_failure_file_written ? "true" : "false")
@@ -1016,8 +1104,15 @@ void handle(const std::string& line) {
 					+ ",\"incoming_event\":" + std::to_string(g_failure_event)
 					+ ",\"trace_scope\":\"interpreter\"";
 			}
+			if (g_internal_failure_active) {
+				result += ",\"adapter_failure_active\":true,\"adapter_failure_operation\":\""
+					+ json_escape(g_internal_failure_operation) + "\"";
+			}
+			result += std::string(",\"frame_capture_available\":")
+				+ (g_capture_disabled.load() ? "false" : "true");
 			result += "}";
 			reply_ok(id, result);
+			recover_native_failure_after_status();
 		} else if (method == "dismiss_failure") {
 			if (!g_failure_active) {
 				reply_err(id, "no_active_failure", "no active fatal quarantine");
@@ -1035,6 +1130,10 @@ void handle(const std::string& line) {
 		} else if (method == "test_fatal" && env_enabled("EMUCAP_ENABLE_TEST_FATAL")) {
 			g_synthetic_fatal_pending = true;
 			reply_ok(id, "{\"scheduled\":true}");
+		} else if (
+			method == "test_adapter_exception"
+			&& env_enabled("EMUCAP_ENABLE_TEST_ADAPTER_EXCEPTION")) {
+			g_test_adapter_exception_id = id;
 		} else if (method == "read_memory") {
 			handle_read_memory(id, line);
 		} else if (method == "write_memory") {
@@ -1097,6 +1196,13 @@ void handle(const std::string& line) {
 			emu.requestReset();
 			reply_ok(id, "{\"reset\":true}");
 		} else if (method == "screenshot") {
+			if (g_capture_disabled.load()) {
+				reply_err(
+					id,
+					"internal_error",
+					"frame capture was disabled after a native adapter exception; inspect get_failure_context");
+				return;
+			}
 			// 연속 버퍼에서 즉시 PNG 인코딩(emu 스레드, GL 불필요). UI 스레드가 매 렌더마다 raw를 채워두므로
 			// frozen서도 동작한다(버퍼=freeze 직전 프레임=frozen 상태). gui_runOnUiThread/지연은 freeze 중
 			// UI 렌더가 막혀 데드락이라 쓰지 않는다.
@@ -1218,7 +1324,10 @@ void emucap_capture_fatal_sh4(
 	snapshot.pc_ring_count = (size_t)std::min<uint64_t>(crash_sequence, EMUCAP_CRASH_PC_CAP);
 
 	g_failure_active = true;
-	g_failure_captured = true;
+	{
+		std::lock_guard<std::mutex> lock(g_failure_artifact_mtx);
+		g_failure_captured.store(true);
+	}
 	g_failure_dismissed = false;
 	g_failure_synthetic = incoming_event == 0xFFFFFFFFu;
 	g_failure_shutdown_requested.store(false);
@@ -1265,7 +1374,11 @@ void emucap_capture_fatal_sh4(
 		try {
 			if (g_fd < 0) emucap_connect();
 			if (g_fd >= 0) serve_socket_once();
+		} catch (const std::exception& error) {
+			fprintf(stderr, "emucap: fatal quarantine socket service failed: %s\n", error.what());
+			emucap_disconnect();
 		} catch (...) {
+			fprintf(stderr, "emucap: fatal quarantine socket service failed\n");
 			emucap_disconnect();
 		}
 		emucap_sock_wait_ms(2);
@@ -1275,18 +1388,21 @@ void emucap_capture_fatal_sh4(
 	// dismiss, deadline, or UI shutdown without re-entering cleanup on corrupted guest state.
 	if (!g_failure_synthetic)
 		std::_Exit(EXIT_FAILURE);
-	if (g_failure_synthetic && g_failure_dismissed)
-		g_failure_captured = false;
+	if (g_failure_synthetic && g_failure_dismissed) {
+		std::lock_guard<std::mutex> lock(g_failure_artifact_mtx);
+		g_failure_captured.store(false);
+	}
 }
 
 void emucap_notify_shutdown() noexcept {
 	g_failure_shutdown_requested.store(true);
 }
 
-// vblank마다(emu 스레드). 예외는 전부 삼켜 프레임 루프를 보호한다.
+// vblank마다(emu 스레드). 예외는 프레임 루프 밖으로 내보내지 않고 현재 요청과 세션을 닫는다.
 void emucap_service() {
 	try {
 		g_frame++;
+		g_observed_frame.store(g_frame, std::memory_order_relaxed);
 		// 입력 주입은 MapleConfigMap::GetInput(emu 스레드 소비 지점)의 pjs->kcode override에서 이뤄진다
 		// (maple_cfg.cpp, build.sh 주입). 여기선 kcode[] 전역을 쓰지 않는다: 게임 입력엔 불필요(GetInput
 		// override가 항상 이김)하고 UI 스레드 gamepad 핸들러와 경쟁하므로 주입 상태는 emucap_kcode()에서 합친다.
@@ -1322,12 +1438,17 @@ void emucap_service() {
 		}
 
 		serve_socket_once();
+		if (g_test_adapter_exception_id >= 0)
+			throw std::runtime_error("injected native adapter service exception");
 		if (g_synthetic_fatal_pending) {
 			g_synthetic_fatal_pending = false;
 			emucap_capture_fatal_sh4(
 				"Synthetic SH4 fatal (test gate)", Sh4cntx.pc, 0xFFFFFFFFu, 0, 0, 0);
 		}
+	} catch (const std::exception& error) {
+		contain_service_exception("service", error.what());
 	} catch (...) {
+		contain_service_exception("service", "unknown native adapter exception");
 	}
 }
 
@@ -1369,7 +1490,10 @@ void emucap_bp_spin(uint32_t pc) {
 			serve_socket_once();
 			usleep(2000);
 		}
+	} catch (const std::exception& error) {
+		contain_service_exception("breakpoint_spin", error.what());
 	} catch (...) {
+		contain_service_exception("breakpoint_spin", "unknown native adapter exception");
 	}
 }
 
@@ -1421,7 +1545,17 @@ void emucap_trace_hook(uint32_t pc) {
 				else if (g_bp_hits.size() < 4096) g_bp_hits.push_back({pc, emucap_capture_regs()});
 			}
 		}
+	} catch (const std::exception& error) {
+		g_trace_enabled = false;
+		g_watch_enabled = false;
+		rebuild_trace_armed();
+		(void)publish_native_failure("trace", error.what(), false, "running");
 	} catch (...) {
+		g_trace_enabled = false;
+		g_watch_enabled = false;
+		rebuild_trace_armed();
+		(void)publish_native_failure(
+			"trace", "unknown native adapter exception", false, "running");
 	}
 }
 
@@ -1432,12 +1566,19 @@ void emucap_capture_latest() {
 	// GetLastFrame은 FBO 블릿 + glReadPixels(전 프레임)이라 매 렌더 호출은 비용이 크다 → N프레임마다만
 	// 캡처(버퍼는 ~N/60초 이내라 screenshot엔 충분, frozen 직전 프레임도 충분히 최신). running 시에만 도는
 	// 함수라(frozen 중엔 UI 렌더가 멈춤) 캡처 정지=비용 0.
+	if (g_capture_disabled.load()) return;
 	static unsigned tick = 0;
 	if ((tick++ & 3) != 0) return;   // 4프레임마다(약 15Hz)
 	try {
 		std::lock_guard<std::mutex> lk(g_fb_mtx);
 		emucap_capture_raw(g_fb_raw, g_fb_w, g_fb_h);
 		g_fb_fresh = !g_fb_raw.empty() && g_fb_w > 0 && g_fb_h > 0;
+	} catch (const std::exception& error) {
+		g_capture_disabled.store(true);
+		(void)publish_native_failure("frame_capture", error.what(), false, "running");
 	} catch (...) {
+		g_capture_disabled.store(true);
+		(void)publish_native_failure(
+			"frame_capture", "unknown native adapter exception", false, "running");
 	}
 }

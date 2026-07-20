@@ -23,10 +23,9 @@ fn main() -> anyhow::Result<()> {
     // 8s default, not 5s: the emucap fork's `emucap.screenshot` has its own internal 5.0s wait for
     // GE stepping (`WebSocketGPUBufferEmucapScreenshot`'s `timeoutSeconds`) before it replies with an
     // error event. A 5s socket read timeout here would race that; the client's
-    // own read can time out (`bridge_error`/IO) a few ms ahead of PPSSPP's reply, which then
-    // arrives unread on the socket and gets misattributed as an error to whatever unrelated
-    // request comes next (this transport demuxes by event name only, no per-request id). Comfortably
-    // outlasting PPSSPP's known worst-case wait avoids that race in the common case.
+    // own read can time out (`bridge_error`/IO) a few ms ahead of PPSSPP's reply. Every bridge
+    // request is ticket-correlated, so a late reply cannot be attributed to a later command;
+    // comfortably outlasting PPSSPP's known worst-case wait still avoids a false timeout.
     //
     // 8s does NOT cover savestate: the fork's `SaveStateSubscriber.cpp` waits up to 15s for the save/
     // load to complete before replying, so `save_state`/`load_state` get a dedicated per-call read

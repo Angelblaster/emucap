@@ -24,9 +24,9 @@
 //! Two PPSSPP protocol quirks shape the stepping/pause/resume/poll_events code below:
 //! - `cpu.stepInto`/`cpu.stepOver`/`cpu.stepOut`/`cpu.runUntil`/`cpu.nextHLE` have **no synchronous
 //!   reply** — PPSSPP acks them with a *differently named* spontaneous `cpu.stepping` event once the
-//!   step completes (`SteppingSubscriber.cpp`). `cpu.resume` and the plain `cpu.stepping` (pause)
-//!   request DO ack under their own name, so the existing `call()` demux (match-by-name) already
-//!   handles those two; `call_and_wait_for` covers the mismatched-name case for stepping verbs.
+//!   step completes (`SteppingSubscriber.cpp`). The fork echoes each request's `ticket` on these
+//!   asynchronous stepping/resume acknowledgements, so the transport can correlate them just as it
+//!   does ordinary same-name replies and errors.
 //! - The `cpu.stepping` event's optional `reason`/`relatedAddress` fields (which would otherwise say
 //!   *why* the CPU stopped, e.g. `"cpu.breakpoint"`) are in practice never populated — `Core_Break()`
 //!   sets `g_cpuStepCommand.type = CPUStepType::None` in the same breath it stores the reason, which
@@ -79,23 +79,21 @@ const MAX_READ_LEN: usize = 0x2_0000;
 /// Cap on `press_buttons`' `frames` (hold duration). PPSSPP only acks `input.buttons.press` once
 /// the button auto-releases after `duration` frames elapse (`WebSocketInputState::Broadcast`), so
 /// `call()` blocks for that long — at PSP's ~60 fps a large `frames` value (e.g. a 10s hold, 600
-/// frames) runs past the bridge binary's 8s WS read timeout (`emucap-ppsspp-bridge.rs`), which then
-/// misattributes PPSSPP's late reply to whatever unrelated request comes next (this transport
-/// demuxes by event name only, no per-request id — see the module doc). 240 frames (~4s at 60 fps)
-/// leaves a comfortable margin under that 8s timeout for the round trip and any frame-timing
-/// jitter; hold a button longer by issuing repeated `press_buttons` calls or `set_input` instead.
+/// frames) runs past the bridge binary's 8s WS read timeout (`emucap-ppsspp-bridge.rs`). Tickets keep
+/// a late release from being mistaken for another command, but the original call would still fail
+/// and need best-effort input cleanup. 240 frames (~4s at 60 fps) leaves a comfortable margin under
+/// that timeout for the round trip and any frame-timing jitter; hold a button longer by issuing
+/// repeated `press_buttons` calls or `set_input` instead.
 const MAX_PRESS_FRAMES: u64 = 240;
 
 /// Dedicated WS read budget for `save_state`/`load_state`, threaded per-call over the bridge's
 /// default read timeout (8s, `emucap-ppsspp-bridge.rs`). The emucap fork's `SaveStateSubscriber.cpp`
 /// runs the async save/load on the EmuThread and blocks up to `cv.wait_for(..., seconds(15))` before
 /// it replies. The 8s default is shorter than that worst case, so a slow (>8s) save/load would time
-/// out on the bridge's socket read while PPSSPP is still working: the `call()` reports a spurious
-/// failure, PPSSPP's later reply arrives unread, and — since this transport demuxes by event name
-/// only — a stale `{event:"error"}` (PPSSPP's own 15s timeout) gets misattributed to whatever
-/// unrelated request is next. Giving just these two calls a budget past the fork's 15s wait lets the
-/// savestate call absorb its own reply/error while every other read keeps failing fast. Kept bounded
-/// (not unbounded) so a genuinely wedged save still surfaces an error rather than hanging forever.
+/// out on the bridge's socket read while PPSSPP is still working, reporting a spurious failure.
+/// Ticket correlation prevents that late response from contaminating the next request, while this
+/// dedicated budget avoids the false timeout in the first place. It remains bounded so a genuinely
+/// wedged save still surfaces an error rather than hanging forever.
 const SAVESTATE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Dedicated WS read budget for `reset`. The emucap fork's headless build performs a *real* reboot
@@ -415,3 +413,7 @@ mod tests;
 #[cfg(test)]
 #[path = "ppsspp_bridge_temporal_tests.rs"]
 mod temporal_tests;
+
+#[cfg(test)]
+#[path = "ppsspp_bridge_transport_tests.rs"]
+mod transport_tests;

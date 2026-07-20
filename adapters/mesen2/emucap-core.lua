@@ -23,6 +23,7 @@ local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
 local socket = require("socket.core")
 local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
+local Dump = require("emucap_dump")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -1441,26 +1442,7 @@ end
 local DUMP_REGIONS = SYS.dump_regions
 
 function handlers.dump_memory(p)
-  if not p.path then return false, "bad_params", "path 필요" end
-  os.execute('mkdir -p "' .. p.path .. '"')
-  local metas = {}
-  for _, r in ipairs(DUMP_REGIONS) do
-    local mt = emu.memType[r.mt]
-    local buf = {}
-    for i = 0, r.size - 1 do
-      buf[i + 1] = string.char(emu.read(i, mt, false))
-    end
-    local f = assert(io.open(p.path .. "/" .. r.name .. ".bin", "wb"))
-    f:write(table.concat(buf))
-    f:close()
-    metas[#metas + 1] = string.format(
-      '{"name":"%s","memory_type":"%s","base_address":%d,"size":%d}',
-      r.name, r.mt, r.base, r.size)
-  end
-  local mf = assert(io.open(p.path .. "/regions.json", "wb"))
-  mf:write("[" .. table.concat(metas, ",") .. "]")
-  mf:close()
-  return true, { path = p.path, regions = #DUMP_REGIONS }
+  return Dump.write(p, DUMP_REGIONS, emu, io.open)
 end
 
 -- ── 바이트패턴 검색 (find_pattern) ───────────────────────────

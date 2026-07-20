@@ -42,7 +42,11 @@ done
 # WebSocket). Both carry the identical patch stack (loopback-bind + savestate/screenshot + the GUI
 # --debugger=<port> honoring from 0005 + the isolated memstick from 0006), so the launcher can pick
 # either binary with one build.
-cmake -S "$SRC" -B "$SRC/build-headless" -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release
+# Homebrew upgrades replace versioned Fontconfig Cellar paths. Drop only those cached discovery
+# values before configuring so an existing build tree follows the currently linked formula instead
+# of failing on a deleted older include directory.
+cmake -S "$SRC" -B "$SRC/build-headless" -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release \
+  -U 'Fontconfig_*' -U '*FONTCONFIG*'
 # PPSSPPHeadless is the guaranteed default target — a failure here fails the build (set -e).
 cmake --build "$SRC/build-headless" --target PPSSPPHeadless -j
 echo "built: $SRC/build-headless/PPSSPPHeadless"

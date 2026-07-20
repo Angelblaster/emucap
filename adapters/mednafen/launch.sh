@@ -243,6 +243,11 @@ if [ "${EMUCAP_HEADLESS:-1}" = "1" ]; then
 fi
 
 ARGS=(-sound "${MEDNAFEN_SOUND:-0}")
+if [ "$(uname -s 2>/dev/null || echo unknown)" = "Darwin" ]; then
+  # Homebrew's SDL2 package is SDL3-backed sdl2-compat. Its Cocoa OpenGL swap can block before
+  # Mednafen releases the first video sync, so neither emulation nor the adapter starts.
+  ARGS=(-video.driver softfb "${ARGS[@]}")
+fi
 if [ "$MODULE" = "md" ]; then
   # Force a 6-button pad so the emucap raw input mask has a stable 2-byte buffer.
   # Games that only use 3-button inputs still see the low bits normally.

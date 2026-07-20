@@ -178,11 +178,15 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 
 # 1. 어댑터 소스 복사
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
-echo "→ emucap.cpp/.h + input ownership + failure serializer 복사: $SRC/core/"
+cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/core/"
+echo "→ emucap.cpp/.h + input ownership + failure serializers 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
 # HEAD와 대조해 재빌드 필요 여부 확인 — build-time 임베드라 재빌드 안 하면 옛 hash 그대로). 미커밋이면 -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h emucap_failure.cpp emucap_failure.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+git -C "$HERE" diff --quiet HEAD -- \
+  emucap.cpp emucap.h emucap_input.h emucap_failure.cpp emucap_failure.h \
+  ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
+  2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@flycast-${FLYCAST_COMMIT:0:12}"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
@@ -204,6 +208,7 @@ done
 
 # 독립 serializer gate: upstream 헤더 없이 128 KiB 상한·R0-R15·원자 파일 교체를 먼저 검증한다.
 "$HERE/test-failure.sh"
+"$HERE/../_common/test-native-failure.sh"
 echo "→ Flycast fatal serializer 단독 회귀 테스트 통과"
 
 # 2. emulator.cpp 훅: emucap.h include + vblank()에 emucap_service() 호출(Event::VBlank 직후).
@@ -308,6 +313,8 @@ perl -0777 -pi -e 's{(\n\t\tcore/nullDC\.cpp\n)}{$1\t\tcore/emucap.cpp\n} unless
   "$SRC/CMakeLists.txt"
 perl -0777 -pi -e 's{(\n\t\tcore/emucap\.cpp\n)}{$1\t\tcore/emucap_failure.cpp\n} unless m{core/emucap_failure\.cpp}' \
   "$SRC/CMakeLists.txt"
+perl -0777 -pi -e 's{(\n\t\tcore/emucap_failure\.cpp\n)}{$1\t\tcore/emucap_native_failure.cpp\n} unless m{core/emucap_native_failure\.cpp}' \
+  "$SRC/CMakeLists.txt"
 if [ "${EMUCAP_FLYCAST_DISABLE_CRASH_RING:-0}" = "1" ]; then
   perl -0777 -pi -e 's{(\n\t\tcore/debug/gdb_server\.h\)\n)}{$1\ntarget_compile_definitions(flycast PRIVATE EMUCAP_DISABLE_CRASH_PC_RING)\n} unless m{EMUCAP_DISABLE_CRASH_PC_RING}' \
     "$SRC/CMakeLists.txt"
@@ -316,7 +323,8 @@ if [ "${EMUCAP_FLYCAST_DISABLE_CRASH_RING:-0}" = "1" ]; then
 fi
 inject_check 'core/emucap.cpp' "$SRC/CMakeLists.txt"
 inject_check 'core/emucap_failure.cpp' "$SRC/CMakeLists.txt"
-echo "→ CMakeLists.txt target_sources에 emucap + fatal serializer 추가"
+inject_check 'core/emucap_native_failure.cpp' "$SRC/CMakeLists.txt"
+echo "→ CMakeLists.txt target_sources에 emucap + failure serializers 추가"
 
 # 3b. macOS 필수 빌드 픽스(클린 upstream엔 없음 — 텍스처 디버그 mods와 무관한 빌드 자체 픽스).
 #     (1) enable_language(OBJC): macOS는 .mm(Objective-C)라 OBJC 언어 활성 없으면 generate가

@@ -23,7 +23,12 @@ fn saturn_spec_has_module_and_content_and_headless() {
     );
     assert_eq!(
         spec.args,
-        vec!["-sound", "0", "-force_module", "ss", "game.cue"]
+        [
+            #[cfg(target_os = "macos")]
+            vec!["-video.driver", "softfb"],
+            vec!["-sound", "0", "-force_module", "ss", "game.cue"],
+        ]
+        .concat()
     );
     assert!(spec
         .env
@@ -44,17 +49,22 @@ fn md_spec_forces_six_button_pad() {
     );
     assert_eq!(
         spec.args,
-        vec![
-            "-sound",
-            "0",
-            "-md.input.auto",
-            "0",
-            "-md.input.port1",
-            "gamepad6",
-            "-force_module",
-            "md",
-            "game.md"
+        [
+            #[cfg(target_os = "macos")]
+            vec!["-video.driver", "softfb"],
+            vec![
+                "-sound",
+                "0",
+                "-md.input.auto",
+                "0",
+                "-md.input.port1",
+                "gamepad6",
+                "-force_module",
+                "md",
+                "game.md",
+            ],
         ]
+        .concat()
     );
 }
 
@@ -83,7 +93,12 @@ fn pce_spec_enables_sound_only_when_requested() {
     );
     assert_eq!(
         spec.args,
-        vec!["-sound", "1", "-force_module", "pce", "game.cue"]
+        [
+            #[cfg(target_os = "macos")]
+            vec!["-video.driver", "softfb"],
+            vec!["-sound", "1", "-force_module", "pce", "game.cue"],
+        ]
+        .concat()
     );
 }
 

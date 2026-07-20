@@ -133,6 +133,53 @@ fn process_state_requires_matching_start_identity() {
     assert_eq!(process_state(&reused), ProcessState::Exited);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_process_identity_uses_kernel_microseconds_and_accepts_legacy_capsules() {
+    let captured = capture_process(std::process::id());
+    let start = captured.start_identity.as_deref().unwrap();
+    let fields: Vec<_> = start.split(':').collect();
+    assert_eq!(fields.len(), 3);
+    assert_eq!(fields[0], "macos-bsdinfo");
+    assert!(fields[1].parse::<u64>().unwrap() > 0);
+    assert!(fields[2].parse::<u64>().unwrap() < 1_000_000);
+    assert_eq!(process_state(&captured), ProcessState::Alive);
+
+    let legacy = ProcessIdentity {
+        pid: captured.pid,
+        start_identity: legacy_macos_process_start_identity(captured.pid),
+    };
+    assert!(legacy.start_identity.is_some());
+    assert_eq!(process_state(&legacy), ProcessState::Alive);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_rapid_child_restart_captures_distinct_start_identity() {
+    let mut first = std::process::Command::new("/bin/sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let first_identity = capture_process(first.id());
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(first_identity.start_identity.is_some());
+    assert_eq!(process_state(&first_identity), ProcessState::Exited);
+
+    let mut second = std::process::Command::new("/bin/sleep")
+        .arg("5")
+        .spawn()
+        .unwrap();
+    let second_identity = capture_process(second.id());
+    second.kill().unwrap();
+    second.wait().unwrap();
+    assert!(second_identity.start_identity.is_some());
+    assert_ne!(
+        first_identity.start_identity,
+        second_identity.start_identity
+    );
+}
+
 #[test]
 fn current_rejects_path_traversal_launch_id() {
     let tmp = tempfile::tempdir().unwrap();

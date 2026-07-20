@@ -1,0 +1,128 @@
+diff --git c/Core/Debugger/WebSocket/SteppingBroadcaster.h w/Core/Debugger/WebSocket/SteppingBroadcaster.h
+--- c/Core/Debugger/WebSocket/SteppingBroadcaster.h
++++ w/Core/Debugger/WebSocket/SteppingBroadcaster.h
+@@ -17,6 +17,10 @@
+ 
+ #pragma once
+ 
++#include <deque>
++#include <string>
++
++#include "Common/Data/Format/JSONReader.h"
+ #include "Core/Core.h"
+ 
+ namespace net {
+@@ -29,9 +33,12 @@
+ 		prevState_ = coreState;
+ 	}
+ 
++	void ExpectRequest(const char *event, const json::JsonGet &data);
+ 	void Broadcast(net::WebSocketServer *ws);
+ 
+ private:
+ 	CoreState prevState_;
+ 	int lastCounter_ = 0;
++	std::deque<std::string> steppingTickets_;
++	std::deque<std::string> resumeTickets_;
+ };
+diff --git c/Core/Debugger/WebSocket/SteppingBroadcaster.cpp w/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
+--- c/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
++++ w/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
+@@ -15,6 +15,9 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
++#include <cstring>
++#include <utility>
++
+ #include "Core/Core.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/Debugger/WebSocket/SteppingBroadcaster.h"
+@@ -23,13 +26,15 @@
+ #include "Core/System.h"
+ 
+ struct CPUSteppingEvent {
+-	CPUSteppingEvent(const SteppingReason &reason) : reason_(reason) {
++	CPUSteppingEvent(const SteppingReason &reason, const std::string &ticket) : reason_(reason), ticket_(ticket) {
+ 	}
+ 
+ 	operator std::string() {
+ 		JsonWriter j;
+ 		j.begin();
+ 		j.writeString("event", "cpu.stepping");
++		if (!ticket_.empty())
++			j.writeRaw("ticket", ticket_);
+ 		j.writeUint("pc", currentMIPS->pc);
+ 		// A double ought to be good enough for a 156 day debug session.
+ 		j.writeFloat("ticks", CoreTiming::GetTicks());
+@@ -43,8 +48,31 @@
+ 
+ private:
+ 	const SteppingReason &reason_;
++	const std::string &ticket_;
+ };
+ 
++static std::string RequestTicket(const JsonGet &data) {
++	const JsonNode *value = data.get("ticket");
++	return value ? json_stringify(value) : "";
++}
++
++void SteppingBroadcaster::ExpectRequest(const char *event, const JsonGet &data) {
++	std::string ticket = RequestTicket(data);
++	if (ticket.empty())
++		return;
++
++	if (!strcmp(event, "cpu.resume")) {
++		resumeTickets_.push_back(std::move(ticket));
++	} else if (!strcmp(event, "cpu.stepping") ||
++		!strcmp(event, "cpu.stepInto") ||
++		!strcmp(event, "cpu.stepOver") ||
++		!strcmp(event, "cpu.stepOut") ||
++		!strcmp(event, "cpu.runUntil") ||
++		!strcmp(event, "cpu.nextHLE")) {
++		steppingTickets_.push_back(std::move(ticket));
++	}
++}
++
+ // CPU has begun stepping (cpu.stepping)
+ //
+ // Sent unexpectedly with these properties:
+@@ -61,9 +89,22 @@
+ 		int steppingCounter = Core_GetSteppingCounter();
+ 		// We ignore CORE_POWERDOWN as a stepping state.
+ 		if (coreState == CORE_STEPPING_CPU && steppingCounter != lastCounter_) {
+-			ws->Send(CPUSteppingEvent(Core_GetSteppingReason()));
++			std::string ticket;
++			if (!steppingTickets_.empty()) {
++				ticket = std::move(steppingTickets_.front());
++				steppingTickets_.pop_front();
++			}
++			ws->Send(CPUSteppingEvent(Core_GetSteppingReason(), ticket));
+ 		} else if (prevState_ == CORE_STEPPING_CPU && coreState != CORE_STEPPING_CPU && Core_IsActive()) {
+-			ws->Send(R"({"event":"cpu.resume"})");
++			JsonWriter j;
++			j.begin();
++			j.writeString("event", "cpu.resume");
++			if (!resumeTickets_.empty()) {
++				j.writeRaw("ticket", resumeTickets_.front());
++				resumeTickets_.pop_front();
++			}
++			j.end();
++			ws->Send(j.str());
+ 		}
+ 		lastCounter_ = steppingCounter;
+ 		prevState_ = coreState;
+diff --git c/Core/Debugger/WebSocket.cpp w/Core/Debugger/WebSocket.cpp
+--- c/Core/Debugger/WebSocket.cpp
++++ w/Core/Debugger/WebSocket.cpp
+@@ -187,6 +187,10 @@
+ 			std::lock_guard<std::mutex> guard(lifecycleLock);
+ 			eventFunc->second(req);
+ 			if (!req.Finish()) {
++				// emucap: asynchronous CPU-control requests acknowledge through SteppingBroadcaster
++				// instead of DebuggerRequest::Respond(). Preserve the request ticket there too, so
++				// a delayed halt/resume cannot satisfy an unrelated later command.
++				stepping.ExpectRequest(event, root);
+ 				// Poll more frequently for a second in case this triggers something.
+ 				highActivity = 1000;
+ 			}

@@ -2,6 +2,16 @@
 
 Prerelease software — interfaces may still change.
 
+## 0.10.0-rc.1
+
+### Fixed
+- Native Mednafen and Flycast adapter failures survive reconnects as bounded diagnostic artifacts instead of collapsing into an unexplained transport timeout.
+- Mesen treats requested dump paths as literal file paths and no longer passes live dump destinations through a shell command.
+- Mednafen preserves the full unsigned 32-bit address domain on Windows and rejects malformed or overflowing numeric arguments before mutation.
+- macOS runtime ownership uses the kernel process-start identity, reducing the chance that a reused PID is mistaken for the launched emulator.
+- PPSSPP debugger requests carry per-request tickets, so a delayed reply or error cannot be attributed to a later unrelated command; asynchronous CPU stepping acknowledgements echo the same identity in the local fork.
+- Mednafen uses its software framebuffer on macOS to avoid an SDL2-compat OpenGL startup deadlock, and `display` now selects visible versus headless launch as documented.
+
 ## 0.10.0-alpha.2
 
 ### Fixed

@@ -323,11 +323,17 @@ impl<L: EmulatorLink> ObservedLink<L> {
 
     fn rebuild_snapshot(&mut self) {
         let adapter_failure = self.adapter_failure.as_ref();
-        let adapter_exact = self
+        let adapter_valid = self
             .current
             .as_ref()
             .zip(adapter_failure)
-            .is_some_and(|(current, failure)| adapter_failure_is_exact(current, failure));
+            .is_some_and(|(current, failure)| adapter_failure_is_current(current, failure));
+        let adapter_exact = adapter_valid
+            && adapter_failure.is_some_and(|failure| {
+                failure.get("kind").and_then(Value::as_str) != Some("adapter_internal_error")
+            });
+        let adapter_active =
+            adapter_valid && adapter_failure.is_some_and(adapter_failure_is_active);
         let lease = self
             .record
             .as_ref()
@@ -356,9 +362,11 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 state: ExecutionState::Exited,
                 source: "host".into(),
             }
-        } else if adapter_exact {
+        } else if adapter_active {
             ExecutionContinuity {
-                state: ExecutionState::Crashed,
+                state: adapter_failure
+                    .map(adapter_failure_execution)
+                    .unwrap_or(ExecutionState::Unknown),
                 source: "adapter".into(),
             }
         } else if transport.state == TransportState::Connected {
@@ -377,15 +385,24 @@ impl<L: EmulatorLink> ObservedLink<L> {
             .as_ref()
             .and_then(|record| record.last_failure.as_ref())
             .is_some();
-        let evidence = if adapter_exact {
+        let evidence = if adapter_exact && adapter_active {
             EvidenceContinuity {
                 state: EvidenceState::Exact,
+                failure_context_available: true,
+            }
+        } else if adapter_active {
+            EvidenceContinuity {
+                state: if last_status.is_some() {
+                    EvidenceState::LastGood
+                } else {
+                    EvidenceState::Unavailable
+                },
                 failure_context_available: true,
             }
         } else if transport.state == TransportState::Connected && last_status.is_some() {
             EvidenceContinuity {
                 state: EvidenceState::Live,
-                failure_context_available: link_failure_available,
+                failure_context_available: adapter_valid || link_failure_available,
             }
         } else if last_status.is_some() {
             EvidenceContinuity {
@@ -395,7 +412,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
         } else {
             EvidenceContinuity {
                 state: EvidenceState::Unavailable,
-                failure_context_available: link_failure_available,
+                failure_context_available: adapter_valid || link_failure_available,
             }
         };
         self.snapshot = ContinuitySnapshot {
@@ -794,8 +811,8 @@ fn status_execution(status: Option<&Value>) -> Option<ExecutionContinuity> {
     })
 }
 
-fn adapter_failure_is_exact(current: &CurrentManifest, failure: &Value) -> bool {
-    failure.get("schema_version").and_then(Value::as_u64) == Some(1)
+fn adapter_failure_is_current(current: &CurrentManifest, failure: &Value) -> bool {
+    let base_valid = failure.get("schema_version").and_then(Value::as_u64) == Some(1)
         && failure.get("launch_id").and_then(Value::as_str) == Some(current.launch_id.as_str())
         && failure
             .get("kind")
@@ -805,8 +822,29 @@ fn adapter_failure_is_exact(current: &CurrentManifest, failure: &Value) -> bool 
             .get("observed_at_unix_ms")
             .and_then(Value::as_u64)
             .is_some()
-        && failure.get("frame").and_then(Value::as_u64).is_some()
-        && failure.get("epc").and_then(Value::as_u64).is_some()
+        && failure.get("frame").and_then(Value::as_u64).is_some();
+    if !base_valid {
+        return false;
+    }
+    if failure.get("kind").and_then(Value::as_str) == Some("adapter_internal_error") {
+        return failure
+            .get("adapter")
+            .and_then(Value::as_str)
+            .is_some_and(|adapter| !adapter.is_empty())
+            && failure
+                .get("operation")
+                .and_then(Value::as_str)
+                .is_some_and(|operation| !operation.is_empty())
+            && failure.get("reason").and_then(Value::as_str).is_some()
+            && failure.get("active").and_then(Value::as_bool).is_some()
+            && failure
+                .get("execution_state")
+                .and_then(Value::as_str)
+                .is_some_and(|state| {
+                    matches!(state, "running" | "frozen" | "crashed" | "unknown")
+                });
+    }
+    failure.get("epc").and_then(Value::as_u64).is_some()
         && failure
             .get("incoming_event")
             .and_then(Value::as_u64)
@@ -816,6 +854,23 @@ fn adapter_failure_is_exact(current: &CurrentManifest, failure: &Value) -> bool 
             .and_then(Value::as_object)
             .is_some()
         && failure.get("pc_ring").and_then(Value::as_array).is_some()
+}
+
+fn adapter_failure_is_active(failure: &Value) -> bool {
+    failure
+        .get("active")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn adapter_failure_execution(failure: &Value) -> ExecutionState {
+    match failure.get("execution_state").and_then(Value::as_str) {
+        Some("running") => ExecutionState::Running,
+        Some("frozen") => ExecutionState::Frozen,
+        Some("crashed") => ExecutionState::Crashed,
+        Some("unknown") => ExecutionState::Unknown,
+        _ => ExecutionState::Crashed,
+    }
 }
 
 fn lease_view(

@@ -534,11 +534,19 @@ pub fn process_state(process: &ProcessIdentity) -> ProcessState {
     let Some(expected) = process.start_identity.as_deref() else {
         return ProcessState::Unknown;
     };
-    match process_start_identity(process.pid) {
-        Some(actual) if actual == expected => ProcessState::Alive,
-        Some(_) => ProcessState::Exited,
+    match process_start_identity_matches(process.pid, expected) {
+        Some(true) => ProcessState::Alive,
+        Some(false) => ProcessState::Exited,
         None => ProcessState::Unknown,
     }
+}
+
+fn process_start_identity_matches(pid: u32, expected: &str) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if !expected.starts_with("macos-bsdinfo:") {
+        return legacy_macos_process_start_identity(pid).map(|actual| actual == expected);
+    }
+    process_start_identity(pid).map(|actual| actual == expected)
 }
 
 #[cfg(target_os = "linux")]
@@ -550,7 +558,50 @@ fn process_start_identity(pid: u32) -> Option<String> {
     Some(format!("{}:{start_ticks}", boot_id.trim()))
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn process_start_identity(pid: u32) -> Option<String> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let buffer_size = libc::c_int::try_from(size).ok()?;
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            buffer_size,
+        )
+    };
+    if read != buffer_size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_pid != pid as u32 || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000
+    {
+        return None;
+    }
+    Some(format!(
+        "macos-bsdinfo:{}:{:06}",
+        info.pbi_start_tvsec, info.pbi_start_tvusec
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn legacy_macos_process_start_identity(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn process_start_identity(pid: u32) -> Option<String> {
     let output = Command::new("ps")
         .args(["-o", "lstart=", "-p", &pid.to_string()])

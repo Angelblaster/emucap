@@ -192,6 +192,116 @@ fn matching_adapter_failure_is_exact_crash_evidence() {
 }
 
 #[test]
+fn active_native_adapter_error_preserves_cause_without_claiming_exact_guest_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47831);
+    std::fs::write(
+        store.adapter_failure_path(47831, &current.launch_id),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "launch_id": current.launch_id,
+            "adapter": "mednafen-native",
+            "kind": "adapter_internal_error",
+            "operation": "service",
+            "reason": "injected failure",
+            "observed_at_unix_ms": 1,
+            "frame": 2,
+            "active": true,
+            "execution_state": "unknown"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inner = SequenceLink::new(47831, &current.launch_id, []);
+    let mut link = ObservedLink::with_store(inner, store);
+
+    let continuity = link.continuity();
+    assert_eq!(continuity.execution.state, ExecutionState::Unknown);
+    assert_eq!(continuity.execution.source, "adapter");
+    assert_eq!(continuity.evidence.state, EvidenceState::Unavailable);
+    assert!(continuity.evidence.failure_context_available);
+    let context = link.failure_context();
+    assert_eq!(context["adapter_failure"]["kind"], "adapter_internal_error");
+    assert_eq!(context["adapter_failure"]["operation"], "service");
+}
+
+#[test]
+fn active_native_adapter_error_demotes_prior_live_status_to_last_good() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47833);
+    let inner = SequenceLink::new(
+        47833,
+        &current.launch_id,
+        [Outcome::Ok(serde_json::json!({"state": "running"}))],
+    );
+    let mut link = ObservedLink::with_store(inner, store.clone());
+    link.call("status", serde_json::json!({})).unwrap();
+    std::fs::write(
+        store.adapter_failure_path(47833, &current.launch_id),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "launch_id": current.launch_id,
+            "adapter": "flycast-native",
+            "kind": "adapter_internal_error",
+            "operation": "service",
+            "reason": "failure after status",
+            "observed_at_unix_ms": 2,
+            "frame": 3,
+            "active": true,
+            "execution_state": "unknown"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    link.failure_context();
+    let continuity = link.continuity();
+    assert_eq!(continuity.execution.state, ExecutionState::Unknown);
+    assert_eq!(continuity.execution.source, "adapter");
+    assert_eq!(continuity.evidence.state, EvidenceState::LastGood);
+    assert!(continuity.evidence.failure_context_available);
+}
+
+#[test]
+fn recovered_native_adapter_error_remains_context_without_overriding_live_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47832);
+    std::fs::write(
+        store.adapter_failure_path(47832, &current.launch_id),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "launch_id": current.launch_id,
+            "adapter": "flycast-native",
+            "kind": "adapter_internal_error",
+            "operation": "trace",
+            "reason": "injected failure",
+            "observed_at_unix_ms": 1,
+            "frame": 2,
+            "active": false,
+            "execution_state": "running"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inner = SequenceLink::new(
+        47832,
+        &current.launch_id,
+        [Outcome::Ok(serde_json::json!({"state": "running"}))],
+    );
+    let mut link = ObservedLink::with_store(inner, store);
+
+    link.call("status", serde_json::json!({})).unwrap();
+    let continuity = link.continuity();
+    assert_eq!(continuity.execution.state, ExecutionState::Running);
+    assert_eq!(continuity.execution.source, "adapter");
+    assert_eq!(continuity.evidence.state, EvidenceState::Live);
+    assert!(continuity.evidence.failure_context_available);
+}
+
+#[test]
 fn matching_launch_id_without_exact_snapshot_schema_is_not_promoted() {
     let tmp = tempfile::tempdir().unwrap();
     let store = RuntimeStore::new(tmp.path().join("sessions"));

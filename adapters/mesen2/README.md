@@ -48,6 +48,10 @@ not provide live MCP control.
 
 The ROM path is auto-inferred via `getRomInfo`; if inference is off, fix the `ROM_PATH` fallback at the
 top of `emucap.lua`, or override it when finalizing with `emucap finalize --rom`.
+`OUTPUT_ROOT` must remain a relative slash-separated path whose components use only ASCII letters,
+digits, `_`, `-`, and `.`. Empty, `.`/`..`, absolute, backslash, whitespace, and shell-metacharacter
+components are rejected before the compatibility directory helper runs. This keeps retrospective
+capture usable in unmodified Mesen without interpreting user-controlled shell syntax.
 
 ## Launch internals & macOS caveats
 
@@ -119,6 +123,8 @@ that Mesen exited, so reconnect and query `status` before launching another proc
   disassembly API, so a 65816 decoder is implemented directly in the adapter (M/X flags
   start from `cpu.ps` and track REP/SEP).
 - Analysis: `dump_memory`/`probe`/`regression_run`.
+- `dump_memory` writes only into the staging directory already created by the MCP host. The requested
+  path is passed to file I/O literally; the adapter does not create or interpolate it through a shell.
 - `verify_determinism` — measures reproducibility by replaying a reproduction recipe N
   times and matching hashes (determinism_replay gate).
 - **Note**: of the above, `tap`/`hold_until`/`regression_run`/

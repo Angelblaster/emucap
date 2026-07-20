@@ -11,9 +11,9 @@ GBA · NES), a Mednafen fork
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
 (PlayStation 2), a Dolphin fork (GameCube · Wii), and MAME (PC-98).
 
-**v0.10.0-alpha.2 — alpha.** This repository is under active, continuous development;
-interfaces and behavior may change between prereleases. Adapter availability remains
-host-dependent and is reported by `status`.
+**v0.10.0-rc.1 — release candidate.** Interfaces and behavior may still change before
+the stable 0.10.0 release. Adapter availability remains host-dependent and is reported
+by `status`.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 

@@ -1,4 +1,4 @@
-// Mednafen 포크의 라이브 제어 소켓 클라이언트(우리 IP). emucap-mcp(서버)에 접속해 NDJSON
+// Mednafen 포크의 emucap 라이브 제어 소켓 클라이언트. emucap-mcp(서버)에 접속해 NDJSON
 // 프로토콜을 서비스한다 — Mesen의 emucap-core.lua에 대응하는 C++판. Rust 측(TcpLink·tools·
 // MCP)은 그대로 동작한다. 대상은 Saturn(ss), PSX(psx), PC Engine(pce), Mega Drive(md)이다.
 //
@@ -12,6 +12,8 @@
 
 #include "emucap.h"
 #include "emucap_input.h"
+#include "emucap_json_num.h"
+#include "emucap_native_failure.h"
 
 // 빌드 hash(build.sh가 생성; 없으면 unknown 폴백 — LSP·build.sh 밖 직접 컴파일 대비).
 #if defined(__has_include)
@@ -25,6 +27,7 @@
 
 #include <exception>
 #include <atomic>
+#include <stdexcept>
 
 #ifdef _WIN32
 #include <winsock2.h>   // Windows 소켓(MinGW) — POSIX sys/socket.h 대체
@@ -137,6 +140,10 @@ size_t g_tx_pos = 0;
 static const size_t TX_CAP = 8 * 1024 * 1024;
 static const long MAX_SYNC_ADVANCE = 5000;
 uint64_t g_frame = 0;
+long g_test_adapter_exception_id = -1;
+bool g_internal_failure_active = false;
+char g_internal_failure_operation[128]{};
+char g_internal_failure_reason[512]{};
 
 // 지연 명령(run_frames): N프레임 진행 후 응답. 진행 중엔 새 명령을 받지 않고 keepalive를 보낸다.
 long g_def_id = -1;
@@ -237,7 +244,7 @@ bool g_insn_skip_first = false;
 long g_probe_id = -1;
 long g_probe_remaining = 0;
 std::string g_probe_mt;
-long g_probe_addr = 0;
+uint32 g_probe_addr = 0;
 long g_probe_len = 0;
 
 int emucap_port() {
@@ -250,7 +257,7 @@ void rearm_breakpoints();
 
 void cancel_session_requests() {
   const bool had_request = g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
-      || g_insn_step_id >= 0;
+      || g_insn_step_id >= 0 || g_test_adapter_exception_id >= 0;
   if (g_def_is_press) g_input_override.release();
   g_def_id = -1;
   g_def_remaining = 0;
@@ -266,6 +273,7 @@ void cancel_session_requests() {
   g_insn_step_id = -1;
   g_insn_remaining = 0;
   g_insn_skip_first = false;
+  g_test_adapter_exception_id = -1;
   if (g_insn_armed) rearm_breakpoints();
   if (had_request)
     fprintf(stderr, "emucap: connection ended; cancelled session-scoped request\n");
@@ -451,6 +459,115 @@ void reply_err(long id, const char* kind, const char* msg) {
   char head[96];
   snprintf(head, sizeof(head), "{\"id\":%ld,\"ok\":false,\"error\":{\"kind\":\"%s\",\"message\":\"", id, kind);
   send_line(std::string(head) + json_escape(msg) + "\"}}");  // msg는 예외 등 비신뢰 → 이스케이프
+}
+
+bool json_u32_arg(
+    long id,
+    const std::string& line,
+    const char* key,
+    uint32& out,
+    bool required,
+    bool* present = nullptr) {
+  std::uint32_t parsed = 0;
+  const EmucapJsonNumberStatus status = emucap_json_u32(line, key, parsed);
+  if (present) *present = status != EmucapJsonNumberStatus::absent;
+  if (status == EmucapJsonNumberStatus::absent && !required) return true;
+  if (status != EmucapJsonNumberStatus::valid) {
+    const std::string message =
+        std::string(key) + (status == EmucapJsonNumberStatus::absent
+            ? " is required"
+            : " must be an unsigned 32-bit integer");
+    reply_err(id, "bad_params", message.c_str());
+    return false;
+  }
+  out = static_cast<uint32>(parsed);
+  return true;
+}
+
+bool publish_native_failure(
+    const char* operation,
+    const char* reason,
+    bool active,
+    const char* execution_state) noexcept {
+  try {
+    std::string error;
+    const bool written = emucap_publish_native_failure(
+        "mednafen-native",
+        EMUCAP_BUILD_HASH,
+        g_frame,
+        operation,
+        reason,
+        active,
+        execution_state,
+        &error);
+    if (!written)
+      fprintf(stderr, "emucap: cannot persist native adapter failure: %s\n", error.c_str());
+    return written;
+  } catch (const std::exception& error) {
+    fprintf(stderr, "emucap: native adapter failure serialization failed: %s\n", error.what());
+  } catch (...) {
+    fprintf(stderr, "emucap: native adapter failure serialization failed\n");
+  }
+  return false;
+}
+
+void remember_active_native_failure(const char* operation, const char* reason) noexcept {
+  g_internal_failure_active = true;
+  snprintf(
+      g_internal_failure_operation,
+      sizeof(g_internal_failure_operation),
+      "%s",
+      operation != nullptr ? operation : "unknown");
+  snprintf(
+      g_internal_failure_reason,
+      sizeof(g_internal_failure_reason),
+      "%s",
+      reason != nullptr ? reason : "unknown native adapter exception");
+  (void)publish_native_failure(
+      g_internal_failure_operation, g_internal_failure_reason, true, "unknown");
+}
+
+void recover_native_failure_after_status() noexcept {
+  if (!g_internal_failure_active) return;
+  const char* state = g_frozen ? "frozen" : "running";
+  if (publish_native_failure(
+          g_internal_failure_operation, g_internal_failure_reason, false, state)) {
+    g_internal_failure_active = false;
+  }
+}
+
+void flush_pending_internal_error(long id, const char* reason) noexcept {
+  if (id < 0 || g_fd < 0) return;
+  try {
+    reply_err(id, "internal_error", reason);
+    for (int guard = 0; guard < 16 && g_fd >= 0 && !g_tx.empty(); guard++) {
+      const TxFlush status = flush_tx_once();
+      if (status == TX_COMPLETE || status == TX_IDLE || status == TX_ERROR) break;
+      usleep(1000);
+    }
+  } catch (...) {
+  }
+}
+
+void contain_service_exception(const char* operation, const char* reason) noexcept {
+  const long pending_ids[] = {
+      g_def_id, g_probe_id, g_step_id, g_insn_step_id, g_test_adapter_exception_id};
+  g_frozen = true;
+  g_frozen_via_cb = false;
+  for (size_t i = 0; i < sizeof(pending_ids) / sizeof(pending_ids[0]); i++) {
+    bool duplicate = false;
+    for (size_t previous = 0; previous < i; previous++)
+      duplicate = duplicate || pending_ids[previous] == pending_ids[i];
+    if (!duplicate) flush_pending_internal_error(pending_ids[i], reason);
+  }
+  remember_active_native_failure(operation, reason);
+  emucap_disconnect();
+}
+
+bool adapter_exception_test_enabled() {
+  const char* value = getenv("EMUCAP_ENABLE_TEST_ADAPTER_EXCEPTION");
+  return value != nullptr
+      && (!strcmp(value, "1") || !strcasecmp(value, "true"));
 }
 
 bool normalize_sync_advance(long id, long& count, bool allow_zero) {
@@ -806,18 +923,19 @@ static const long MAX_FIND_LEN = 16L * 1024 * 1024;  // 16MB — 벌크 read라 
 static const uint64 DUMP_MAX_REGION_BYTES = 64ULL * 1024 * 1024;  // 64MB
 
 // 주소공간 [addr, addr+len)을 hex 문자열로. aspace 없거나 범위 위반이면 false. read_memory·probe 공용.
-bool read_aspace_hex(const std::string& mt, long addr, long len, std::string& hex_out) {
+bool read_aspace_hex(const std::string& mt, uint32 addr, long len, std::string& hex_out) {
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) return false;
   // 주소·길이 범위 검증 — 거대 length는 reserve에서 std::bad_alloc을 던져 핸들러 밖으로
   // 탈출시켜 에뮬레이터를 죽인다. 이 검증으로 uint32 캐스팅(off/chunk)도 잘림 없이 안전해진다.
-  if (addr < 0 || len < 0 || len > MAX_READ_LEN) return false;
+  if (len < 0 || len > MAX_READ_LEN) return false;
   uint64 end = (uint64)addr + (uint64)len;
   if (end > 0x100000000ULL || (sp->size && end > sp->size)) return false;
   hex_out.clear();
   hex_out.reserve((size_t)len * 2);
   static uint8 buf[0x10000];
-  long off = addr, remaining = len;
+  uint64 off = addr;
+  long remaining = len;
   while (remaining > 0) {
     long chunk = remaining > (long)sizeof(buf) ? (long)sizeof(buf) : remaining;
     sp->GetAddressSpaceBytes(mt.c_str(), (uint32)off, (uint32)chunk, buf);
@@ -879,15 +997,16 @@ void handle_find_pattern(long id, const std::string& line) {
     return;
   }
 
-  long start = 0, length = -1, max_matches = 256, align = 1;
-  json_num(line, "start", start);
+  uint32 start = 0;
+  if (!json_u32_arg(id, line, "start", start, false)) return;
+  long length = -1, max_matches = 256, align = 1;
   bool has_length = json_num(line, "length", length);
   json_num(line, "max_matches", max_matches);
   json_num(line, "align", align);
   if (max_matches < 1) max_matches = 1;
   if (max_matches > 4096) max_matches = 4096;
   if (align < 1) align = 1;
-  if (start < 0 || (uint64)start >= sp->size) {
+  if ((uint64)start >= sp->size) {
     reply_err(id, "bad_params", "start 범위 초과");
     return;
   }
@@ -931,15 +1050,16 @@ void handle_find_pattern(long id, const std::string& line) {
   arr += "]";
   char tail[160];
   snprintf(tail, sizeof(tail),
-           ",\"count\":%zu,\"start\":%ld,\"scanned\":%u,\"truncated\":%s}",
-           matches.size(), start, (unsigned)scan_len, truncated ? "true" : "false");
+           ",\"count\":%zu,\"start\":%u,\"scanned\":%u,\"truncated\":%s}",
+           matches.size(), (unsigned)start, (unsigned)scan_len, truncated ? "true" : "false");
   reply_ok(id, "{\"matches\":" + arr + tail);
 }
 
 void handle_read_memory(long id, const std::string& line) {
   std::string mt = json_str(line, "memory_type");
-  long addr = 0, len = 0;
-  json_num(line, "address", addr);
+  uint32 addr = 0;
+  if (!json_u32_arg(id, line, "address", addr, true)) return;
+  long len = 0;
   json_num(line, "length", len);
   // Saturn "physical"(합성 128MB SH-2 버스)은 미구현이라 read가 조용히 0을 준다 — advertise되는데도
   // silent-wrong이므로 명확히 거부하고 구체 region memory_type을 쓰게 한다(가치-조건 BP가 kSSBusRegions로
@@ -955,8 +1075,8 @@ void handle_read_memory(long id, const std::string& line) {
 
 void handle_write_memory(long id, const std::string& line) {
   std::string mt = json_str(line, "memory_type");
-  long addr = 0;
-  json_num(line, "address", addr);
+  uint32 addr = 0;
+  if (!json_u32_arg(id, line, "address", addr, true)) return;
   std::string hex = json_str(line, "hex");
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
@@ -971,7 +1091,6 @@ void handle_write_memory(long id, const std::string& line) {
               "Mednafen Saturn physical address space write is a no-op; use a specific region memory_type (workraml/workramh/scspram/vdp1vram/vdp2vram/cram)");
     return;
   }
-  if (addr < 0 || addr > 0xFFFFFFFFL) { reply_err(id, "bad_params", "address 범위 초과"); return; }
   // 홀수 길이 hex는 마지막 nibble을 조용히 버리는 오류를 낸다 — Mesen 어댑터와 동일하게 거부한다.
   if (hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex는 짝수 길이 hex 문자열이어야"); return; }
   std::vector<uint8> bytes;
@@ -1787,8 +1906,13 @@ void handle_set_layer_enable(long id, const std::string& line) {
     // 막고, Rust 프록시가 빈 배열을 omit과 동일 처리하는 계약과도 일치시킨다.
     do_apply = (matched > 0);
   } else {
-    long raw = 0;
-    if (json_num(line, "mask", raw)) {
+    std::uint64_t raw = 0;
+    const EmucapJsonNumberStatus mask_status = emucap_json_u64(line, "mask", raw);
+    if (mask_status == EmucapJsonNumberStatus::invalid) {
+      reply_err(id, "bad_params", "mask must be an unsigned 64-bit integer");
+      return;
+    }
+    if (mask_status == EmucapJsonNumberStatus::valid) {
       mask = (uint64_t)raw;
       do_apply = true;
     }
@@ -1979,14 +2103,15 @@ void handle_watch_register(long id, const std::string& line) {
     reply_err(id, "bad_params", m.c_str());
     return;
   }
-  long mn = 0, mx = 0;
-  json_num(line, "min", mn);
-  json_num(line, "max", mx);
+  uint32 mn = 0, mx = 0;
+  if (!json_u32_arg(id, line, "min", mn, true)
+      || !json_u32_arg(id, line, "max", mx, true))
+    return;
   bool pause = true;
   json_bool(line, "pause_on_hit", pause);
   g_watch_reg = reg;
-  g_watch_min = (uint32)mn;
-  g_watch_max = (uint32)mx;
+  g_watch_min = mn;
+  g_watch_max = mx;
   g_watch_pause = pause;
   g_watch_enabled = true;
   rearm_breakpoints();
@@ -2102,6 +2227,9 @@ void handle(const std::string& line) {
     if (MDFNGameInfo) {
       methods += ",\"get_rom_info\"";
     }
+    if (adapter_exception_test_enabled()) {
+      methods += ",\"test_adapter_exception\"";
+    }
     // memory_types: 이 게임의 debugger address space 이름들(없으면 빈 배열). read/write_memory의
     // 유효한 memory_type 목록이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
     std::string mtypes;
@@ -2215,9 +2343,19 @@ void handle(const std::string& line) {
       resp += hex_bytes(g_last_smpc_oreg, sizeof(g_last_smpc_oreg));
       resp += "\"}";
     }
+    if (g_internal_failure_active) {
+      resp.pop_back();
+      resp += ",\"adapter_failure_active\":true,\"adapter_failure_operation\":\"";
+      resp += json_escape(g_internal_failure_operation);
+      resp += "\"}";
+    }
     reply_ok(id, resp);
+    recover_native_failure_after_status();
   } else if (method == "get_rom_info") {
     handle_get_rom_info(id);
+  } else if (
+      method == "test_adapter_exception" && adapter_exception_test_enabled()) {
+    g_test_adapter_exception_id = id;
   } else if (method == "read_memory") {
     handle_read_memory(id, line);
   } else if (method == "find_pattern") {
@@ -2353,6 +2491,10 @@ void handle(const std::string& line) {
     long frames = 0;
     json_num(line, "frame", frames);
     if (!normalize_sync_advance(id, frames, true)) return;
+    uint32 probe_addr = 0;
+    if (!json_u32_arg(id, line, "address", probe_addr, true)) return;
+    long probe_len = 0;
+    json_num(line, "length", probe_len);
     try {                              // 즉시 복귀(원자적 진입)
       FileStream fs(path, FileStream::MODE_READ);
       MDFNSS_LoadSM(&fs);
@@ -2361,10 +2503,8 @@ void handle(const std::string& line) {
     g_probe_id = id;                   // 진행·읽기·응답은 emucap_service가(그 사이 새 명령 차단)
     g_probe_remaining = frames;
     g_probe_mt = probe_mt;
-    g_probe_addr = 0;
-    g_probe_len = 0;
-    json_num(line, "address", g_probe_addr);
-    json_num(line, "length", g_probe_len);
+    g_probe_addr = probe_addr;
+    g_probe_len = probe_len;
   } else if (method == "set_breakpoint") {
     std::string kind = json_str(line, "kind");
     if (kind.empty()) kind = "exec";  // kind 생략 시 기본 exec
@@ -2376,14 +2516,11 @@ void handle(const std::string& line) {
       return;
     }
     std::string mt = json_str(line, "memory_type");
-    long start = 0, end = 0;
-    json_num(line, "start", start);
-    json_num(line, "end", end);
-    if (end < start) end = start;
-    if (start < 0 || end > 0xFFFFFFFFL) {
-      reply_err(id, "bad_params", "start/end 범위 초과(0..0xFFFFFFFF)");
+    uint32 start = 0, end = 0;
+    if (!json_u32_arg(id, line, "start", start, true)
+        || !json_u32_arg(id, line, "end", end, true))
       return;
-    }
+    if (end < start) end = start;
     int type = (kind == "read") ? BPOINT_READ : (kind == "write") ? BPOINT_WRITE : BPOINT_PC;
     bool logical = true;
     bool adapter_bp = false;
@@ -2407,8 +2544,8 @@ void handle(const std::string& line) {
         // The public memory_type uses byte offsets like read_memory("vram0"), so convert here.
         uint32 vdc = (mt == "vram1") ? 1u : 0u;
         type = (type == BPOINT_READ) ? BPOINT_AUX_READ : BPOINT_AUX_WRITE;
-        start = (long)((vdc << 16) | (((uint32)start) >> 1));
-        end = (long)((vdc << 16) | (((uint32)end) >> 1));
+        start = (vdc << 16) | (start >> 1);
+        end = (vdc << 16) | (end >> 1);
         logical = true;
       } else if (type == BPOINT_READ || type == BPOINT_WRITE) {
         // 기본 logical(cpu, 16비트) read/write BP: 범위 밖은 GetLastLogicalReadAddr(16비트)와 안 맞아 미발화.
@@ -2424,22 +2561,22 @@ void handle(const std::string& line) {
             reply_err(id, "bad_params", "MD ram BP 범위는 0x0000..0xFFFF");
             return;
           }
-          start = (long)(0xFF0000u | ((uint32)start & 0xFFFFu));
-          end = (long)(0xFF0000u | ((uint32)end & 0xFFFFu));
+          start = 0xFF0000u | (start & 0xFFFFu);
+          end = 0xFF0000u | (end & 0xFFFFu);
         } else if (mt == "zram") {
           if (start > 0x1FFF || end > 0x1FFF) {
             reply_err(id, "bad_params", "MD zram BP 범위는 0x0000..0x1FFF");
             return;
           }
-          start = (long)(0xA00000u | ((uint32)start & 0x1FFFu));
-          end = (long)(0xA00000u | ((uint32)end & 0x1FFFu));
+          start = 0xA00000u | (start & 0x1FFFu);
+          end = 0xA00000u | (end & 0x1FFFu);
         } else if (mt == "vram" || mt == "cram" || mt == "vsram" || mt == "vdpreg") {
           if (type != BPOINT_WRITE) {
             reply_err(id, "unsupported", "MD VDP read BP는 아직 미지원 — write BP만 지원");
             return;
           }
           uint32 max_addr = mt == "vram" ? 0xFFFFu : mt == "vdpreg" ? 0x1Fu : 0x7Fu;
-          if ((uint32)start > max_addr || (uint32)end > max_addr) {
+          if (start > max_addr || end > max_addr) {
             reply_err(id, "bad_params", "MD VDP BP 범위 초과");
             return;
           }
@@ -2467,12 +2604,12 @@ void handle(const std::string& line) {
           bool matched = false;
           for (const auto& r : kSSBusRegions) {
             if (mt == r.mt) {
-              if ((uint32)start >= r.size || (uint32)end >= r.size) {
+              if (start >= r.size || end >= r.size) {
                 reply_err(id, "bad_params", "SS RAM-region BP offset가 region 크기를 초과");
                 return;
               }
-              start = (long)(r.base + (uint32)start);
-              end = (long)(r.base + (uint32)end);
+              start = r.base + start;
+              end = r.base + end;
               logical = false;
               matched = true;
               break;
@@ -2525,11 +2662,13 @@ void handle(const std::string& line) {
     }
     // 값-조건(read/write BP만): value 지정 시 접근 값이 (value & value_mask)와 같을 때만 발화.
     // value_len(1~4)은 비교 바이트 수, value_mask 기본 0xFFFFFFFF(전 비트).
-    long value = 0, value_mask = 0xFFFFFFFFL, val_len = 1;
+    uint32 value = 0, value_mask = 0xFFFFFFFFu;
+    long val_len = 1;
     bool has_value = (line.find("\"value\"") != std::string::npos);
     if (has_value) {
-      json_num(line, "value", value);
-      json_num(line, "value_mask", value_mask);
+      if (!json_u32_arg(id, line, "value", value, true)
+          || !json_u32_arg(id, line, "value_mask", value_mask, false))
+        return;
       json_num(line, "value_len", val_len);
       if (val_len < 1) val_len = 1;
       if (val_len > 4) val_len = 4;
@@ -2560,11 +2699,12 @@ void handle(const std::string& line) {
       // 좁은 한계: SS on-chip 레지스터 대상 RMW만 CheatMemRead fastmap 밖이라 부정확 — work RAM 대상은
       // 정확하며 값-BP 실사용은 work RAM이다.
     }
-    long pc_min = 0, pc_max = 0xFFFFFFFFL;
+    uint32 pc_min = 0, pc_max = 0xFFFFFFFFu;
     bool has_pc_min = (line.find("\"pc_min\"") != std::string::npos);
     bool has_pc_max = (line.find("\"pc_max\"") != std::string::npos);
-    if (has_pc_min) json_num(line, "pc_min", pc_min);
-    if (has_pc_max) json_num(line, "pc_max", pc_max);
+    if ((has_pc_min && !json_u32_arg(id, line, "pc_min", pc_min, true))
+        || (has_pc_max && !json_u32_arg(id, line, "pc_max", pc_max, true)))
+      return;
     if (pc_max < pc_min) pc_max = pc_min;
     bool has_pc_filter = has_pc_min || has_pc_max;
 
@@ -2575,19 +2715,19 @@ void handle(const std::string& line) {
       BP b{};
       b.id = bid;
       b.type = type;
-      b.a1 = (uint32)start;
-      b.a2 = (uint32)end;
+      b.a1 = start;
+      b.a2 = end;
       b.logical = logical;
       json_bool(line, "pause_on_hit", b.pause_on_hit);
       b.adapter_bp = adapter_bp;
       b.memory_type = mt;
       b.has_value = has_value && (type == BPOINT_READ || type == BPOINT_WRITE);
-      b.value = (uint32)value;
-      b.value_mask = (uint32)value_mask;
+      b.value = value;
+      b.value_mask = value_mask;
       b.val_len = (int)val_len;
       b.has_pc_filter = has_pc_filter;
-      b.pc_min = (uint32)pc_min;
-      b.pc_max = (uint32)pc_max;
+      b.pc_min = pc_min;
+      b.pc_max = pc_max;
       g_bps.push_back(b);
       rearm_breakpoints();
       char buf[48];
@@ -2657,15 +2797,16 @@ void handle(const std::string& line) {
   } else if (method == "disassemble") {
     // SH-2 디스어셈블: addr부터 count개 명령. 코어의 Debugger->Disassemble(A&, SpecialA, buf)는
     // A를 다음 명령으로 증가시킨다(가변 길이 디코드라 명령 경계가 정확). raw 바이트 수동 디코드 불필요.
-    long addr = 0, count = 1;
-    json_num(line, "address", addr);
+    uint32 addr = 0;
+    if (!json_u32_arg(id, line, "address", addr, true)) return;
+    long count = 1;
     json_num(line, "count", count);
     if (count < 1) count = 1;
     if (count > 256) count = 256;
     if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->Disassemble) {
       reply_err(id, "no_debugger", "디스어셈블러 미초기화(--enable-debugger 필요)");
     } else {
-      uint32 A = (uint32)addr;
+      uint32 A = addr;
       std::string out = "[";
       for (long i = 0; i < count; i++) {
         char tbuf[256]; tbuf[0] = 0;
@@ -3093,7 +3234,11 @@ void emucap_service(uint64_t frame) {
     return;
   }
   serve_socket_once();
+  if (g_test_adapter_exception_id >= 0)
+    throw std::runtime_error("injected native adapter service exception");
+  } catch (const std::exception& error) {
+    contain_service_exception("service", error.what());
   } catch (...) {
-    // 어떤 예외도 프레임 루프(main)로 탈출시키지 않는다 — std::terminate 방지.
+    contain_service_exception("service", "unknown native adapter exception");
   }
 }

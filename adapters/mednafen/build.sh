@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Mednafen 어댑터 재현 빌드(Saturn + PlayStation + PC Engine + Mega Drive).
 #
-# Mednafen은 GPL이라 통째 벤더링/재배포하지 않는다. 우리 추가분(emucap.cpp/.h)만 이 저장소에
+# Mednafen은 GPL이라 통째 벤더링/재배포하지 않는다. emucap runtime source만 이 저장소에
 # 두고, 업스트림 Mednafen을 로컬에서 받아 패치·빌드한다.
 #
 # 한 바이너리가 ss(Saturn)·psx(PlayStation)·pce(PC Engine)·md(Mega Drive)를 모두 처리한다(모두 컴파일·링크).
@@ -130,15 +130,21 @@ echo "→ 추출"
 safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
-# 3. 우리 소켓 클라이언트
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$SRC/src/drivers/"
+# 3. emucap 소켓 클라이언트
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" \
+  "$HERE/emucap_json_num.h" "$SRC/src/drivers/"
+cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알리게 한다 —
 # 사용자가 `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(build-time 임베드라 재빌드
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+git -C "$HERE" diff --quiet HEAD -- \
+  emucap.cpp emucap.h emucap_input.h emucap_json_num.h \
+  ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
+  2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/src/drivers/emucap_build.h"
+"$HERE/../_common/test-native-failure.sh"
 
 # 헬퍼: perl 주입 후 마커(고정 문자열)가 들어갔는지 검증. fresh 빌드가 조용히 깨지는 것을 막는다.
 inject_check() { grep -qF "$1" "$2" || { echo "ERROR: $3"; exit 1; }; }
@@ -518,8 +524,8 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
 esac
 ./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-wswan --enable-debugger >/dev/null
 
-# 6. emucap.cpp를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
-perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) /' \
+# 6. emucap sources를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
+perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
   src/drivers/Makefile
 
 # 7. 빌드

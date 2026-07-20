@@ -127,14 +127,19 @@ MEDNAFEN_FORCE_MODULE=pce ./launch.sh "/path/to/pce.cue" 47800
 MEDNAFEN_FORCE_MODULE=md ./launch.sh "/path/to/game.md" 47800
 ```
 (`launch.sh` uses `SDL_VIDEODRIVER=dummy` · `-sound 0` by default. If you need a screen, use
-`EMUCAP_HEADLESS=0`; if you need sound, use `MEDNAFEN_SOUND=1`, adjusting via environment variables. Other environment variables:
+`EMUCAP_HEADLESS=0`; if you need sound, use `MEDNAFEN_SOUND=1`, adjusting via environment variables.
+On macOS both the Rust and shell launchers select Mednafen's `softfb` video driver because the
+SDL3-backed SDL2 compatibility layer can block the first OpenGL swap before emulation starts.
+Other environment variables:
 `MEDNAFEN_BIN` (fork binary path, default `work/mednafen/src/mednafen`), `EMUCAP_LAUNCH_WAIT` (connection wait
 seconds, default 20), `EMUCAP_EMU_HOME` (emucap data root), `EMUCAP_LOG` (log path), `EMUCAP_SESSION_TOKEN` (when unspecified, auto-loaded from
 the per-port token file reported by `runtime_paths.token_file`). Override the build version with `MEDNAFEN_VER`.)
 So if you used `launch.sh`, a separate `SDL_VIDEODRIVER=dummy` retry is not a new measure.
-If the log ends near `Initializing video...` followed by `Signal has been caught ... SIGTERM`, it is usually
-not a video crash but `launch.sh` cleaning up its own process after a connection timeout. First re-query
-`status` right before launch and check whether the port is stale.
+If the log ends near `Initializing video...` followed by `Signal has been caught ... SIGTERM`, the
+launcher cleaned up its own process after a connection timeout. First re-query `status` right before
+launch and check whether the port is stale. On an older macOS launcher, a stack blocked in
+`Cocoa_GL_SwapWindow` identifies the SDL2-compat OpenGL startup deadlock; rebuild or update so the
+launcher selects `softfb`.
 For diagnosis by connection symptom — such as the PID disappearing after `Mednafen 연결됨`, `Broken pipe`, or
 `CLOSE_WAIT` — check the Mednafen log tail and re-query `status`/`listening_port` right before launch.
 
@@ -149,6 +154,11 @@ pin it with `MEDNAFEN_FORCE_MODULE=md` or the 4th launch argument `md`. For the 
 `-md.input.auto 0 -md.input.port1 gamepad6` to pin the 6-button input buffer.
 
 ## memory_type = address space (exposed by the debugger)
+
+Address, breakpoint range/value/filter, probe, disassembly, and register-bound arguments are parsed as unsigned
+fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A negative, malformed, or greater-than-
+`0xffffffff` value returns `bad_params` instead of being saturated or wrapped.
+
 - **Saturn (14 kinds)**: `workraml` (1MB) · `workramh` (1MB) · `vdp1vram` (512KB) · `vdp2vram` (512KB) ·
   `vdp1fb0`/`vdp1fb1` · `scspram` (512KB) · `cram` (4KB, VDP2 palette — stored raw; interpret index/color
   format via CRAM_Mode) · `backup` (32KB) · `physical` (SH-2 external bus), etc.
@@ -263,7 +273,8 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   reads to separate "pad latch" from "game-visible read".
 - **ROM reload**: for a rebuilt disc, **restart the fork** (kill, then re-run with the new disc →
   auto-reconnects to emucap-mcp). In-process reload is a non-goal for driver-threading reasons.
-- **Follow-up**: a proper JSON parser (currently minimal extraction).
+- **Follow-up**: a structural JSON parser (the current extractor validates fixed-width numeric values but still
+  locates fields with minimal string matching).
 
 ## broker multi-instance note
 

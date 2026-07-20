@@ -466,9 +466,10 @@ pub(crate) struct LaunchArgs {
     #[serde(default)]
     pub(crate) name: Option<String>,
     /// HITL 창(사람이 보고 직접 플레이)을 띄운다 — 에이전트가 디버거로 붙는 동안 사람이 네이티브 창에서
-    /// 게임을 본다. PC-98은 MAME의 실제 video/keyboard provider를, NDS는 desmume-cli를
-    /// EMUCAP_NDS_DISPLAY=1로, PSP는 헤드리스 대신 PPSSPPSDL(GUI) 빌드를 실행한다. macOS는 창이 사는 동안
-    /// caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스). HITL 창을 지원하지 않는 어댑터는 무시한다.
+    /// 게임을 본다. Mednafen은 네이티브 SDL 창을, PC-98은 MAME의 실제 video/keyboard provider를,
+    /// NDS는 desmume-cli를 EMUCAP_NDS_DISPLAY=1로, PSP는 헤드리스 대신 PPSSPPSDL(GUI) 빌드를
+    /// 실행한다. macOS는 창이 사는 동안 caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스).
+    /// HITL 창을 지원하지 않는 어댑터는 무시한다.
     #[serde(default)]
     pub(crate) display: Option<bool>,
     /// 오디오 출력을 켠다. 현재 Mednafen(Saturn/PSX/PCE/MD/WonderSwan)에서만 지원하며 기본은

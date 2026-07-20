@@ -119,6 +119,11 @@
       "expression": "write.ok => Applied(memory_type,address,bytes)"
     },
     {
+      "id": "MEM.DUMP.PATH.1",
+      "category": "postcondition",
+      "expression": "dump.ok => writes_confined_to(request.path) and literal_path(request.path)"
+    },
+    {
       "id": "STATE.FILTER.1",
       "category": "postcondition",
       "expression": "get_state.ok and groups not empty => returned_groups subset_of groups and groups_applied"
@@ -302,7 +307,7 @@
       "methods": ["dump_memory"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": []
+      "expectations": ["MEM.DUMP.PATH.1"]
     },
     {
       "id": "state.read",

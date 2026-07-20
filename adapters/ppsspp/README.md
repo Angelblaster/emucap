@@ -37,6 +37,10 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
     `cpu.stepInto` passed an instruction *count* (1), so `(1/4)=0` instructions executed and the PC
     never advanced (`SteppingSubscriber.cpp`, `CPUCoreSubscriber.cpp`). Both are exercised only by
     the WebSocket debugger, which is why upstream's GUI never hit them.
+  - `patches/0003-emucap-loopback-bind-and-headless-reset.patch` binds the debugger to loopback
+    and makes a headless reset acknowledge the completed reboot rather than merely queueing it.
+  - `patches/0004-emucap-psp-bp-hardening.patch` gives concurrent headless resets distinct
+    identities and hardens debugger breakpoint behavior and attribution.
   - `patches/0005-emucap-gui-debugger-port.patch` makes the **GUI** build honor `--debugger=<port>`.
     Headless PPSSPP acts on that flag in its own `main()`; the SDL/GUI frontend forwarded the arg to
     `NativeInit` but never acted on it, so the GUI's debugger WebServer bound an *auto-assigned* port
@@ -55,6 +59,11 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
     launcher sets this env (plus `HOME`/`XDG_CONFIG_HOME`) to the emucap-owned per-port run dir, so a
     HITL session never touches the user's real config/saves/control mappings even if they configured a
     custom memory stick in their own PPSSPP.
+  - `patches/0007-emucap-headless-no-sdl-fatal.patch` lets `PPSSPPHeadless` configure and build
+    without SDL3; the optional GUI target remains available when SDL3 and SDL3_ttf are installed.
+  - `patches/0008-emucap-correlate-async-debugger-acks.patch` echoes request tickets on
+    asynchronous CPU stepping and resume events. The bridge tickets every command, so a delayed
+    reply or error is queued instead of satisfying an unrelated later request.
 - `cpu.stepInto`/`stepOver`/`stepOut`/`runUntil`/`nextHLE` ack via a *differently named* spontaneous
   `cpu.stepping` event rather than a reply of their own name (`SteppingSubscriber.cpp`) — the bridge
   handles this with a send-then-wait-for-a-different-event primitive, not a naive call/reply demux.

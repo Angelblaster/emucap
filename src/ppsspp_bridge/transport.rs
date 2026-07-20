@@ -9,16 +9,17 @@ use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use super::{BridgeError, BridgeResult, PPSSPP_SUBPROTOCOL};
 
 pub trait WsTransport {
-    /// Send `{"event": event, ...params}` and block for the reply carrying the same event name.
-    /// A `{"event":"error", ...}` reply becomes `Err`. Any other event observed while waiting (a
-    /// spontaneous log/breakpoint notification) is queued rather than dropped, so `drain_events`
-    /// can surface it later.
+    /// Send `{"event": event, ...params}` and block for the reply carrying the same event name and
+    /// request identity. A correlated `{"event":"error", ...}` reply becomes `Err`. Any other
+    /// event observed while waiting (a spontaneous notification or a late reply to an earlier
+    /// request) is queued rather than dropped, so `drain_events` can surface it later.
     fn call(&mut self, event: &str, params: Value) -> Result<Value, BridgeError>;
     /// Send `{"event": event, ...params}` for a command whose acknowledgement is a *differently
     /// named* spontaneous event — PPSSPP's `cpu.stepInto`/`stepOver`/`stepOut`/`runUntil`/`nextHLE`
     /// have no reply of their own name; they ack via a `cpu.stepping` event once the step completes
     /// (`SteppingSubscriber.cpp`). Blocks until an event named `expect_event` arrives; anything else
-    /// observed meanwhile is queued exactly like `call`.
+    /// observed meanwhile is queued exactly like `call`. The PPSSPP fork echoes the request ticket
+    /// on these asynchronous acknowledgements so a late completion cannot satisfy a later command.
     fn call_and_wait_for(
         &mut self,
         event: &str,
@@ -44,13 +45,10 @@ pub trait WsTransport {
         params: Value,
         timeout: Duration,
     ) -> Result<Value, BridgeError>;
-    /// Like `call`, but tags the request with a `ticket` and only accepts a reply whose `event`
-    /// name AND echoed `ticket` both match. PPSSPP echoes any `ticket` a request carried back on its
-    /// reply (`WebSocketUtils`/`InputSubscriber.cpp`), so this is how a timed `input.buttons.press`
-    /// is correlated: a stale ack from an *earlier* press that only released once the CPU resumed
-    /// (its own ack was stranded when a breakpoint halted the core mid-press) carries the earlier
-    /// ticket and is queued/ignored here rather than misattributed to this call. Off-ticket replies
-    /// seen while waiting are queued as spontaneous events, exactly like `call`.
+    /// Like `call`, but uses a caller-supplied `ticket`. This is needed by timed
+    /// `input.buttons.press`, whose recovery path refers to the exact press identity. Ordinary
+    /// calls mint their ticket inside the transport. Off-ticket replies seen while waiting are
+    /// queued as spontaneous events, exactly like `call`.
     fn call_ticketed(
         &mut self,
         event: &str,
@@ -69,6 +67,9 @@ pub struct TungsteniteWs {
     /// The default per-read socket timeout set at connect, restored after any `call_with_timeout`
     /// widens it for a single slow exchange.
     default_timeout: Duration,
+    /// Monotonic request identity. PPSSPP's direct responses and errors echo arbitrary `ticket`
+    /// values; the emucap fork does the same for asynchronous CPU stepping/resume acknowledgements.
+    next_ticket: u64,
 }
 
 impl TungsteniteWs {
@@ -97,11 +98,18 @@ impl TungsteniteWs {
             socket,
             pending_events: VecDeque::new(),
             default_timeout: timeout,
+            next_ticket: 1,
         })
     }
 }
 
 impl TungsteniteWs {
+    fn mint_ticket(&mut self) -> String {
+        let ticket = format!("emucap-ws-{}", self.next_ticket);
+        self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
+        ticket
+    }
+
     /// Send `{"event": event, ...params}` without waiting for any reply.
     fn send_request(&mut self, event: &str, params: Value) -> BridgeResult<()> {
         let mut obj = match params {
@@ -119,51 +127,17 @@ impl TungsteniteWs {
         Ok(())
     }
 
-    /// Block until an event named `expect` arrives. A `{"event":"error", ...}` reply becomes
-    /// `Err`. Any other event observed while waiting (a spontaneous log/breakpoint/stepping
-    /// notification) is queued rather than dropped, so a later `drain_events` can surface it.
-    fn read_until(&mut self, expect: &str) -> BridgeResult<Value> {
-        loop {
-            match self.socket.read()? {
-                Message::Text(text) => {
-                    let value: Value = serde_json::from_str(text.as_str())?;
-                    let seen = value.get("event").and_then(Value::as_str).unwrap_or("");
-                    if seen == "error" {
-                        let message = value
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("PPSSPP debugger returned an error")
-                            .to_string();
-                        return Err(BridgeError::Emulator(message));
-                    }
-                    if seen == expect {
-                        return Ok(value);
-                    }
-                    // A spontaneous event (log line, breakpoint/stepping hit) arrived ahead of our
-                    // reply — queue it instead of dropping it, so a later poll_events can surface it.
-                    self.pending_events.push_back(value);
-                }
-                Message::Close(_) => {
-                    return Err(BridgeError::Emulator(
-                        "PPSSPP debugger closed the websocket".into(),
-                    ));
-                }
-                // Ping/Pong/Frame carry no event payload; tungstenite answers pings automatically.
-                _ => {}
-            }
-        }
-    }
-
-    /// Like `read_until`, but the reply must also echo back `ticket` — a reply named `expect` whose
-    /// `ticket` differs (a stale ack from an earlier correlated request) is queued as a spontaneous
-    /// event, not returned, so it can never satisfy the wrong call.
+    /// Block until a reply carries both the expected event name and this request's identity. A late
+    /// reply or error for another ticket is queued, not attributed to the command now in flight.
     fn read_until_ticketed(&mut self, expect: &str, ticket: &str) -> BridgeResult<Value> {
         loop {
             match self.socket.read()? {
                 Message::Text(text) => {
                     let value: Value = serde_json::from_str(text.as_str())?;
                     let seen = value.get("event").and_then(Value::as_str).unwrap_or("");
-                    if seen == "error" {
+                    let ticket_matches =
+                        value.get("ticket").and_then(Value::as_str) == Some(ticket);
+                    if seen == "error" && ticket_matches {
                         let message = value
                             .get("message")
                             .and_then(Value::as_str)
@@ -171,8 +145,6 @@ impl TungsteniteWs {
                             .to_string();
                         return Err(BridgeError::Emulator(message));
                     }
-                    let ticket_matches =
-                        value.get("ticket").and_then(Value::as_str) == Some(ticket);
                     if seen == expect && ticket_matches {
                         return Ok(value);
                     }
@@ -241,8 +213,8 @@ impl TungsteniteWs {
 
 impl WsTransport for TungsteniteWs {
     fn call(&mut self, event: &str, params: Value) -> BridgeResult<Value> {
-        self.send_request(event, params)?;
-        self.read_until(event)
+        let ticket = self.mint_ticket();
+        self.call_ticketed(event, params, &ticket)
     }
 
     fn call_and_wait_for(
@@ -251,8 +223,11 @@ impl WsTransport for TungsteniteWs {
         params: Value,
         expect_event: &str,
     ) -> BridgeResult<Value> {
-        self.send_request(event, params)?;
-        self.read_until(expect_event)
+        let ticket = self.mint_ticket();
+        let mut obj = object_params(event, params)?;
+        obj.insert("ticket".into(), json!(ticket));
+        self.send_request(event, Value::Object(obj))?;
+        self.read_until_ticketed(expect_event, &ticket)
     }
 
     fn call_with_timeout(
@@ -263,10 +238,13 @@ impl WsTransport for TungsteniteWs {
     ) -> BridgeResult<Value> {
         // Bound both the write and read. Applying the timeout only after send_request would let a
         // blocked socket write outlive the caller's operation deadline.
+        let ticket = self.mint_ticket();
+        let mut obj = object_params(event, params)?;
+        obj.insert("ticket".into(), json!(ticket));
         self.with_socket_timeout(timeout, |transport| {
             transport
-                .send_request(event, params)
-                .and_then(|()| transport.read_until(event))
+                .send_request(event, Value::Object(obj))
+                .and_then(|()| transport.read_until_ticketed(event, &ticket))
         })
     }
 
@@ -277,23 +255,18 @@ impl WsTransport for TungsteniteWs {
         expect_event: &str,
         timeout: Duration,
     ) -> BridgeResult<Value> {
+        let ticket = self.mint_ticket();
+        let mut obj = object_params(event, params)?;
+        obj.insert("ticket".into(), json!(ticket));
         self.with_socket_timeout(timeout, |transport| {
             transport
-                .send_request(event, params)
-                .and_then(|()| transport.read_until(expect_event))
+                .send_request(event, Value::Object(obj))
+                .and_then(|()| transport.read_until_ticketed(expect_event, &ticket))
         })
     }
 
     fn call_ticketed(&mut self, event: &str, params: Value, ticket: &str) -> BridgeResult<Value> {
-        let mut obj = match params {
-            Value::Object(map) => map,
-            Value::Null => serde_json::Map::new(),
-            other => {
-                return Err(BridgeError::BadParams(format!(
-                    "params for {event} must be a JSON object, got {other}"
-                )))
-            }
-        };
+        let mut obj = object_params(event, params)?;
         obj.insert("ticket".into(), json!(ticket));
         self.send_request(event, Value::Object(obj))?;
         self.read_until_ticketed(event, ticket)
@@ -317,5 +290,15 @@ impl WsTransport for TungsteniteWs {
         }
         let _ = self.socket.get_mut().set_nonblocking(false);
         out
+    }
+}
+
+fn object_params(event: &str, params: Value) -> BridgeResult<serde_json::Map<String, Value>> {
+    match params {
+        Value::Object(map) => Ok(map),
+        Value::Null => Ok(serde_json::Map::new()),
+        other => Err(BridgeError::BadParams(format!(
+            "params for {event} must be a JSON object, got {other}"
+        ))),
     }
 }

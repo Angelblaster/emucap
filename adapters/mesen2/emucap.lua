@@ -5,6 +5,12 @@
 -- 실패). 따라서 startFrame에서 샘플 시점을 정하고, 그 프레임의 다음 명령에서
 -- 발화하는 1회용 exec 콜백 안에서 createSavestate를 호출한 뒤 콜백을 즉시 해제한다.
 
+local script_source = debug.getinfo(1, "S").source
+local script_dir = script_source and script_source:sub(1, 1) == "@"
+  and script_source:sub(2):match("^(.*)[/\\][^/\\]+$")
+if script_dir then package.path = script_dir .. "/?.lua;" .. package.path end
+local Fs = require("emucap_fs")
+
 local OUTPUT_ROOT = "bundles"        -- 작업 디렉토리 기준 상대 경로
 local ROM_PATH    = "roms/game.sfc"  -- 자동 추론 실패 시 폴백 경로
 local PLATFORM    = "snes"
@@ -73,14 +79,16 @@ local function dump_bundle()
   local ts = os.time()
   local rom = detect_rom_path()
   local dir = OUTPUT_ROOT .. "/" .. ts .. "-retrospective"
-  os.execute('mkdir -p "' .. dir .. '/slices"')
+  local made, make_error = Fs.ensure_relative_directory(dir .. "/slices")
+  assert(made, make_error)
 
   local slices_json = {}
   local movie_lines = {}
   for _, s in ipairs(ring) do
     local fname = string.format("f%05d", s.frame)
     local sdir = dir .. "/slices/" .. fname
-    os.execute('mkdir -p "' .. sdir .. '"')
+    made, make_error = Fs.ensure_relative_directory(sdir)
+    assert(made, make_error)
     write_file(sdir .. "/state.mss", s.state)
     write_file(sdir .. "/screen.png", s.screen)
     movie_lines[#movie_lines + 1] = input_line(s.frame, s.input)
